@@ -8,8 +8,12 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from paper_core import (
+    ExtractedPageImage,
     LlamaTranslator,
+    PositionedCaption,
     Segment,
+    _assign_inline_images,
+    _assign_page_images,
     _mark_caption_boundaries,
     _merge_page_continuations,
     _merge_reference_entries,
@@ -17,6 +21,8 @@ from paper_core import (
     _sentence_parts,
     _strip_repeated_margin_fragments,
     bilingual_html,
+    bilingual_markdown,
+    document_to_dict,
     neighboring_context,
     parse_glossary,
     segments_for_mode,
@@ -166,6 +172,13 @@ class CoreTests(unittest.TestCase):
         citation = "ACM Trans. Graph., Vol. 43, No. 4, Article 85."
         self.assertEqual(_sentence_parts(citation), [citation])
 
+    def test_figure_number_stays_with_first_caption_sentence(self):
+        caption = "Fig. 12. The result of the model. A second explanation."
+        self.assertEqual(
+            _sentence_parts(caption),
+            ["Fig. 12. The result of the model.", "A second explanation."],
+        )
+
     def test_layout_whitespace_ends_figure_caption(self):
         plain = "Figure 3: Pipeline overview. It has two stages.\nBody text begins here. It continues."
         layout = "Figure 3: Pipeline overview. It has two stages.\n\n\nBody text begins here. It continues."
@@ -173,6 +186,57 @@ class CoreTests(unittest.TestCase):
         units = split_document_units(normalized, include_positions=True)
         self.assertEqual([unit[0] for unit in units[:3]], ["Figure 3: Pipeline overview.", "It has two stages.", "Body text begins here."])
         self.assertEqual([unit[2] for unit in units[:3]], [1, 1, 2])
+
+    def test_caption_boundary_tolerates_internal_spacing_difference(self):
+        plain = (
+            "Fig. 2. An overview of the framework represented by a tetrahedral mesh M. "
+            "The final result is shown here.\nBody text begins here."
+        )
+        layout_caption = (
+            "Fig. 2. An overview of the framework represented by a tetrahedral meshM. "
+            "The final result is shown here."
+        )
+        marked = _mark_caption_boundaries(plain, [layout_caption])
+        self.assertEqual(marked.count("\uE100"), 1)
+        normalized = _normalize_block(marked, captions_marked=True)
+        units = split_document_units(normalized, include_positions=True)
+        self.assertEqual(units[0][1], "figure")
+        self.assertEqual(units[-1][0], "Body text begins here.")
+        self.assertEqual(units[-1][1], "sentence")
+
+    def test_images_are_assigned_to_nearest_caption_in_same_column(self):
+        left = Segment(0, 1, "Fig. 1. Left figure.", kind="figure", paragraph=1, sentence=1)
+        right = Segment(1, 1, "Fig. 2. Right figure.", kind="figure", paragraph=2, sentence=1)
+        captions = [
+            PositionedCaption(left.source, 50, 300),
+            PositionedCaption(right.source, 320, 500),
+        ]
+        images = [
+            ExtractedPageImage("/left.jpg", 50, 315, 290, 460),
+            ExtractedPageImage("/right.jpg", 320, 515, 560, 690),
+        ]
+        unassigned = _assign_page_images([left, right], captions, images, 612)
+        self.assertEqual(unassigned, [])
+        self.assertEqual(left.assets, ["/left.jpg"])
+        self.assertEqual(right.assets, ["/right.jpg"])
+
+    def test_uncaptioned_inline_image_uses_nearby_figure_reference(self):
+        first = Segment(0, 1, "Unrelated paragraph.", paragraph=1, sentence=1)
+        target = Segment(
+            1,
+            1,
+            "As shown in the wrapped figure on the right, support is required.",
+            paragraph=2,
+            sentence=1,
+        )
+        fragments = [
+            (320, 500, "Unrelated paragraph."),
+            (320, 350, "wrapped figure on the right, support"),
+        ]
+        image = ExtractedPageImage("/inline.jpg", 470, 300, 550, 400)
+        remaining = _assign_inline_images([first, target], fragments, [image], 612)
+        self.assertEqual(remaining, [])
+        self.assertEqual(target.assets, ["/inline.jpg"])
 
     def test_translation_payload_uses_official_options(self):
         captured = {}
@@ -205,6 +269,16 @@ class CoreTests(unittest.TestCase):
         self.assertIn("TRANSLATION", output)
         self.assertIn("MEMO", output)
         self.assertIn("P2<br>S3", output)
+        self.assertIn("Built with PLaMo", output)
+
+    def test_exports_include_plamo_attribution(self):
+        segments = [Segment(0, 1, "Source.", "訳文。", paragraph=1, sentence=1)]
+        markdown = bilingual_markdown("Paper", segments)
+        payload = document_to_dict("Paper", segments)
+        self.assertIn("Built with PLaMo", markdown)
+        self.assertEqual(payload["attribution"], "Built with PLaMo")
+        self.assertEqual(payload["generated_by"], "PLaMo 3 Translate")
+        self.assertIn("plamo-community-license", payload["model_license"])
 
 
 if __name__ == "__main__":

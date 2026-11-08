@@ -119,7 +119,7 @@ nvidia-smi
 3. 必要なら参考文脈と用語集を入力します。用語集は `原語 = 訳語` を1行ずつ書きます。
 4. 「翻訳を開始」を押します。
 5. 完了後、左の原文、中央の訳文、右のメモを選択した単位で確認します。一文単位では各行の `P段落番号 / S文番号` と太い区切りで段落境界も確認でき、メモは入力後に自動保存されます。
-6. 対訳をHTML / Markdown / JSONで保存します。HTMLは図とメモを埋め込んだ単体ファイルです。
+6. 対訳をHTML / Markdown / JSONで保存します。HTMLは図とメモを埋め込んだ単体ファイルで、各形式に `Built with PLaMo` と生成元モデルを記録します。
 
 一文単位モードは論文を一文ずつ分割し、翻訳時に同じ段落の前後文を参考文脈として付与します。段落単位モードは同じ段落の文をまとめてモデルへ渡します。どちらも見出し、数式、表、図キャプション、箇条書きを構造ブロックとして保持します。`REFERENCES` 以降は著者・年・題名・掲載誌を1件の引用単位にまとめ、各ページで反復するヘッダーとフッターは本文から除外します。PLaMo公式の `chat_template_kwargs` を使って `target_lang`、`source_lang`、`context`、`glossary`、`form` をモデルへ渡します。
 
@@ -147,7 +147,7 @@ nvidia-smi
 .\build-portable.ps1
 ```
 
-モデルはPLaMo Community Licenseの確認と公式配布元からの取得を受取人ごとに行う設計です。詳しい配布方式の比較は `DISTRIBUTION.md` を参照してください。
+モデルはPLaMo Community Licenseの確認と公式配布元からの取得を受取人ごとに行う設計です。ポータブルZIPにはアプリのMIT Licenseと、同梱するPython・pypdf・Pillow・PyInstallerのライセンス本文を収録します。詳しい配布方式の比較は `DISTRIBUTION.md` を参照してください。
 
 ## ライセンス
 
@@ -159,4 +159,4 @@ nvidia-smi
 - pypdf: https://pypdf.readthedocs.io/
 - Pillow: https://python-pillow.org/
 
-生成物を公表する場合の表示義務や、組織内利用を含む商用利用の登録条件について、必ず最新のPLaMo Community License本文を確認してください。
+生成物を第三者へ提供・公表する場合は、`Built with PLaMo`、生成元の明示、ライセンスの提供など、PLaMo Community License第4条・第5条の条件を確認してください。組織内利用を含む商業目的では、直近事業年度の収入または売上が10億円以下でも事前登録が必要で、超える場合はPFNから別途商業用ライセンスを取得する必要があります。

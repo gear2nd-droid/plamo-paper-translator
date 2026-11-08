@@ -21,6 +21,9 @@ PLaMoPaperTranslator/
 ├─ PLaMoPaperTranslator.exe     # Python同梱のアプリ本体
 ├─ Start-PLaMoPaperTranslator.cmd
 ├─ setup.ps1                    # 公式配布元からランタイムとモデルを取得
+├─ LICENSE                      # アプリ独自コードのMIT License
+├─ THIRD_PARTY_NOTICES.md
+├─ licenses/                    # Python・pypdf・Pillow・PyInstallerのライセンス本文
 ├─ models/                      # 初回セットアップ後にGGUFを保存
 ├─ runtime/                     # llama.cpp CUDA/Vulkan版
 └─ data/                        # PDFと翻訳結果（配布時は空）

@@ -1,6 +1,6 @@
 # Third-party notices
 
-この配布物は外部ソフトウェアとモデルを初回セットアップ時に公式配布元から取得します。各コンポーネントにはそれぞれのライセンスが適用されます。
+この配布物は外部ソフトウェアを利用し、モデルと推論ランタイムを初回セットアップ時に公式配布元から取得します。各コンポーネントにはそれぞれのライセンスが適用されます。ポータブルZIPには `licenses/` 以下に同梱コンポーネントのライセンス本文を収録します。
 
 ## PLaMo 3 Translate
 
@@ -11,6 +11,8 @@
 
 モデルはこのアプリのポータブルZIPには同梱しません。利用者がライセンスを確認したうえで、公式モデルリポジトリから取得します。
 
+本アプリのUIとエクスポートには `Built with PLaMo` および生成元モデルを表示します。生成物を第三者へ提供・公表する場合は、PLaMo Community License第4条・第5条を確認してください。商業目的には組織内部での利用も含まれ、所定条件下では事前登録が必要です。
+
 ## llama.cpp
 
 - Project: https://github.com/ggml-org/llama.cpp
@@ -20,10 +22,26 @@
 
 - Project: https://github.com/py-pdf/pypdf
 - License: BSD-3-Clause
+- Included license: `licenses/pypdf-LICENSE.txt`
 
 ## Pillow
 
 - Project: https://python-pillow.org/
-- License: HPND
+- License: MIT-CMU
+- Included license: `licenses/Pillow-LICENSE.txt`
+
+## Python
+
+- Project: https://www.python.org/
+- License: Python Software Foundation License Version 2 and bundled notices
+- Included license: `licenses/Python-LICENSE.txt`
+
+## PyInstaller
+
+- Project: https://pyinstaller.org/
+- License: GPL-2.0-or-later with Bootloader Exception; selected files are Apache-2.0
+- Included license: `licenses/PyInstaller-COPYING.txt`
+
+PyInstallerの公式例外により、生成した実行ファイルは依存物のライセンスに従って配布できます。
 
 このファイルは要約です。正確な条件は、取得時点の各公式ライセンス本文を優先してください。

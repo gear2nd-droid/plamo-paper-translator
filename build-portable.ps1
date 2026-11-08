@@ -11,7 +11,28 @@ try {
     $PackageRoot = Join-Path $AppRoot "dist\PLaMoPaperTranslator"
     New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
     Copy-Item -Force "dist\PLaMoPaperTranslator.exe" $PackageRoot
-    Copy-Item -Force "Start-PLaMoPaperTranslator.cmd","start.ps1","setup.ps1","requirements.txt","README.md","DISTRIBUTION.md","THIRD_PARTY_NOTICES.md" $PackageRoot
+    Copy-Item -Force "Start-PLaMoPaperTranslator.cmd","start.ps1","setup.ps1","requirements.txt","README.md","DISTRIBUTION.md","THIRD_PARTY_NOTICES.md","LICENSE" $PackageRoot
+    $LicenseRoot = Join-Path $PackageRoot "licenses"
+    New-Item -ItemType Directory -Force -Path $LicenseRoot | Out-Null
+
+    $PythonBase = (& $Python -c "import sys; print(sys.base_prefix)").Trim()
+    $PythonLicense = Join-Path $PythonBase "LICENSE.txt"
+    if (-not (Test-Path -LiteralPath $PythonLicense)) { throw "Pythonのライセンス本文が見つかりません: $PythonLicense" }
+    Copy-Item -Force -LiteralPath $PythonLicense -Destination (Join-Path $LicenseRoot "Python-LICENSE.txt")
+
+    function Copy-PackageLicense {
+        param([string]$Distribution, [string]$DestinationName)
+        $Finder = 'import sys; from importlib.metadata import distribution; d=distribution(sys.argv[1]); files=[f for f in (d.files or []) if "license" in str(f).lower() or "copying" in str(f).lower()]; print(d.locate_file(files[0])) if files else sys.exit(1)'
+        $Source = (& $Python -c $Finder $Distribution).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $Source)) {
+            throw "$Distribution のライセンス本文が見つかりません。"
+        }
+        Copy-Item -Force -LiteralPath $Source -Destination (Join-Path $LicenseRoot $DestinationName)
+    }
+
+    Copy-PackageLicense -Distribution "pypdf" -DestinationName "pypdf-LICENSE.txt"
+    Copy-PackageLicense -Distribution "Pillow" -DestinationName "Pillow-LICENSE.txt"
+    Copy-PackageLicense -Distribution "pyinstaller" -DestinationName "PyInstaller-COPYING.txt"
     New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "models"),(Join-Path $PackageRoot "runtime"),(Join-Path $PackageRoot "data") | Out-Null
     $Zip = Join-Path $AppRoot "dist\PLaMoPaperTranslator-Windows-portable.zip"
     if (Test-Path $Zip) { Remove-Item -LiteralPath $Zip -Force }

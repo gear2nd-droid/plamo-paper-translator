@@ -27,13 +27,12 @@ LANGUAGES = {
 
 CAPTION_MARKER = "\uE100"
 BODY_MARKER = "\uE101"
+PLAMO_LICENSE_URL = "https://plamo.preferredai.jp/info/plamo-community-license-ja"
+PLAMO_ATTRIBUTION = "Built with PLaMo"
 
 LIST_PATTERN = re.compile(r"^(?:[•●◦▪‣*-]\s+|\((?:[1-9]|1[01])\)\s+|(?:[1-9]|1[01])[.)]\s+)")
 
-POSITIONED_CAPTION_PATTERN = re.compile(
-    r"^(?:(?:figure|table)\s*\d+\s*:|fig\.\s*\d+\s*[.:])",
-    re.I,
-)
+POSITIONED_CAPTION_PATTERN = re.compile(r"^(?:figure|fig\.?|table)\s*\d+\s*[.:]", re.I)
 
 
 @dataclass
@@ -49,6 +48,22 @@ class Segment:
     note: str = ""
     paragraph: int = 0
     sentence: int = 0
+
+
+@dataclass(frozen=True)
+class PositionedCaption:
+    text: str
+    x: float
+    y: float
+
+
+@dataclass(frozen=True)
+class ExtractedPageImage:
+    asset: str
+    x0: float | None = None
+    y0: float | None = None
+    x1: float | None = None
+    y1: float | None = None
 
 
 def _mostly_nonlinguistic(text: str) -> bool:
@@ -144,11 +159,11 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
     return "\n\n".join(paragraphs)
 
 
-def _positioned_caption_blocks(
+def _positioned_captions(
     fragments: list[tuple[float, float, str]],
     page_midpoint: float,
-) -> list[str]:
-    captions: list[str] = []
+) -> list[PositionedCaption]:
+    captions: list[PositionedCaption] = []
     for start, (start_x, start_y, start_text) in enumerate(fragments):
         if not POSITIONED_CAPTION_PATTERN.match(start_text.strip()):
             continue
@@ -167,8 +182,15 @@ def _positioned_caption_blocks(
                 previous_y = y
         caption = re.sub(r"\s+", " ", "".join(pieces)).strip()
         if caption:
-            captions.append(caption)
+            captions.append(PositionedCaption(caption, start_x, start_y))
     return captions
+
+
+def _positioned_caption_blocks(
+    fragments: list[tuple[float, float, str]],
+    page_midpoint: float,
+) -> list[str]:
+    return [caption.text for caption in _positioned_captions(fragments, page_midpoint)]
 
 
 def _mark_caption_boundaries(text: str, caption_source: str | list[str]) -> str:
@@ -184,7 +206,31 @@ def _mark_caption_boundaries(text: str, caption_source: str | list[str]) -> str:
         if not tokens:
             continue
         pattern = r"\s+".join(re.escape(token) for token in tokens)
-        text = re.sub(pattern, lambda match: f"\n\n{CAPTION_MARKER}{match.group(0)}\n\n", text, count=1)
+        text, replacements = re.subn(
+            pattern,
+            lambda match: f"\n\n{CAPTION_MARKER}{match.group(0)}\n\n",
+            text,
+            count=1,
+        )
+        if replacements:
+            continue
+        # Text extraction can insert or remove spaces around equations and
+        # inline symbols. Match stable anchors at both ends so the complete
+        # layout-verified caption still becomes its own paragraph.
+        for anchor_size in (8, 6, 4):
+            if len(tokens) < anchor_size * 2:
+                continue
+            start_pattern = r"\s*".join(re.escape(token) for token in tokens[:anchor_size])
+            end_pattern = r"\s*".join(re.escape(token) for token in tokens[-anchor_size:])
+            fuzzy_pattern = rf"{start_pattern}[\s\S]{{0,5000}}?{end_pattern}"
+            text, replacements = re.subn(
+                fuzzy_pattern,
+                lambda match: f"\n\n{CAPTION_MARKER}{match.group(0)}\n\n",
+                text,
+                count=1,
+            )
+            if replacements:
+                break
     return text
 
 
@@ -261,6 +307,12 @@ def _sentence_parts(text: str) -> list[str]:
     marker = "\uE000"
     boundary = "\uE001"
     protected = re.sub(r"(?<=\d)\.(?=\d)", marker, text)
+    protected = re.sub(
+        r"^((?:fig(?:ure)?\.?|table)\s+\d+)\.(?=\s)",
+        lambda match: match.group(1) + marker,
+        protected,
+        flags=re.I,
+    )
     protected = re.sub(r"\b([A-Z])\.(?=\s+[A-Z])", lambda match: match.group(1) + marker, protected)
     protected = re.sub(
         r"\b(?:e\.g|i\.e|et\s+al|Fig|Figs|Eq|Eqs|Sec|Secs|Dr|Prof|No|Nos|Vol|Trans|Proc|Conf|Comput|Graph|Int|pp|eds?)\s*\.",
@@ -346,12 +398,40 @@ def segments_for_mode(segments: Iterable[Segment], mode: str) -> list[Segment]:
     return result
 
 
-def _extract_page_images(page: Any, asset_dir: Path | None, page_number: int, url_prefix: str) -> list[str]:
+def _image_display_boxes(page: Any) -> dict[str, list[tuple[float, float, float, float]]]:
+    boxes: dict[str, list[tuple[float, float, float, float]]] = {}
+
+    def collect_image(operation: bytes, operands: list[Any], cm: list[float], _tm: list[float]) -> None:
+        if operation != b"Do" or not operands:
+            return
+        name = str(operands[0]).lstrip("/")
+        if len(cm) < 6:
+            return
+        a, b, c, d, e, f = (float(value) for value in cm[:6])
+        corners = ((e, f), (a + e, b + f), (c + e, d + f), (a + c + e, b + d + f))
+        xs = [point[0] for point in corners]
+        ys = [point[1] for point in corners]
+        boxes.setdefault(name, []).append((min(xs), min(ys), max(xs), max(ys)))
+
+    try:
+        page.extract_text(visitor_operand_before=collect_image)
+    except (TypeError, ValueError):
+        return {}
+    return boxes
+
+
+def _extract_page_images(
+    page: Any,
+    asset_dir: Path | None,
+    page_number: int,
+    url_prefix: str,
+) -> list[ExtractedPageImage]:
     if asset_dir is None:
         return []
-    assets: list[str] = []
+    assets: list[ExtractedPageImage] = []
     try:
         images = page.images
+        display_boxes = _image_display_boxes(page)
         asset_dir.mkdir(parents=True, exist_ok=True)
         for image_number, image_file in enumerate(images, start=1):
             image = image_file.image
@@ -371,10 +451,125 @@ def _extract_page_images(page: Any, asset_dir: Path | None, page_number: int, ur
                 data = buffer.getvalue()
             filename = f"page-{page_number:03d}-figure-{image_number:02d}{suffix}"
             (asset_dir / filename).write_bytes(data)
-            assets.append(f"{url_prefix.rstrip('/')}/{filename}")
+            resource_name = Path(image_file.name).stem.lstrip("/")
+            box = next(iter(display_boxes.get(resource_name, [])), None)
+            asset = f"{url_prefix.rstrip('/')}/{filename}"
+            assets.append(ExtractedPageImage(asset, *(box or (None, None, None, None))))
     except (ImportError, OSError, ValueError):
         return []
     return assets
+
+
+def _caption_identity(text: str) -> tuple[str, int] | None:
+    match = re.match(r"^(figure|fig\.?)\s*(\d+)\s*[.:]", text.strip(), re.I)
+    if match:
+        return "figure", int(match.group(2))
+    match = re.match(r"^table\s*(\d+)\s*[.:]", text.strip(), re.I)
+    if match:
+        return "table", int(match.group(1))
+    return None
+
+
+def _assign_page_images(
+    page_segments: list[Segment],
+    captions: list[PositionedCaption],
+    images: list[ExtractedPageImage],
+    page_width: float,
+) -> list[ExtractedPageImage]:
+    leaders: dict[tuple[str, int], Segment] = {}
+    for segment in page_segments:
+        identity = _caption_identity(segment.source)
+        if identity and identity not in leaders:
+            leaders[identity] = segment
+
+    figure_captions = [
+        caption for caption in captions if (_caption_identity(caption.text) or (None, 0))[0] == "figure"
+    ]
+    unassigned: list[ExtractedPageImage] = []
+    for image in images:
+        candidates = figure_captions
+        if image.x0 is not None and image.x1 is not None and image.y0 is not None:
+            image_width = image.x1 - image.x0
+            if image_width < page_width * 0.65:
+                image_is_left = (image.x0 + image.x1) / 2 < page_width / 2
+                same_column = [caption for caption in candidates if (caption.x < page_width / 2) == image_is_left]
+                if same_column:
+                    candidates = same_column
+            captions_below = [caption for caption in candidates if caption.y <= image.y0 + 8]
+            if captions_below:
+                candidates = captions_below
+            if candidates:
+                caption = min(candidates, key=lambda item: abs(image.y0 - item.y))
+            else:
+                caption = None
+        else:
+            caption = next(
+                (item for item in candidates if (identity := _caption_identity(item.text)) in leaders and not leaders[identity].assets),
+                None,
+            )
+
+        identity = _caption_identity(caption.text) if caption else None
+        leader = leaders.get(identity) if identity else None
+        if leader:
+            leader.assets.append(image.asset)
+        else:
+            unassigned.append(image)
+    return unassigned
+
+
+def _word_tokens(value: str) -> set[str]:
+    return {word.lower() for word in re.findall(r"[A-Za-z]{3,}", value)}
+
+
+def _assign_inline_images(
+    page_segments: list[Segment],
+    fragments: list[tuple[float, float, str]],
+    images: list[ExtractedPageImage],
+    page_width: float,
+) -> list[str]:
+    remaining: list[str] = []
+    for image in images:
+        if image.x0 is None or image.x1 is None or image.y0 is None or image.y1 is None:
+            remaining.append(image.asset)
+            continue
+        image_is_left = (image.x0 + image.x1) / 2 < page_width / 2
+        nearby = [
+            (x, y, value)
+            for x, y, value in fragments
+            if value.strip() and (x < page_width / 2) == image_is_left
+        ]
+        if not nearby:
+            remaining.append(image.asset)
+            continue
+
+        def fragment_rank(fragment: tuple[float, float, str]) -> tuple[int, float, float]:
+            _x, y, value = fragment
+            if image.y0 <= y <= image.y1:
+                vertical_gap = 0.0
+            else:
+                vertical_gap = min(abs(y - image.y0), abs(y - image.y1))
+            mentions_nearby_figure = vertical_gap <= 100 and bool(
+                re.search(r"\b(?:fig(?:ure)?|illustration|image|shown|above|right|left)\b", value, re.I)
+            )
+            return (0 if mentions_nearby_figure else 1, vertical_gap, abs(y - (image.y0 + image.y1) / 2))
+
+        anchor_text = min(nearby, key=fragment_rank)[2]
+        anchor_words = _word_tokens(anchor_text)
+        if not anchor_words:
+            remaining.append(image.asset)
+            continue
+
+        def segment_score(segment: Segment) -> tuple[float, int]:
+            source_words = _word_tokens(segment.source)
+            overlap = len(anchor_words & source_words) / len(anchor_words)
+            return overlap, len(anchor_words & source_words)
+
+        leader = max(page_segments, key=segment_score, default=None)
+        if leader is None or segment_score(leader)[0] < 0.6:
+            remaining.append(image.asset)
+            continue
+        leader.assets.append(image.asset)
+    return remaining
 
 
 def _margin_key(value: str) -> str:
@@ -582,9 +777,10 @@ def extract_document(
         paragraph_offset = 0
         for page_number, (page, raw, fragments, margin_candidates) in enumerate(page_records, start=1):
             raw = _strip_repeated_margin_fragments(raw, margin_candidates, repeated_margin_keys)
+            positioned_captions: list[PositionedCaption] = []
             if fragments:
-                captions = _positioned_caption_blocks(fragments, float(page.mediabox.width) / 2)
-                raw = _mark_caption_boundaries(raw, captions)
+                positioned_captions = _positioned_captions(fragments, float(page.mediabox.width) / 2)
+                raw = _mark_caption_boundaries(raw, [caption.text for caption in positioned_captions])
             normalized = _normalize_block(raw, captions_marked=bool(fragments))
             page_start = len(segments)
             units = split_document_units(normalized, max_chars=max_chars, include_positions=True)
@@ -600,14 +796,21 @@ def extract_document(
                     )
                 )
             paragraph_offset += max((unit[2] for unit in units), default=0)
-            assets = _extract_page_images(page, asset_dir, page_number, asset_url_prefix)
-            if assets:
-                candidates = [segment for segment in segments[page_start:] if segment.kind == "figure"]
-                if candidates:
-                    for number, asset in enumerate(assets):
-                        candidate_index = min(number * len(candidates) // len(assets), len(candidates) - 1)
-                        candidates[candidate_index].assets.append(asset)
-                else:
+            images = _extract_page_images(page, asset_dir, page_number, asset_url_prefix)
+            if images:
+                unassigned_images = _assign_page_images(
+                    segments[page_start:],
+                    positioned_captions,
+                    images,
+                    float(page.mediabox.width),
+                )
+                unassigned_assets = _assign_inline_images(
+                    segments[page_start:],
+                    fragments,
+                    unassigned_images,
+                    float(page.mediabox.width),
+                )
+                if unassigned_assets:
                     segments.append(
                         Segment(
                             index=len(segments),
@@ -616,7 +819,7 @@ def extract_document(
                             translation=f"原文ページ {page_number} から抽出した図",
                             kind="figure",
                             label="asset",
-                            assets=assets,
+                            assets=unassigned_assets,
                             paragraph=paragraph_offset + 1,
                             sentence=1,
                         )
@@ -741,11 +944,24 @@ class LlamaTranslator:
 
 
 def document_to_dict(title: str, segments: Iterable[Segment], **metadata: Any) -> dict[str, Any]:
-    return {"title": title, **metadata, "segments": [asdict(segment) for segment in segments]}
+    return {
+        "title": title,
+        "generated_by": "PLaMo 3 Translate",
+        "attribution": PLAMO_ATTRIBUTION,
+        "model_license": PLAMO_LICENSE_URL,
+        **metadata,
+        "segments": [asdict(segment) for segment in segments],
+    }
 
 
 def bilingual_markdown(title: str, segments: Iterable[Segment]) -> str:
-    lines = [f"# {title}", "", "> PLaMo Paper Translator による一文単位の対訳", ""]
+    lines = [
+        f"# {title}",
+        "",
+        "> Built with PLaMo — PLaMo 3 Translate による機械翻訳です。",
+        f"> [PLaMo Community License]({PLAMO_LICENSE_URL})",
+        "",
+    ]
     for segment in segments:
         if segment.kind == "heading":
             lines.extend([f"## {segment.source}", "", f"**訳:** {segment.translation or segment.source}", ""])
@@ -805,13 +1021,14 @@ def bilingual_html(
 <title>{safe_title} — 対訳</title>
 <style>
 *{{box-sizing:border-box}}body{{font-family:"Yu Gothic UI","Noto Sans JP",sans-serif;margin:0;background:#f3f1eb;color:#20231f}}
-header{{padding:28px 32px;border-bottom:1px solid #d8d5ca;background:#fff;position:sticky;top:0;z-index:2}}h1{{font:600 1.45rem Georgia,"Yu Mincho",serif;margin:0}}
+header{{padding:28px 32px;border-bottom:1px solid #d8d5ca;background:#fff;position:sticky;top:0;z-index:2}}h1{{font:600 1.45rem Georgia,"Yu Mincho",serif;margin:0}}header p{{margin:6px 0 0;font-size:.78rem;color:#687169}}header a,footer a{{color:#174d36}}
 .labels,.reader-row{{display:grid;grid-template-columns:44px minmax(300px,1fr) minmax(300px,1fr) minmax(230px,.72fr);max-width:1800px;margin:auto}}
 .labels{{position:sticky;top:89px;z-index:2;background:#174d36;color:#fff;font-size:.72rem;letter-spacing:.1em}}.labels>*{{padding:10px 18px;border-right:1px solid #376750}}
 .reader-row{{background:#fff;border-bottom:1px solid #dedbd1;align-items:stretch}}.reader-row>*{{padding:10px 12px;border-right:1px solid #e1ded5;min-width:0}}
 .number{{color:#728078;text-align:center;padding:22px 5px}}.number b,.number span{{display:block}}.number b{{font:italic .72rem Georgia,serif}}.number span{{font-size:.58rem;line-height:1.45;margin-top:7px}}p{{white-space:pre-wrap;line-height:1.78;margin:0;overflow-wrap:anywhere}}.source p{{font-family:Georgia,"Times New Roman","Yu Mincho",serif}}.translation{{background:#fbfcf9}}.note{{background:#f8f5ed;color:#5f675f;font-size:.86rem}}.note span{{color:#a0a49d}}
 .paragraph-start{{border-top:3px solid #9aab9f;margin-top:8px}}
 .kind-heading{{margin-top:24px;border-top:3px solid #174d36}}.kind-heading p{{font-weight:700;font-size:1.08rem}}.kind-equation p,.kind-table p{{font-family:"Cambria Math",Consolas,monospace;white-space:pre-wrap}}.figure-gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px}}figure{{margin:0;background:#fff}}img{{display:block;width:100%;height:100%;max-height:460px;object-fit:contain;margin:auto;border:1px solid #ddd}}
+footer{{padding:24px 32px;text-align:center;font-size:.78rem;color:#687169}}
 @media(max-width:900px){{.labels,.reader-row{{grid-template-columns:36px minmax(260px,1fr) minmax(260px,1fr)}}.labels .memo-label{{display:none}}.note{{grid-column:2/4;border-top:1px dashed #d8d5ca}}}}
 @media(max-width:620px){{header{{padding:20px 16px}}.labels{{display:none}}.reader-row{{grid-template-columns:32px 1fr}}.reader-row>*{{grid-column:2}}.number{{grid-column:1!important;grid-row:1/4}}}}
-</style></head><body><header><h1>{safe_title}</h1></header><div class="labels"><span></span><b>ORIGINAL</b><b>TRANSLATION</b><b class="memo-label">MEMO</b></div><main>{''.join(rows)}</main></body></html>"""
+</style></head><body><header><h1>{safe_title}</h1><p>Built with PLaMo — PLaMo 3 Translate による機械翻訳です。 <a href="{PLAMO_LICENSE_URL}">PLaMo Community License</a></p></header><div class="labels"><span></span><b>ORIGINAL</b><b>TRANSLATION</b><b class="memo-label">MEMO</b></div><main>{''.join(rows)}</main><footer>Built with PLaMo · <a href="{PLAMO_LICENSE_URL}">PLaMo Community License</a></footer></body></html>"""
