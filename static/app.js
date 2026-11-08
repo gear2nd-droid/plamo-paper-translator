@@ -1,4 +1,5 @@
-const state = { documentId: null, jobId: null, poller: null };
+const JOB_STORAGE_KEY = 'plamo-paper-translator.job-id';
+const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0 };
 const $ = (id) => document.getElementById(id);
 
 function toast(message) {
@@ -41,21 +42,35 @@ async function startJob() {
   try {
     const response = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
     const data = await response.json(); if (!response.ok) throw new Error(data.error || '翻訳を開始できませんでした');
-    state.jobId = data.id; pollJob(); state.poller = setInterval(pollJob, 1200);
+    state.jobId = data.id; localStorage.setItem(JOB_STORAGE_KEY, data.id); pollJob();
   } catch (error) { $('progressMessage').textContent = error.message; toast(error.message); }
 }
 
+function schedulePoll(delay = 1200) {
+  clearTimeout(state.poller);
+  state.poller = setTimeout(pollJob, delay);
+}
+
 async function pollJob() {
-  if (!state.jobId) return;
+  if (!state.jobId || state.polling) return;
+  state.polling = true;
+  let terminal = false;
   try {
     const response = await fetch(`/api/jobs/${state.jobId}`); const data = await response.json();
     if (!response.ok) throw new Error(data.error || '状態を取得できません');
+    state.pollFailures = 0;
     $('progressMessage').textContent = data.message; $('progressPercent').textContent = `${Math.round(data.progress || 0)}%`; $('progressBar').style.width = `${data.progress || 0}%`;
     if (['completed','completed_with_errors','failed','cancelled'].includes(data.status)) {
-      clearInterval(state.poller); state.poller = null;
+      terminal = true; clearTimeout(state.poller); state.poller = null;
       if (data.status.startsWith('completed')) showResults(data); else { $('resultSubtitle').textContent = data.message; toast(data.message); }
     }
-  } catch (error) { clearInterval(state.poller); $('progressMessage').textContent = error.message; }
+  } catch (_) {
+    state.pollFailures += 1;
+    $('progressMessage').textContent = `接続を再試行しています…（${state.pollFailures}回目）`;
+  } finally {
+    state.polling = false;
+    if (!terminal) schedulePoll(state.pollFailures ? Math.min(10000, 1200 * (2 ** Math.min(state.pollFailures, 3))) : 1200);
+  }
 }
 
 function showResults(data) {
@@ -79,5 +94,16 @@ document.querySelectorAll('.step').forEach((node) => node.addEventListener('clic
 $('targetLang').addEventListener('change', () => $('form').closest('label').style.display = $('targetLang').value === 'ja' ? '' : 'none');
 $('startTranslation').addEventListener('click', startJob);
 $('cancelJob').addEventListener('click', async () => { if(state.jobId) await fetch(`/api/jobs/${state.jobId}/cancel`, {method:'POST'}); });
-$('newPaper').addEventListener('click', () => location.reload());
-updateEngine(); setInterval(updateEngine, 5000);
+$('newPaper').addEventListener('click', () => { localStorage.removeItem(JOB_STORAGE_KEY); location.href = '/'; });
+
+function resumeJob() {
+  const requested = new URLSearchParams(location.search).get('job');
+  const saved = requested || localStorage.getItem(JOB_STORAGE_KEY);
+  if (!saved || !/^[a-f0-9]{32}$/.test(saved)) return;
+  state.jobId = saved; localStorage.setItem(JOB_STORAGE_KEY, saved);
+  showStep(3); $('progressBox').classList.remove('hidden'); $('resultActions').classList.add('hidden');
+  $('progressMessage').textContent = '保存済みの翻訳状態を確認しています…';
+  pollJob();
+}
+
+updateEngine(); setInterval(updateEngine, 5000); resumeJob();

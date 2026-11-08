@@ -137,6 +137,32 @@ def _save_job(job: dict[str, Any]) -> None:
     (JOB_DIR / f'{job["id"]}.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _load_saved_job(job_id: str) -> dict[str, Any] | None:
+    if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        return None
+    with state_lock:
+        if job_id in jobs:
+            return jobs[job_id]
+    path = JOB_DIR / f"{job_id}.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["segments"] = [
+            segment if isinstance(segment, Segment) else Segment(**segment)
+            for segment in payload.get("segments", [])
+        ]
+    except (OSError, ValueError, TypeError):
+        return None
+    if payload.get("status") in {"queued", "running"}:
+        payload["status"] = "failed"
+        payload["message"] = "アプリが再起動したため翻訳が中断されました。もう一度翻訳を開始してください。"
+        _save_job(payload)
+    with state_lock:
+        jobs[job_id] = payload
+    return payload
+
+
 def _translate_job(job_id: str) -> None:
     with state_lock:
         job = jobs[job_id]
@@ -227,11 +253,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]+)", path)
         if match:
+            job = _load_saved_job(match.group(1))
+            if not job:
+                self._error("ジョブが見つかりません。", 404)
+                return
             with state_lock:
-                job = jobs.get(match.group(1))
-                if not job:
-                    self._error("ジョブが見つかりません。", 404)
-                    return
                 payload = _job_snapshot(job)
                 if job["status"].startswith("completed"):
                     payload["segments"] = [segment.__dict__ for segment in job["segments"]]
@@ -239,8 +265,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/export", path)
         if match:
-            with state_lock:
-                job = jobs.get(match.group(1))
+            job = _load_saved_job(match.group(1))
             if not job:
                 self._error("ジョブが見つかりません。", 404)
                 return
