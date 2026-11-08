@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $AppRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Executable = Join-Path $AppRoot "PLaMoPaperTranslator.exe"
 $Python = Join-Path $AppRoot ".venv\Scripts\python.exe"

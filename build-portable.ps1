@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $AppRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Python = Join-Path $AppRoot ".venv\Scripts\python.exe"

@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet("8b", "2b")]
     [string]$ModelSize = "8b",
     [switch]$RuntimeOnly
@@ -51,44 +51,104 @@ function Get-RemoteFile {
 }
 
 Write-Host "[3/4] llama.cpp を準備しています..."
-$Release = Invoke-RestMethod -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" -Headers @{"User-Agent"="PLaMo-Paper-Translator"}
-$HasNvidia = $null -ne (Get-Command nvidia-smi -ErrorAction SilentlyContinue)
-if ($HasNvidia) {
-    $MainAsset = $Release.assets | Where-Object { $_.name -match '^llama-.+-bin-win-cuda-12\.4-x64\.zip$' } | Select-Object -First 1
-    $CudaAsset = $Release.assets | Where-Object { $_.name -match '^cudart-llama-bin-win-cuda-12\.4-x64\.zip$' } | Select-Object -First 1
-    if (-not $MainAsset -or -not $CudaAsset) { throw "最新の llama.cpp リリースに CUDA 12.4 Windows 版がありません。" }
-    $Assets = @($MainAsset, $CudaAsset)
-    Write-Host "  NVIDIA GPUを検出しました。CUDA版を使用します。"
+$LlamaServer = Get-ChildItem $RuntimeRoot -Filter "llama-server.exe" -Recurse | Select-Object -First 1
+if ($LlamaServer) {
+    Write-Host "  既存の llama.cpp を使用: $($LlamaServer.FullName)"
+    & $LlamaServer.FullName --version
+    if ($LASTEXITCODE -ne 0) { throw "既存の llama-server.exe を実行できません。runtime を確認してください。" }
 } else {
-    $MainAsset = $Release.assets | Where-Object { $_.name -match '^llama-.+-bin-win-vulkan-x64\.zip$' } | Select-Object -First 1
-    if (-not $MainAsset) { throw "最新の llama.cpp リリースに Vulkan Windows 版がありません。" }
-    $Assets = @($MainAsset)
-    Write-Host "  NVIDIA GPUが見つからないためVulkan版を使用します。"
+    $Releases = Invoke-RestMethod -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20" -Headers @{"User-Agent"="PLaMo-Paper-Translator"}
+    $Release = $Releases | Where-Object {
+        @($_.assets | Where-Object { $_.name -match '^llama-.+-bin-win-(?:cuda-12\.4|vulkan)-x64\.zip$' }).Count -gt 0
+    } | Select-Object -First 1
+    if (-not $Release) { throw "GPU対応Windows版を含む llama.cpp リリースが見つかりません。" }
+    Write-Host "  使用する公式リリース: $($Release.tag_name)"
+    $HasNvidia = $null -ne (Get-Command nvidia-smi -ErrorAction SilentlyContinue)
+    if ($HasNvidia) {
+        $MainAsset = $Release.assets | Where-Object { $_.name -match '^llama-.+-bin-win-cuda-12\.4-x64\.zip$' } | Select-Object -First 1
+        $CudaAsset = $Release.assets | Where-Object { $_.name -match '^cudart-llama-bin-win-cuda-12\.4-x64\.zip$' } | Select-Object -First 1
+        if (-not $MainAsset -or -not $CudaAsset) { throw "llama.cpp リリースに CUDA 12.4 Windows 版がありません。" }
+        Write-Host "  NVIDIA GPUを検出しました。CUDA版を使用します。"
+    } else {
+        $MainAsset = $Release.assets | Where-Object { $_.name -match '^llama-.+-bin-win-vulkan-x64\.zip$' } | Select-Object -First 1
+        if (-not $MainAsset) { throw "llama.cpp リリースに Vulkan Windows 版がありません。" }
+        Write-Host "  NVIDIA GPUが見つからないためVulkan版を使用します。"
+    }
+
+    $MainArchive = Join-Path $RuntimeRoot $MainAsset.name
+    Get-RemoteFile -Url $MainAsset.browser_download_url -Destination $MainArchive
+    Expand-Archive -LiteralPath $MainArchive -DestinationPath $RuntimeRoot -Force
+    Remove-Item -LiteralPath $MainArchive -Force
+
+    if ($HasNvidia) {
+        $CudaArchive = Join-Path $RuntimeRoot $CudaAsset.name
+        try {
+            Get-RemoteFile -Url $CudaAsset.browser_download_url -Destination $CudaArchive
+            Expand-Archive -LiteralPath $CudaArchive -DestinationPath $RuntimeRoot -Force
+            Remove-Item -LiteralPath $CudaArchive -Force
+        } catch {
+            $SystemCuda = (Get-Command cudart64_12.dll -ErrorAction SilentlyContinue) -and
+                          (Get-Command cublas64_12.dll -ErrorAction SilentlyContinue) -and
+                          (Get-Command cublasLt64_12.dll -ErrorAction SilentlyContinue)
+            if ($SystemCuda) {
+                Write-Warning "CUDAランタイムの取得に失敗しましたが、システムのCUDA 12 DLLを使用できます。"
+            } else {
+                throw
+            }
+        }
+    }
+    if (-not (Get-ChildItem $RuntimeRoot -Filter "llama-server.exe" -Recurse)) { throw "llama-server.exe を展開できませんでした。" }
 }
-foreach ($Asset in $Assets) {
-    $Archive = Join-Path $RuntimeRoot $Asset.name
-    Get-RemoteFile -Url $Asset.browser_download_url -Destination $Archive
-    Expand-Archive -LiteralPath $Archive -DestinationPath $RuntimeRoot -Force
-    Remove-Item -LiteralPath $Archive -Force
-}
-if (-not (Get-ChildItem $RuntimeRoot -Filter "llama-server.exe" -Recurse)) { throw "llama-server.exe を展開できませんでした。" }
 
 if (-not $RuntimeOnly) {
     Write-Host "[4/4] PLaMo 3 Translate $ModelSize を準備しています..."
     if ($ModelSize -eq "8b") {
         $ModelFile = "plamo-3-translate-8b-Q4_K_M.gguf"
-        $ExpectedBytes = 5280435168
+        $MinimumBytes = 4000000000
     } else {
         $ModelFile = "plamo-3-translate-2b-Q4_K_M.gguf"
-        $ExpectedBytes = 1807192480
+        $MinimumBytes = 1000000000
     }
-    $BaseUrl = "https://huggingface.co/pfnet/plamo-3-translate-$ModelSize-GGUF/resolve/main"
+    $ModelRepository = "pfnet/plamo-3-translate-$ModelSize-GGUF"
+    $BaseUrl = "https://huggingface.co/$ModelRepository/resolve/main"
     $ModelPath = Join-Path $ModelRoot $ModelFile
-    Get-RemoteFile -Url "$BaseUrl/$ModelFile?download=true" -Destination $ModelPath
+    Get-RemoteFile -Url "$BaseUrl/${ModelFile}?download=true" -Destination $ModelPath
     $ActualBytes = (Get-Item -LiteralPath $ModelPath).Length
-    if ($ActualBytes -ne $ExpectedBytes) {
-        throw "モデルのファイルサイズが公式値と一致しません（期待: $ExpectedBytes / 実際: $ActualBytes）。"
+    if ($ActualBytes -lt $MinimumBytes) {
+        throw "モデルファイルが小さすぎます（最低: $MinimumBytes / 実際: $ActualBytes）。"
     }
+
+    $Stream = [System.IO.File]::OpenRead($ModelPath)
+    try {
+        $Header = New-Object byte[] 4
+        [void]$Stream.Read($Header, 0, 4)
+        $Magic = [System.Text.Encoding]::ASCII.GetString($Header)
+    } finally {
+        $Stream.Dispose()
+    }
+    if ($Magic -ne "GGUF") { throw "モデルファイルのGGUFヘッダーを確認できません。" }
+
+    $RemoteEntry = $null
+    try {
+        $TreeUrl = "https://huggingface.co/api/models/$ModelRepository/tree/main?recursive=false&expand=false"
+        $RemoteTree = Invoke-RestMethod -Uri $TreeUrl
+        $RemoteEntry = @($RemoteTree) | ForEach-Object { $_ } | Where-Object { $_.path -eq $ModelFile } | Select-Object -First 1
+    } catch {
+        Write-Warning "Hugging Face APIへ接続できないため、公式サイズとSHA-256の照合を省略します。"
+    }
+    if ($RemoteEntry) {
+        if ($ActualBytes -ne [long]$RemoteEntry.size) {
+            throw "モデルのサイズが公式APIと一致しません（期待: $($RemoteEntry.size) / 実際: $ActualBytes）。"
+        }
+        if ($RemoteEntry.lfs.oid) {
+            Write-Host "  SHA-256を検証しています..."
+            $LocalHash = (Get-FileHash -LiteralPath $ModelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($LocalHash -ne $RemoteEntry.lfs.oid.ToLowerInvariant()) {
+                throw "モデルのSHA-256が公式APIと一致しません。"
+            }
+        }
+    }
+    Write-Host "  モデル検証完了: $ModelFile ($ActualBytes bytes)"
     Get-RemoteFile -Url "$BaseUrl/chat_template.jinja?download=true" -Destination (Join-Path $ModelRoot "chat_template.jinja")
 } else {
     Write-Host "[4/4] RuntimeOnly のためモデル取得を省略しました。"

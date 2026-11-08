@@ -30,6 +30,88 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\start.ps1
 ```
 
+## モデルの取得
+
+### 推奨: セットアップスクリプトで取得
+
+PowerShellをプロジェクトフォルダで開き、次を実行します。
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup.ps1 -ModelSize 8b
+```
+
+スクリプトは次の処理を行います。
+
+1. PLaMo Community Licenseと公式モデルURLを表示し、同意を確認します。
+2. `.venv/` を作り、`pypdf` をインストールします。
+3. NVIDIA GPUがあればllama.cppのWindows CUDA 12.4版、なければVulkan版を公式GitHub Releasesから取得します。
+4. PFN公式Hugging Faceからモデルとチャットテンプレートを取得します。
+5. GGUFヘッダー、ファイルサイズ、SHA-256をHugging Face公式APIの現在値と照合します。
+
+既定の8Bモデル:
+
+| 項目 | 値 |
+|---|---|
+| リポジトリ | `pfnet/plamo-3-translate-8b-GGUF` |
+| ファイル | `plamo-3-translate-8b-Q4_K_M.gguf` |
+| サイズ | 5,280,445,728 bytes（約5.28GB、2026-11-08時点） |
+| SHA-256 | `94e5d3f91b421f7c8900ddaac27b11a19f7441426c954bbb25a2fd60a1640187`（同日時点） |
+| 保存先 | `models/plamo-3-translate-8b-Q4_K_M.gguf` |
+| 追加ファイル | `models/chat_template.jinja` |
+
+途中で通信が切れた場合は、同じコマンドをもう一度実行してください。`.partial` ファイルから再開します。完成済みファイルは再取得しません。
+
+### 軽量な2Bモデルを使う
+
+VRAMが少ないPCや速度を優先する場合:
+
+```powershell
+.\setup.ps1 -ModelSize 2b
+```
+
+取得するファイルは `plamo-3-translate-2b-Q4_K_M.gguf`（1,807,203,040 bytes、約1.81GB、2026-11-08時点）です。8Bと2Bを両方置いた場合、アプリはファイル名順で最初に見つかったGGUFを使うため、使用しない方を `models/` の外へ移してください。
+
+### モデルだけ手動で取得
+
+llama.cppとPython環境を既に準備済みの場合は、公式URLからモデルだけ取得できます。
+
+```powershell
+New-Item -ItemType Directory -Force .\models | Out-Null
+
+curl.exe -L --fail --retry 4 -C - `
+  -o .\models\plamo-3-translate-8b-Q4_K_M.gguf.partial `
+  "https://huggingface.co/pfnet/plamo-3-translate-8b-GGUF/resolve/main/plamo-3-translate-8b-Q4_K_M.gguf?download=true"
+
+if ($LASTEXITCODE -ne 0) {
+  throw "モデルのダウンロードに失敗しました。同じコマンドで再開してください。"
+}
+
+Move-Item `
+  .\models\plamo-3-translate-8b-Q4_K_M.gguf.partial `
+  .\models\plamo-3-translate-8b-Q4_K_M.gguf
+
+curl.exe -L --fail --retry 4 `
+  -o .\models\chat_template.jinja `
+  "https://huggingface.co/pfnet/plamo-3-translate-8b-GGUF/resolve/main/chat_template.jinja?download=true"
+```
+
+取得後の確認:
+
+```powershell
+Get-Item .\models\*.gguf | Select-Object Name, Length
+Get-ChildItem .\runtime -Filter llama-server.exe -Recurse
+nvidia-smi
+```
+
+### モデル取得時の注意
+
+- 空き容量は8B構成で最低10GB、ビルド成果物も作る場合は15GB以上を推奨します。
+- モデルはGit管理対象外です。`.gitignore` により `.gguf`、ランタイム、論文、翻訳結果はpushされません。
+- プロキシ環境では `HTTPS_PROXY` を設定してから `setup.ps1` を再実行してください。
+- 組織内利用はPLaMo Community License上の商業目的に含まれます。該当する場合はPFNの条件に従って事前登録または契約を行ってください。
+- 取得元を変更した非公式GGUFは、テンプレートや量子化方式が異なる可能性があるためサポート対象外です。
+
 ## 使い方
 
 1. PDF / TXT / Markdown をドロップします。
