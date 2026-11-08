@@ -1,5 +1,6 @@
 const JOB_STORAGE_KEY = 'plamo-paper-translator.job-id';
 const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0 };
+const noteTimers = new Map();
 const $ = (id) => document.getElementById(id);
 
 function toast(message) {
@@ -10,6 +11,7 @@ function toast(message) {
 function showStep(number) {
   document.querySelectorAll('.panel').forEach((node, i) => node.classList.toggle('active', i === number - 1));
   document.querySelectorAll('.step').forEach((node, i) => node.classList.toggle('active', i === number - 1));
+  document.querySelector('.workspace').classList.toggle('reading', number === 3);
   window.scrollTo({top: document.querySelector('.workspace').offsetTop - 90, behavior: 'smooth'});
 }
 
@@ -30,7 +32,7 @@ async function upload(file) {
     const response = await fetch('/api/documents', {method: 'POST', headers: {'X-Filename': encodeURIComponent(file.name), 'Content-Type': file.type || 'application/octet-stream'}, body: file});
     const data = await response.json(); if (!response.ok) throw new Error(data.error || '読み込みに失敗しました');
     state.documentId = data.id; $('title').value = data.title;
-    $('uploadState').innerHTML = `<div><b>${escapeHtml(data.filename)}</b><p>本文の抽出が完了しました</p></div><div class="document-stats"><span>${data.pages}ページ</span><span>${data.segment_count}区間</span><span>${data.characters.toLocaleString()}文字</span></div>`;
+    $('uploadState').innerHTML = `<div><b>${escapeHtml(data.filename)}</b><p>本文の抽出が完了しました</p></div><div class="document-stats"><span>${data.pages}ページ</span><span>${data.segment_count}行</span><span>${data.characters.toLocaleString()}文字</span></div>`;
     $('toSettings').disabled = false; toast('論文を読み込みました');
   } catch (error) { $('uploadState').innerHTML = `<div><b>読み込めませんでした</b><p>${escapeHtml(error.message)}</p></div>`; toast(error.message); }
 }
@@ -75,10 +77,39 @@ async function pollJob() {
 
 function showResults(data) {
   $('progressBox').classList.add('hidden'); $('resultActions').classList.remove('hidden');
-  $('resultSubtitle').textContent = `${data.total}区間の対訳が完成しました。HTMLはブラウザからPDF印刷もできます。`;
+  $('readerHeader').classList.remove('hidden');
+  $('resultSubtitle').textContent = `${data.total}行の対訳が完成しました。Pは段落、Sは段落内の文番号です。`;
   ['Html','Md','Json'].forEach((format) => $(`export${format}`).href = `/api/jobs/${state.jobId}/export?format=${format.toLowerCase()}`);
-  $('results').innerHTML = data.segments.map((item) => `<section class="pair"><span class="page">PAGE ${item.page}</span><article><h3>ORIGINAL</h3><p>${escapeHtml(item.source)}</p></article><article><h3>TRANSLATION</h3><p>${escapeHtml(item.translation || `⚠ ${item.error || '未翻訳'}`)}</p></article></section>`).join('');
+  $('results').innerHTML = data.segments.map((item, position, list) => renderSegment(item, position, list)).join('');
   toast('翻訳が完了しました');
+}
+
+function renderSegment(item, position, list) {
+  const kind = item.kind || 'sentence';
+  const labels = {sentence:'文', heading:'見出し', equation:'数式', table:'表', figure:'図'};
+  const translation = item.translation || `⚠ ${item.error || '未翻訳'}`;
+  const imageItems = (item.assets || []).map((asset, number) => `<figure><a href="${escapeHtml(asset)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(asset)}" alt="図 ${item.index + 1}-${number + 1}" loading="lazy"></a></figure>`).join('');
+  const images = imageItems ? `<div class="figure-gallery">${imageItems}</div>` : '';
+  const hasPosition = Number(item.paragraph) > 0;
+  const isParagraphStart = hasPosition && (position === 0 || item.paragraph !== list[position - 1].paragraph);
+  const unitPosition = hasPosition ? `P${item.paragraph} / S${item.sentence}` : '旧形式';
+  return `<section class="reader-row kind-${escapeHtml(kind)}${isParagraphStart ? ' paragraph-start' : ''}" data-index="${item.index}">
+    <div class="unit-meta"><b>${String(item.index + 1).padStart(3, '0')}</b><span>${escapeHtml(unitPosition)}</span><i>${labels[kind] || kind}</i></div>
+    <article class="source-pane">${images}<p>${escapeHtml(item.source)}</p></article>
+    <article class="translation-pane"><p>${escapeHtml(translation)}</p></article>
+    <aside class="memo-pane"><textarea class="note-editor" data-note-index="${item.index}" aria-label="${item.index + 1}番のメモ" placeholder="この箇所へのメモ…">${escapeHtml(item.note || '')}</textarea><small class="note-status">${item.note ? '保存済み' : '未入力'}</small></aside>
+  </section>`;
+}
+
+async function saveNote(index, note, status) {
+  try {
+    const response = await fetch(`/api/jobs/${state.jobId}/notes`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index, note})});
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'メモを保存できません');
+    status.textContent = '保存済み'; status.className = 'note-status saved';
+  } catch (_) {
+    status.textContent = '保存を再試行します'; status.className = 'note-status error';
+    noteTimers.set(index, setTimeout(() => saveNote(index, note, status), 3000));
+  }
 }
 
 function escapeHtml(value) { const node = document.createElement('div'); node.textContent = String(value ?? ''); return node.innerHTML; }
@@ -95,6 +126,16 @@ $('targetLang').addEventListener('change', () => $('form').closest('label').styl
 $('startTranslation').addEventListener('click', startJob);
 $('cancelJob').addEventListener('click', async () => { if(state.jobId) await fetch(`/api/jobs/${state.jobId}/cancel`, {method:'POST'}); });
 $('newPaper').addEventListener('click', () => { localStorage.removeItem(JOB_STORAGE_KEY); location.href = '/'; });
+$('results').addEventListener('input', (event) => {
+  const editor = event.target.closest('.note-editor'); if (!editor) return;
+  const index = Number(editor.dataset.noteIndex); const status = editor.nextElementSibling;
+  clearTimeout(noteTimers.get(index)); status.textContent = '保存中…'; status.className = 'note-status saving';
+  noteTimers.set(index, setTimeout(() => saveNote(index, editor.value, status), 650));
+});
+$('readerSearch').addEventListener('input', (event) => {
+  const query = event.target.value.trim().toLocaleLowerCase();
+  document.querySelectorAll('.reader-row').forEach((row) => row.classList.toggle('filtered', Boolean(query) && !row.textContent.toLocaleLowerCase().includes(query)));
+});
 
 function resumeJob() {
   const requested = new URLSearchParams(location.search).get('job');

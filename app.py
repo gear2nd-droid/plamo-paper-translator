@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
 import json
 import mimetypes
 import os
@@ -38,9 +39,10 @@ STATIC_DIR = APP_DIR / "static"
 DATA_DIR = USER_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 JOB_DIR = DATA_DIR / "jobs"
+ASSET_DIR = DATA_DIR / "assets"
 RUNTIME_DIR = USER_DIR / "runtime"
 MODEL_DIR = USER_DIR / "models"
-for directory in (DATA_DIR, UPLOAD_DIR, JOB_DIR):
+for directory in (DATA_DIR, UPLOAD_DIR, JOB_DIR, ASSET_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 documents: dict[str, dict[str, Any]] = {}
@@ -137,6 +139,24 @@ def _save_job(job: dict[str, Any]) -> None:
     (JOB_DIR / f'{job["id"]}.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _asset_path(url: str) -> Path | None:
+    match = re.fullmatch(r"/api/assets/([a-f0-9]{32})/([\w.-]+)", urllib.parse.urlparse(url).path)
+    if not match:
+        return None
+    target = (ASSET_DIR / match.group(1) / match.group(2)).resolve()
+    root = ASSET_DIR.resolve()
+    return target if root in target.parents and target.is_file() else None
+
+
+def _inline_asset(url: str) -> str:
+    target = _asset_path(url)
+    if not target:
+        return url
+    mime_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    encoded = base64.b64encode(target.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
 def _load_saved_job(job_id: str) -> dict[str, Any] | None:
     if not re.fullmatch(r"[a-f0-9]{32}", job_id):
         return None
@@ -186,20 +206,21 @@ def _translate_job(job_id: str) -> None:
                 job["message"] = "キャンセルしました"
                 _save_job(job)
                 return
-            job["message"] = f"{index + 1} / {len(segments)} セグメントを翻訳中"
+            job["message"] = f"{index + 1} / {len(segments)} 行を翻訳中"
             job["completed"] = index
-        context = neighboring_context(segments, index, job.get("context", ""))
-        try:
-            segment.translation = translator.translate(
-                segment.source,
-                target_lang=job["target_lang"],
-                source_lang=job["source_lang"],
-                form=job["form"],
-                context=context,
-                glossary=glossary,
-            )
-        except Exception as exc:
-            segment.error = str(exc)
+        if segment.label != "asset":
+            context = neighboring_context(segments, index, job.get("context", ""))
+            try:
+                segment.translation = translator.translate(
+                    segment.source,
+                    target_lang=job["target_lang"],
+                    source_lang=job["source_lang"],
+                    form=job["form"],
+                    context=context,
+                    glossary=glossary,
+                )
+            except Exception as exc:
+                segment.error = str(exc)
         with state_lock:
             job["completed"] = index + 1
             job["progress"] = round((index + 1) / len(segments) * 100, 1)
@@ -251,6 +272,20 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
             return
+        asset_match = re.fullmatch(r"/api/assets/([a-f0-9]{32})/([\w.-]+)", path)
+        if asset_match:
+            target = _asset_path(path)
+            if not target:
+                self._error("画像が見つかりません。", 404)
+                return
+            body = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, max-age=3600")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]+)", path)
         if match:
             job = _load_saved_job(match.group(1))
@@ -281,7 +316,7 @@ class Handler(BaseHTTPRequestHandler):
                 ).encode("utf-8")
                 content_type, ext = "application/json; charset=utf-8", "json"
             else:
-                content = bilingual_html(job["title"], job["segments"]).encode("utf-8")
+                content = bilingual_html(job["title"], job["segments"], asset_resolver=_inline_asset).encode("utf-8")
                 content_type, ext = "text/html; charset=utf-8", "html"
             filename = re.sub(r"[^\w\-]+", "_", job["title"])[:60] or "translation"
             self.send_response(200)
@@ -318,6 +353,27 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/jobs":
             self._create_job()
             return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/notes", parsed.path)
+        if match:
+            job = _load_saved_job(match.group(1))
+            if not job:
+                self._error("ジョブが見つかりません。", 404)
+                return
+            try:
+                data = self._read_json()
+                index = int(data.get("index", -1))
+                note = str(data.get("note", ""))[:10_000]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self._error("メモを保存できません。")
+                return
+            with state_lock:
+                if index < 0 or index >= len(job["segments"]):
+                    self._error("対訳位置が不正です。")
+                    return
+                job["segments"][index].note = note
+                _save_job(job)
+            self._json({"ok": True, "index": index})
+            return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/cancel", parsed.path)
         if match:
             with state_lock:
@@ -350,9 +406,15 @@ class Handler(BaseHTTPRequestHandler):
                 handle.write(chunk)
                 remaining -= len(chunk)
         try:
-            segments, pages = extract_document(target)
+            document_assets = ASSET_DIR / document_id
+            segments, pages = extract_document(
+                target,
+                asset_dir=document_assets,
+                asset_url_prefix=f"/api/assets/{document_id}",
+            )
         except Exception as exc:
             target.unlink(missing_ok=True)
+            shutil.rmtree(ASSET_DIR / document_id, ignore_errors=True)
             self._error(str(exc))
             return
         title = Path(filename).stem

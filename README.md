@@ -1,6 +1,6 @@
 # PLaMo Paper Translator
 
-PLaMo 3 Translate をこのPC上で動かし、PDF論文を段落単位の対訳にするローカルアプリです。原文・訳文を並べて確認でき、HTML / Markdown / JSON へ保存できます。
+PLaMo 3 Translate をこのPC上で動かし、PDF論文を一文単位の対訳にするローカルアプリです。原文・訳文・箇所別メモを3ペインで確認でき、HTML / Markdown / JSON へ保存できます。
 
 > Built with PLaMo. モデル本体はリポジトリに同梱せず、初回セットアップ時にPFNの公式配布元から取得します。
 
@@ -44,7 +44,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 スクリプトは次の処理を行います。
 
 1. PLaMo Community Licenseと公式モデルURLを表示し、同意を確認します。
-2. `.venv/` を作り、`pypdf` をインストールします。
+2. `.venv/` を作り、`pypdf` と図抽出用の `Pillow` をインストールします。
 3. NVIDIA GPUがあればllama.cppのWindows CUDA 12.4版、なければVulkan版を公式GitHub Releasesから取得します。
 4. PFN公式Hugging Faceからモデルとチャットテンプレートを取得します。
 5. GGUFヘッダー、ファイルサイズ、SHA-256をHugging Face公式APIの現在値と照合します。
@@ -118,14 +118,19 @@ nvidia-smi
 2. 原文と翻訳先の言語、日本語の文体を選びます。
 3. 必要なら参考文脈と用語集を入力します。用語集は `原語 = 訳語` を1行ずつ書きます。
 4. 「翻訳を開始」を押します。
-5. 完了後、対訳をHTML / Markdown / JSONで保存します。HTMLはブラウザの印刷機能でPDFにもできます。
+5. 完了後、左の原文、中央の訳文、右のメモを一文ずつ確認します。各行の `P段落番号 / S文番号` と太い区切りで段落境界も確認でき、メモは入力後に自動保存されます。
+6. 対訳をHTML / Markdown / JSONで保存します。HTMLは図とメモを埋め込んだ単体ファイルです。
 
-アプリは段落を最大約1,800文字に分け、直前・直後の原文を参考文脈として付与します。PLaMo公式の `chat_template_kwargs` を使い、`target_lang`、`source_lang`、`context`、`glossary`、`form` をモデルへ渡します。
+アプリは論文を一文単位へ分割し、見出し、数式、表、図キャプションを別ブロックとして保持します。表示とメモは一文単位ですが、翻訳時は同じ段落の前後文を参考文脈として付与します。PLaMo公式の `chat_template_kwargs` を使って `target_lang`、`source_lang`、`context`、`glossary`、`form` をモデルへ渡します。
+
+閲覧画面はA4や元PDFのページ境界に合わせず、PCとタブレットの横幅を使う研究リーダー形式です。タブレットの狭い画面では、原文・訳文の下へメモ欄が回り込みます。
 
 ## 対応範囲と制約
 
 - テキストを内包するPDFに対応します。画像だけのスキャンPDFは、先にOCRしてください。
-- 二段組み、脚注、複雑な数式の読み順はPDF内部の文字順序に依存します。原文は対訳に必ず残るため、訳文と照合できます。
+- 二段組みはPDF内部の読み順に沿って抽出します。複雑な脚注や数式の文字表現はPDFの内部構造に依存します。
+- PDFに埋め込まれたラスター図は抽出して図キャプション付近へ配置します。ベクターだけで描かれた図や、画像化されていない表は原文テキストとして保持されます。
+- 数式と数値中心の表は原文を崩さないよう等幅表示します。意味を変えないため、非言語的な数式は翻訳せず原文を併記します。
 - 翻訳は機械生成です。投稿・契約・医療判断などに使う場合は、専門家による校正が必要です。
 - 初回ダウンロード後の翻訳はオフラインで動作します。
 - 論文と結果は `data/`、モデルは `models/`、推論ランタイムは `runtime/` に保存されます。
@@ -152,5 +157,6 @@ nvidia-smi
 - PLaMo 3 Translate 8B GGUF: https://huggingface.co/pfnet/plamo-3-translate-8b-GGUF
 - llama.cpp: https://github.com/ggml-org/llama.cpp
 - pypdf: https://pypdf.readthedocs.io/
+- Pillow: https://python-pillow.org/
 
 生成物を公表する場合の表示義務や、組織内利用を含む商用利用の登録条件について、必ず最新のPLaMo Community License本文を確認してください。

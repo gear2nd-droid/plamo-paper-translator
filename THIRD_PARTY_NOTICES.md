@@ -21,4 +21,9 @@
 - Project: https://github.com/py-pdf/pypdf
 - License: BSD-3-Clause
 
+## Pillow
+
+- Project: https://python-pillow.org/
+- License: HPND
+
 このファイルは要約です。正確な条件は、取得時点の各公式ライセンス本文を優先してください。

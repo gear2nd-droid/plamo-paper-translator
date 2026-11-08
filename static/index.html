@@ -20,7 +20,7 @@
       <div>
         <p class="eyebrow">LOCAL · PRIVATE · BILINGUAL</p>
         <h1>論文の構造を追いながら、<br><em>読み進められる対訳</em>をつくる。</h1>
-        <p class="lead">PDFを段落単位に分け、周辺文脈と用語集をPLaMo 3 Translateへ渡します。原文は必ず残り、処理はこのPC内で完結します。</p>
+        <p class="lead">PDFを一文単位に整え、見出し・数式・表・図を保ったままPLaMo 3 Translateへ渡します。原文・訳文・メモを並べ、処理はこのPC内で完結します。</p>
       </div>
       <div class="hero-art" aria-hidden="true"><span>EN</span><span class="line"></span><span>JA</span></div>
     </section>
@@ -67,8 +67,10 @@
           </div>
           <div id="resultActions" class="result-actions hidden">
             <a id="exportHtml" class="primary small" download>HTMLで保存</a><a id="exportMd" class="secondary small" download>Markdown</a><a id="exportJson" class="secondary small" download>JSON</a>
+            <label class="reader-search"><span>文中検索</span><input id="readerSearch" type="search" placeholder="原文・訳文・メモ"></label>
             <button id="newPaper" class="text-button">別の論文を翻訳</button>
           </div>
+          <div id="readerHeader" class="reader-header hidden"><span>NO.</span><b>原文</b><b>対訳</b><b>メモ <small>自動保存</small></b></div>
           <div id="results" class="results"></div>
         </section>
       </div>
