@@ -286,6 +286,43 @@ def split_document_units(
     return units
 
 
+def segments_for_mode(segments: Iterable[Segment], mode: str) -> list[Segment]:
+    """Return independent sentence rows or consecutive paragraph rows."""
+    source_segments = list(segments)
+    if mode == "sentence":
+        return [Segment(**segment.__dict__) for segment in source_segments]
+    if mode != "paragraph":
+        raise ValueError("分割モードが不正です。")
+
+    grouped: list[list[Segment]] = []
+    for segment in source_segments:
+        if grouped and segment.paragraph and grouped[-1][0].paragraph == segment.paragraph:
+            grouped[-1].append(segment)
+        else:
+            grouped.append([segment])
+
+    result: list[Segment] = []
+    for members in grouped:
+        first = members[0]
+        kinds = {member.kind for member in members}
+        result.append(
+            Segment(
+                index=len(result),
+                page=first.page,
+                source=" ".join(member.source.strip() for member in members if member.source.strip()),
+                translation=" ".join(member.translation.strip() for member in members if member.translation.strip()),
+                error="; ".join(member.error for member in members if member.error),
+                kind=first.kind if len(kinds) == 1 else "sentence",
+                label=next((member.label for member in members if member.label), ""),
+                assets=[asset for member in members for asset in member.assets],
+                note="\n".join(member.note for member in members if member.note),
+                paragraph=first.paragraph,
+                sentence=0,
+            )
+        )
+    return result
+
+
 def _extract_page_images(page: Any, asset_dir: Path | None, page_number: int, url_prefix: str) -> list[str]:
     if asset_dir is None:
         return []
@@ -510,11 +547,12 @@ def bilingual_markdown(title: str, segments: Iterable[Segment]) -> str:
         if segment.kind == "heading":
             lines.extend([f"## {segment.source}", "", f"**訳:** {segment.translation or segment.source}", ""])
             continue
+        position = f"P{segment.paragraph} / S{segment.sentence}" if segment.sentence else f"P{segment.paragraph}"
         for asset in segment.assets:
             lines.extend([f"![{segment.label or 'Figure'}]({asset})", ""])
         lines.extend(
             [
-                f"### {segment.index + 1}. 原文（P{segment.paragraph} / S{segment.sentence}）",
+                f"### {segment.index + 1}. 原文（{position}）",
                 "",
                 segment.source,
                 "",
@@ -545,7 +583,10 @@ def bilingual_html(
         if images:
             images = f'<div class="figure-gallery">{images}</div>'
         paragraph_start = bool(segment.paragraph and segment.paragraph != previous_paragraph)
-        position = f"P{segment.paragraph}<br>S{segment.sentence}" if segment.paragraph else "旧形式"
+        if segment.paragraph:
+            position = f"P{segment.paragraph}<br>S{segment.sentence}" if segment.sentence else f"P{segment.paragraph}"
+        else:
+            position = "旧形式"
         rows.append(
             f'<section class="reader-row kind-{html.escape(segment.kind)}{" paragraph-start" if paragraph_start else ""}">'
             f'<div class="number"><b>{segment.index + 1}</b><span>{position}</span></div>'
@@ -564,9 +605,9 @@ def bilingual_html(
 header{{padding:28px 32px;border-bottom:1px solid #d8d5ca;background:#fff;position:sticky;top:0;z-index:2}}h1{{font:600 1.45rem Georgia,"Yu Mincho",serif;margin:0}}
 .labels,.reader-row{{display:grid;grid-template-columns:44px minmax(300px,1fr) minmax(300px,1fr) minmax(230px,.72fr);max-width:1800px;margin:auto}}
 .labels{{position:sticky;top:89px;z-index:2;background:#174d36;color:#fff;font-size:.72rem;letter-spacing:.1em}}.labels>*{{padding:10px 18px;border-right:1px solid #376750}}
-.reader-row{{background:#fff;border-bottom:1px solid #dedbd1;align-items:stretch}}.reader-row>*{{padding:19px 22px;border-right:1px solid #e1ded5;min-width:0}}
+.reader-row{{background:#fff;border-bottom:1px solid #dedbd1;align-items:stretch}}.reader-row>*{{padding:10px 12px;border-right:1px solid #e1ded5;min-width:0}}
 .number{{color:#728078;text-align:center;padding:22px 5px}}.number b,.number span{{display:block}}.number b{{font:italic .72rem Georgia,serif}}.number span{{font-size:.58rem;line-height:1.45;margin-top:7px}}p{{white-space:pre-wrap;line-height:1.78;margin:0;overflow-wrap:anywhere}}.source p{{font-family:Georgia,"Times New Roman","Yu Mincho",serif}}.translation{{background:#fbfcf9}}.note{{background:#f8f5ed;color:#5f675f;font-size:.86rem}}.note span{{color:#a0a49d}}
-.paragraph-start{{border-top:3px solid #9aab9f;margin-top:14px}}
+.paragraph-start{{border-top:3px solid #9aab9f;margin-top:8px}}
 .kind-heading{{margin-top:24px;border-top:3px solid #174d36}}.kind-heading p{{font-weight:700;font-size:1.08rem}}.kind-equation p,.kind-table p{{font-family:"Cambria Math",Consolas,monospace;white-space:pre-wrap}}.figure-gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px}}figure{{margin:0;background:#fff}}img{{display:block;width:100%;height:100%;max-height:460px;object-fit:contain;margin:auto;border:1px solid #ddd}}
 @media(max-width:900px){{.labels,.reader-row{{grid-template-columns:36px minmax(260px,1fr) minmax(260px,1fr)}}.labels .memo-label{{display:none}}.note{{grid-column:2/4;border-top:1px dashed #d8d5ca}}}}
 @media(max-width:620px){{header{{padding:20px 16px}}.labels{{display:none}}.reader-row{{grid-template-columns:32px 1fr}}.reader-row>*{{grid-column:2}}.number{{grid-column:1!important;grid-row:1/4}}}}

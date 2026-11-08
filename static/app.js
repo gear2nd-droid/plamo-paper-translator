@@ -39,7 +39,7 @@ async function upload(file) {
 
 async function startJob() {
   if (!state.documentId) return toast('先に論文を読み込んでください');
-  const payload = {document_id: state.documentId, title: $('title').value, source_lang: $('sourceLang').value, target_lang: $('targetLang').value, form: $('form').value, context: $('context').value, glossary: $('glossary').value};
+  const payload = {document_id: state.documentId, title: $('title').value, segmentation_mode: document.querySelector('input[name="segmentationMode"]:checked').value, source_lang: $('sourceLang').value, target_lang: $('targetLang').value, form: $('form').value, context: $('context').value, glossary: $('glossary').value};
   showStep(3); $('progressBox').classList.remove('hidden'); $('resultActions').classList.add('hidden'); $('results').innerHTML = '';
   try {
     const response = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
@@ -78,13 +78,15 @@ async function pollJob() {
 function showResults(data) {
   $('progressBox').classList.add('hidden'); $('resultActions').classList.remove('hidden');
   $('readerHeader').classList.remove('hidden');
-  $('resultSubtitle').textContent = `${data.total}行の対訳が完成しました。Pは段落、Sは段落内の文番号です。`;
+  const mode = data.segmentation_mode || 'sentence';
+  $('resultSubtitle').textContent = mode === 'paragraph' ? `${data.total}段落・構造ブロックの対訳が完成しました。` : `${data.total}行の対訳が完成しました。Pは段落、Sは段落内の文番号です。`;
   ['Html','Md','Json'].forEach((format) => $(`export${format}`).href = `/api/jobs/${state.jobId}/export?format=${format.toLowerCase()}`);
-  $('results').innerHTML = data.segments.map((item, position, list) => renderSegment(item, position, list)).join('');
+  $('results').innerHTML = data.segments.map((item, position, list) => renderSegment(item, position, list, mode)).join('');
+  document.querySelectorAll('.note-editor').forEach(resizeNote);
   toast('翻訳が完了しました');
 }
 
-function renderSegment(item, position, list) {
+function renderSegment(item, position, list, mode) {
   const kind = item.kind || 'sentence';
   const labels = {sentence:'文', heading:'見出し', equation:'数式', table:'表', figure:'図'};
   const translation = item.translation || `⚠ ${item.error || '未翻訳'}`;
@@ -92,13 +94,19 @@ function renderSegment(item, position, list) {
   const images = imageItems ? `<div class="figure-gallery">${imageItems}</div>` : '';
   const hasPosition = Number(item.paragraph) > 0;
   const isParagraphStart = hasPosition && (position === 0 || item.paragraph !== list[position - 1].paragraph);
-  const unitPosition = hasPosition ? `P${item.paragraph} / S${item.sentence}` : '旧形式';
+  const unitPosition = hasPosition ? (Number(item.sentence) > 0 ? `P${item.paragraph} / S${item.sentence}` : `P${item.paragraph}`) : '旧形式';
+  const unitLabel = mode === 'paragraph' && kind === 'sentence' ? '段落' : (labels[kind] || kind);
   return `<section class="reader-row kind-${escapeHtml(kind)}${isParagraphStart ? ' paragraph-start' : ''}" data-index="${item.index}">
-    <div class="unit-meta"><b>${String(item.index + 1).padStart(3, '0')}</b><span>${escapeHtml(unitPosition)}</span><i>${labels[kind] || kind}</i></div>
+    <div class="unit-meta"><b>${String(item.index + 1).padStart(3, '0')}</b><span>${escapeHtml(unitPosition)}</span><i>${escapeHtml(unitLabel)}</i></div>
     <article class="source-pane">${images}<p>${escapeHtml(item.source)}</p></article>
     <article class="translation-pane"><p>${escapeHtml(translation)}</p></article>
-    <aside class="memo-pane"><textarea class="note-editor" data-note-index="${item.index}" aria-label="${item.index + 1}番のメモ" placeholder="この箇所へのメモ…">${escapeHtml(item.note || '')}</textarea><small class="note-status">${item.note ? '保存済み' : '未入力'}</small></aside>
+    <aside class="memo-pane"><textarea class="note-editor" rows="1" data-note-index="${item.index}" aria-label="${item.index + 1}番のメモ" placeholder="この箇所へのメモ…">${escapeHtml(item.note || '')}</textarea><small class="note-status">${item.note ? '保存済み' : '未入力'}</small></aside>
   </section>`;
+}
+
+function resizeNote(editor) {
+  editor.style.height = 'auto';
+  editor.style.height = `${editor.scrollHeight}px`;
 }
 
 async function saveNote(index, note, status) {
@@ -128,6 +136,7 @@ $('cancelJob').addEventListener('click', async () => { if(state.jobId) await fet
 $('newPaper').addEventListener('click', () => { localStorage.removeItem(JOB_STORAGE_KEY); location.href = '/'; });
 $('results').addEventListener('input', (event) => {
   const editor = event.target.closest('.note-editor'); if (!editor) return;
+  resizeNote(editor);
   const index = Number(editor.dataset.noteIndex); const status = editor.nextElementSibling;
   clearTimeout(noteTimers.get(index)); status.textContent = '保存中…'; status.className = 'note-status saving';
   noteTimers.set(index, setTimeout(() => saveNote(index, editor.value, status), 650));

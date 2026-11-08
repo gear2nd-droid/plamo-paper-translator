@@ -28,7 +28,7 @@
     <section class="workspace">
       <aside class="steps" aria-label="進行状況">
         <button class="step active" data-step="1"><span>01</span><div><b>論文</b><small>ファイルを選択</small></div></button>
-        <button class="step" data-step="2"><span>02</span><div><b>翻訳設定</b><small>言語・用語・文体</small></div></button>
+        <button class="step" data-step="2"><span>02</span><div><b>翻訳設定</b><small>分割・言語・用語</small></div></button>
         <button class="step" data-step="3"><span>03</span><div><b>対訳</b><small>確認して保存</small></div></button>
       </aside>
 
@@ -49,6 +49,11 @@
           <div class="panel-heading"><span>STEP 02</span><h2>訳し方を整える</h2><p>論文タイトルと専門用語を渡すと、一貫性が上がります。</p></div>
           <div class="form-grid">
             <label class="field full"><span>論文タイトル</span><input id="title" type="text" placeholder="Paper title"></label>
+            <fieldset class="mode-switch full">
+              <legend>分割モード</legend>
+              <label><input type="radio" name="segmentationMode" value="sentence" checked><span><b>一文単位</b><small>一文ずつ対訳し、同じ段落の前後文を参考にします</small></span></label>
+              <label><input type="radio" name="segmentationMode" value="paragraph"><span><b>段落単位</b><small>段落全体をまとめて翻訳します</small></span></label>
+            </fieldset>
             <label class="field"><span>原文の言語</span><select id="sourceLang"><option value="auto">自動判定</option><option value="en">英語</option><option value="ja">日本語</option><option value="zh">中国語</option><option value="ko">韓国語</option><option value="de">ドイツ語</option><option value="fr">フランス語</option></select></label>
             <label class="field"><span>翻訳先</span><select id="targetLang"><option value="ja">日本語</option><option value="en">英語</option><option value="zh">中国語</option><option value="ko">韓国語</option><option value="de">ドイツ語</option><option value="fr">フランス語</option></select></label>
             <label class="field"><span>日本語の文体</span><select id="form"><option value="plain">常体（である調）</option><option value="polite">敬体（です・ます調）</option></select></label>

@@ -15,6 +15,7 @@ from paper_core import (
     bilingual_html,
     neighboring_context,
     parse_glossary,
+    segments_for_mode,
     split_document_units,
     split_text,
 )
@@ -85,6 +86,25 @@ class CoreTests(unittest.TestCase):
         context = neighboring_context(segments, 1)
         self.assertIn("First.", context)
         self.assertNotIn("Different paragraph.", context)
+
+    def test_paragraph_mode_groups_sentence_rows(self):
+        segments = [
+            Segment(0, 1, "First sentence.", kind="sentence", paragraph=1, sentence=1),
+            Segment(1, 1, "Second sentence.", kind="sentence", paragraph=1, sentence=2),
+            Segment(2, 1, "Figure 1: Sample.", kind="figure", assets=["/figure.png"], paragraph=2, sentence=1),
+        ]
+        grouped = segments_for_mode(segments, "paragraph")
+        self.assertEqual(len(grouped), 2)
+        self.assertEqual(grouped[0].source, "First sentence. Second sentence.")
+        self.assertEqual(grouped[0].sentence, 0)
+        self.assertEqual(grouped[1].assets, ["/figure.png"])
+        self.assertEqual([segment.index for segment in grouped], [0, 1])
+
+    def test_sentence_mode_returns_independent_copies(self):
+        original = Segment(0, 1, "One.", paragraph=1, sentence=1)
+        copied = segments_for_mode([original], "sentence")
+        copied[0].note = "changed"
+        self.assertEqual(original.note, "")
 
     def test_layout_whitespace_ends_figure_caption(self):
         plain = "Figure 3: Pipeline overview. It has two stages.\nBody text begins here. It continues."

@@ -30,6 +30,7 @@ from paper_core import (
     extract_document,
     neighboring_context,
     parse_glossary,
+    segments_for_mode,
 )
 
 
@@ -310,7 +311,13 @@ class Handler(BaseHTTPRequestHandler):
                 content_type, ext = "text/markdown; charset=utf-8", "md"
             elif fmt == "json":
                 content = json.dumps(
-                    document_to_dict(job["title"], job["segments"], source_lang=job["source_lang"], target_lang=job["target_lang"]),
+                    document_to_dict(
+                        job["title"],
+                        job["segments"],
+                        source_lang=job["source_lang"],
+                        target_lang=job["target_lang"],
+                        segmentation_mode=job.get("segmentation_mode", "sentence"),
+                    ),
                     ensure_ascii=False,
                     indent=2,
                 ).encode("utf-8")
@@ -450,6 +457,12 @@ class Handler(BaseHTTPRequestHandler):
         if target_lang not in {"ja", "en", "zh", "ko", "de", "fr", "es", "it", "pt", "ru"}:
             self._error("翻訳先言語が不正です。")
             return
+        segmentation_mode = str(data.get("segmentation_mode", "sentence"))
+        try:
+            selected_segments = segments_for_mode(document["segments"], segmentation_mode)
+        except ValueError as exc:
+            self._error(str(exc))
+            return
         job_id = uuid.uuid4().hex
         job = {
             "id": job_id,
@@ -459,13 +472,14 @@ class Handler(BaseHTTPRequestHandler):
             "message": "翻訳開始を待っています",
             "progress": 0,
             "completed": 0,
-            "total": len(document["segments"]),
+            "total": len(selected_segments),
+            "segmentation_mode": segmentation_mode,
             "source_lang": source_lang,
             "target_lang": target_lang,
             "form": str(data.get("form", "plain")),
             "context": str(data.get("context", ""))[:4000],
             "glossary": parse_glossary(str(data.get("glossary", ""))),
-            "segments": [Segment(**segment.__dict__) for segment in document["segments"]],
+            "segments": selected_segments,
             "cancelled": False,
         }
         with state_lock:
