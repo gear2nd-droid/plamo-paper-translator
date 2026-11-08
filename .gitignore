@@ -1,0 +1,27 @@
+# Local AI assets and user data
+models/*
+!models/.gitkeep
+runtime/*
+!runtime/.gitkeep
+data/*
+!data/.gitkeep
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Builds and logs
+build/
+dist/
+*.spec
+*.log
+*.partial
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

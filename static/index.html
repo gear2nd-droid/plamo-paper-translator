@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PLaMo Paper Translator</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">
+      <span class="brand-mark">P</span>
+      <span><b>PLaMo Paper Translator</b><small>論文を、手元のPCで。</small></span>
+    </a>
+    <div id="engineBadge" class="engine-badge waiting"><i></i><span>エンジン確認中</span></div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div>
+        <p class="eyebrow">LOCAL · PRIVATE · BILINGUAL</p>
+        <h1>論文の構造を追いながら、<br><em>読み進められる対訳</em>をつくる。</h1>
+        <p class="lead">PDFを段落単位に分け、周辺文脈と用語集をPLaMo 3 Translateへ渡します。原文は必ず残り、処理はこのPC内で完結します。</p>
+      </div>
+      <div class="hero-art" aria-hidden="true"><span>EN</span><span class="line"></span><span>JA</span></div>
+    </section>
+
+    <section class="workspace">
+      <aside class="steps" aria-label="進行状況">
+        <button class="step active" data-step="1"><span>01</span><div><b>論文</b><small>ファイルを選択</small></div></button>
+        <button class="step" data-step="2"><span>02</span><div><b>翻訳設定</b><small>言語・用語・文体</small></div></button>
+        <button class="step" data-step="3"><span>03</span><div><b>対訳</b><small>確認して保存</small></div></button>
+      </aside>
+
+      <div class="panel-stack">
+        <section id="step1" class="panel active">
+          <div class="panel-heading"><span>STEP 01</span><h2>論文ファイルを読み込む</h2><p>テキストを含む PDF、TXT、Markdown に対応しています。</p></div>
+          <label id="dropzone" class="dropzone">
+            <input id="fileInput" type="file" accept=".pdf,.txt,.md,application/pdf,text/plain,text/markdown">
+            <span class="upload-icon">↥</span>
+            <b>ここにドロップ、またはクリックして選択</b>
+            <small>最大 80MB · ファイルは外部へ送信されません</small>
+          </label>
+          <div id="uploadState" class="upload-state hidden"></div>
+          <div class="actions"><button id="toSettings" class="primary" disabled>翻訳設定へ進む <span>→</span></button></div>
+        </section>
+
+        <section id="step2" class="panel">
+          <div class="panel-heading"><span>STEP 02</span><h2>訳し方を整える</h2><p>論文タイトルと専門用語を渡すと、一貫性が上がります。</p></div>
+          <div class="form-grid">
+            <label class="field full"><span>論文タイトル</span><input id="title" type="text" placeholder="Paper title"></label>
+            <label class="field"><span>原文の言語</span><select id="sourceLang"><option value="auto">自動判定</option><option value="en">英語</option><option value="ja">日本語</option><option value="zh">中国語</option><option value="ko">韓国語</option><option value="de">ドイツ語</option><option value="fr">フランス語</option></select></label>
+            <label class="field"><span>翻訳先</span><select id="targetLang"><option value="ja">日本語</option><option value="en">英語</option><option value="zh">中国語</option><option value="ko">韓国語</option><option value="de">ドイツ語</option><option value="fr">フランス語</option></select></label>
+            <label class="field"><span>日本語の文体</span><select id="form"><option value="plain">常体（である調）</option><option value="polite">敬体（です・ます調）</option></select></label>
+            <label class="field full"><span>参考文脈 <i>任意</i></span><textarea id="context" rows="3" placeholder="例：機械学習分野の学術論文。提案手法は Orion と呼ぶ。"></textarea></label>
+            <label class="field full"><span>用語集 <i>1行につき 原語 = 訳語</i></span><textarea id="glossary" rows="6" placeholder="foundation model = 基盤モデル&#10;inference = 推論&#10;ablation study = アブレーション研究"></textarea></label>
+          </div>
+          <div class="actions split"><button class="secondary back" data-target="1">← 戻る</button><button id="startTranslation" class="primary">翻訳を開始 <span>→</span></button></div>
+        </section>
+
+        <section id="step3" class="panel">
+          <div class="panel-heading"><span>STEP 03</span><h2>対訳を確認する</h2><p id="resultSubtitle">翻訳を準備しています。</p></div>
+          <div id="progressBox" class="progress-box">
+            <div class="progress-head"><b id="progressMessage">モデルを読み込んでいます</b><span id="progressPercent">0%</span></div>
+            <div class="progress-track"><i id="progressBar"></i></div>
+            <button id="cancelJob" class="text-button">翻訳を中止</button>
+          </div>
+          <div id="resultActions" class="result-actions hidden">
+            <a id="exportHtml" class="primary small" download>HTMLで保存</a><a id="exportMd" class="secondary small" download>Markdown</a><a id="exportJson" class="secondary small" download>JSON</a>
+            <button id="newPaper" class="text-button">別の論文を翻訳</button>
+          </div>
+          <div id="results" class="results"></div>
+        </section>
+      </div>
+    </section>
+
+    <section class="privacy-note"><b>データの扱い</b><p>PDF本文と翻訳結果は <code>data/</code> に保存されます。PLaMo 3 Translate と llama.cpp はローカルで動作し、翻訳時のインターネット接続は不要です。</p></section>
+  </main>
+  <footer><span>PLaMo Paper Translator</span><span>Powered locally by PLaMo 3 Translate + llama.cpp</span></footer>
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
