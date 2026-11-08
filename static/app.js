@@ -88,7 +88,7 @@ function showResults(data) {
 
 function renderSegment(item, position, list, mode) {
   const kind = item.kind || 'sentence';
-  const labels = {sentence:'文', heading:'見出し', equation:'数式', table:'表', figure:'図'};
+  const labels = {sentence:'文', heading:'見出し', equation:'数式', table:'表', figure:'図', list_item:'箇条書き', citation:'引用'};
   const translation = item.translation || `⚠ ${item.error || '未翻訳'}`;
   const imageItems = (item.assets || []).map((asset, number) => `<figure><a href="${escapeHtml(asset)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(asset)}" alt="図 ${item.index + 1}-${number + 1}" loading="lazy"></a></figure>`).join('');
   const images = imageItems ? `<div class="figure-gallery">${imageItems}</div>` : '';

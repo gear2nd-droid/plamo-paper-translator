@@ -11,7 +11,11 @@ from paper_core import (
     LlamaTranslator,
     Segment,
     _mark_caption_boundaries,
+    _merge_page_continuations,
+    _merge_reference_entries,
     _normalize_block,
+    _sentence_parts,
+    _strip_repeated_margin_fragments,
     bilingual_html,
     neighboring_context,
     parse_glossary,
@@ -105,6 +109,62 @@ class CoreTests(unittest.TestCase):
         copied = segments_for_mode([original], "sentence")
         copied[0].note = "changed"
         self.assertEqual(original.note, "")
+
+    def test_bullet_items_stay_separate(self):
+        normalized = _normalize_block(
+            "The method has two benefits:\n"
+            "• The first benefit wraps onto\nmultiple physical lines;\n"
+            "• The second benefit is concise."
+        )
+        units = split_document_units(normalized)
+        self.assertEqual([kind for _source, kind in units], ["sentence", "list_item", "list_item"])
+        self.assertEqual(units[1][0], "• The first benefit wraps onto multiple physical lines;")
+
+    def test_page_continuation_joins_interrupted_list_item(self):
+        segments = [
+            Segment(0, 2, "• The pipeline is facilitated by", kind="list_item", paragraph=2, sentence=1),
+            Segment(1, 3, "the robustness of modern solvers.", paragraph=3, sentence=1),
+        ]
+        merged = _merge_page_continuations(segments)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].source, "• The pipeline is facilitated by the robustness of modern solvers.")
+
+    def test_references_are_grouped_as_complete_entries(self):
+        segments = [
+            Segment(0, 1, "REFERENCES", kind="heading", paragraph=1, sentence=1),
+            Segment(1, 1, "A. Author and B. Writer.", paragraph=2, sentence=1),
+            Segment(2, 1, "2024.", paragraph=3, sentence=1),
+            Segment(3, 1, "A complete paper title.", paragraph=4, sentence=1),
+            Segment(4, 1, "ACM Trans. Graph. 43, 4 (2024).", paragraph=5, sentence=1),
+            Segment(5, 1, "C. Researcher.", paragraph=6, sentence=1),
+            Segment(6, 1, "2023.", paragraph=7, sentence=1),
+            Segment(7, 1, "Another title.", paragraph=8, sentence=1),
+        ]
+        grouped = _merge_reference_entries(segments)
+        self.assertEqual([segment.kind for segment in grouped], ["heading", "citation", "citation"])
+        self.assertIn("2024. A complete paper title.", grouped[1].source)
+
+    def test_numbered_references_are_grouped_without_collapsing_section(self):
+        segments = [
+            Segment(0, 1, "REFERENCES", kind="heading", paragraph=1, sentence=1),
+            Segment(1, 1, "[1] A. Author.", paragraph=2, sentence=1),
+            Segment(2, 1, "First title.", paragraph=3, sentence=1),
+            Segment(3, 1, "[2] B. Writer.", paragraph=4, sentence=1),
+            Segment(4, 1, "Second title.", paragraph=5, sentence=1),
+        ]
+        grouped = _merge_reference_entries(segments)
+        self.assertEqual([segment.kind for segment in grouped], ["heading", "citation", "citation"])
+        self.assertIn("First title.", grouped[1].source)
+
+    def test_repeated_footer_fragment_is_removed_from_end(self):
+        footer = "ACM Trans. Graph., Vol. 43, No. 4, Article 85. Publication date: July 2024."
+        text = "Body text mentions ACM publications.\n" + footer
+        cleaned = _strip_repeated_margin_fragments(text, [(footer, "bottom")], {footer})
+        self.assertEqual(cleaned.strip(), "Body text mentions ACM publications.")
+
+    def test_academic_abbreviations_do_not_split_citation(self):
+        citation = "ACM Trans. Graph., Vol. 43, No. 4, Article 85."
+        self.assertEqual(_sentence_parts(citation), [citation])
 
     def test_layout_whitespace_ends_figure_caption(self):
         plain = "Figure 3: Pipeline overview. It has two stages.\nBody text begins here. It continues."

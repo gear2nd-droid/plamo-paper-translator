@@ -5,6 +5,7 @@ import json
 import re
 import urllib.error
 import urllib.request
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -26,6 +27,13 @@ LANGUAGES = {
 
 CAPTION_MARKER = "\uE100"
 BODY_MARKER = "\uE101"
+
+LIST_PATTERN = re.compile(r"^(?:[•●◦▪‣*-]\s+|\((?:[1-9]|1[01])\)\s+|(?:[1-9]|1[01])[.)]\s+)")
+
+POSITIONED_CAPTION_PATTERN = re.compile(
+    r"^(?:(?:figure|table)\s*\d+\s*:|fig\.\s*\d+\s*[.:])",
+    re.I,
+)
 
 
 @dataclass
@@ -80,6 +88,19 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
             # position-verified captions receive figure/table treatment in PDF.
             line = BODY_MARKER + line
         special_kind = _block_kind(line)
+        if special_kind == "list_item":
+            flush()
+            current.append(line)
+            if re.search(r"[.!?。！？;；]$", line):
+                flush()
+            continue
+        if current and _block_kind(current[0]) == "list_item":
+            if special_kind not in {"heading", "figure", "table", "equation"}:
+                current.append(line)
+                if re.search(r"[.!?。！？;；]$", line):
+                    flush()
+                continue
+            flush()
         is_caption = verified_caption or (
             not captions_marked and bool(re.match(r"^(?:figure|fig\.|table)\s*\d+[.:]", line, re.I))
         )
@@ -129,7 +150,7 @@ def _positioned_caption_blocks(
 ) -> list[str]:
     captions: list[str] = []
     for start, (start_x, start_y, start_text) in enumerate(fragments):
-        if not re.match(r"^(?:figure|fig\.|table)\s*\d+\s*:", start_text.strip(), re.I):
+        if not POSITIONED_CAPTION_PATTERN.match(start_text.strip()):
             continue
         left_column = start_x < page_midpoint
         previous_y = start_y
@@ -139,7 +160,7 @@ def _positioned_caption_blocks(
                 break
             if y > previous_y + 3 or previous_y - y > 18:
                 break
-            if re.match(r"^(?:figure|fig\.|table)\s*\d+\s*:", value.strip(), re.I):
+            if POSITIONED_CAPTION_PATTERN.match(value.strip()):
                 break
             pieces.append(value)
             if previous_y - y > 2:
@@ -220,6 +241,8 @@ def _block_kind(text: str) -> str:
         re.I,
     ) or re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Z\u3040-\u30ff\u3400-\u9fff][^.!?]{0,100}$", compact):
         return "heading"
+    if LIST_PATTERN.match(compact):
+        return "list_item"
     if re.match(r"^(?:figure|fig\.)\s*\d+[.:]", compact, re.I):
         return "figure"
     if re.match(r"^table\s*\d+[.:]", compact, re.I):
@@ -240,7 +263,7 @@ def _sentence_parts(text: str) -> list[str]:
     protected = re.sub(r"(?<=\d)\.(?=\d)", marker, text)
     protected = re.sub(r"\b([A-Z])\.(?=\s+[A-Z])", lambda match: match.group(1) + marker, protected)
     protected = re.sub(
-        r"\b(?:e\.g|i\.e|et al|Fig|Eq|Eqs|Sec|Secs|Dr|Prof|No|Vol)\.",
+        r"\b(?:e\.g|i\.e|et\s+al|Fig|Figs|Eq|Eqs|Sec|Secs|Dr|Prof|No|Nos|Vol|Trans|Proc|Conf|Comput|Graph|Int|pp|eds?)\s*\.",
         lambda match: match.group(0).replace(".", marker),
         protected,
         flags=re.I,
@@ -268,7 +291,7 @@ def split_document_units(
         paragraph += 1
         kind = _block_kind(block)
         force_sentence = block.startswith(BODY_MARKER)
-        clean_block = block.removeprefix(CAPTION_MARKER).removeprefix(BODY_MARKER)
+        clean_block = block.replace(CAPTION_MARKER, "").replace(BODY_MARKER, "")
         split_as_sentences = kind in {"sentence", "figure"} or (
             kind == "table" and re.match(r"^Table\s*\d+", clean_block, re.I)
         )
@@ -354,6 +377,165 @@ def _extract_page_images(page: Any, asset_dir: Path | None, page_number: int, ur
     return assets
 
 
+def _margin_key(value: str) -> str:
+    compact = re.sub(r"\s+", " ", value).strip()
+    if re.fullmatch(r"(?:\d+:)?\d+", compact):
+        return "__page_number__"
+    return compact
+
+
+def _remove_fragment_once(text: str, value: str, *, from_end: bool) -> str:
+    tokens = value.split()
+    if not tokens:
+        return text
+    pattern = r"\s+".join(re.escape(token) for token in tokens)
+    matches = list(re.finditer(pattern, text))
+    if not matches:
+        return text
+    match = matches[-1] if from_end else matches[0]
+    return text[: match.start()] + "\n" + text[match.end() :]
+
+
+def _strip_repeated_margin_fragments(
+    text: str,
+    candidates: list[tuple[str, str]],
+    repeated_keys: set[str],
+) -> str:
+    for value, zone in candidates:
+        if _margin_key(value) in repeated_keys:
+            text = _remove_fragment_once(text, value, from_end=zone == "bottom")
+    return text
+
+
+def _merge_page_continuations(segments: list[Segment]) -> list[Segment]:
+    result = list(segments)
+    index = 0
+    while index + 1 < len(result):
+        current = result[index]
+        following = result[index + 1]
+        crosses_page = current.page != following.page
+        can_join = (
+            crosses_page
+            and current.kind in {"sentence", "list_item", "figure", "citation"}
+            and following.kind in {"sentence", "list_item"}
+            and current.label != "asset"
+            and following.label != "asset"
+            and not re.search(r"[.!?。！？;；:]\s*[\"'”’\)\]]*$", current.source)
+        )
+        if not can_join:
+            index += 1
+            continue
+        if current.source.endswith("-") and re.match(r"^[a-z]", following.source):
+            current.source = current.source[:-1] + following.source
+        else:
+            current.source = current.source.rstrip() + " " + following.source.lstrip()
+        current.assets.extend(following.assets)
+        del result[index + 1]
+    return result
+
+
+def _merge_interrupted_sentences(segments: list[Segment]) -> list[Segment]:
+    result = list(segments)
+    index = 0
+    while index < len(result):
+        current = result[index]
+        if current.kind not in {"sentence", "list_item"} or re.search(
+            r"[.!?。！？;；:]\s*[\"'”’\)\]]*$", current.source
+        ):
+            index += 1
+            continue
+        following_index = index + 1
+        while following_index < len(result) and result[following_index].kind in {"figure", "table"}:
+            following_index += 1
+        if following_index == index + 1 or following_index >= len(result):
+            index += 1
+            continue
+        following = result[following_index]
+        if following.page != current.page or following.kind not in {"sentence", "list_item"}:
+            index += 1
+            continue
+        if current.kind != "list_item" and not re.match(r"^[a-z]", following.source):
+            index += 1
+            continue
+        current.source = re.sub(r"\(see(?:\s+\([a-z]\)){2,}\s*$", "(see", current.source, flags=re.I)
+        current.source = current.source.rstrip() + " " + following.source.lstrip()
+        current.assets.extend(following.assets)
+        del result[following_index]
+        index += 1
+    return result
+
+
+def _merge_reference_entries(segments: list[Segment]) -> list[Segment]:
+    reference_index = next(
+        (
+            index
+            for index, segment in enumerate(segments)
+            if segment.kind == "heading" and segment.source.strip().lower() in {"reference", "references"}
+        ),
+        None,
+    )
+    if reference_index is None:
+        return segments
+
+    result = list(segments[: reference_index + 1])
+    tail = segments[reference_index + 1 :]
+    current: list[Segment] = []
+    year_pattern = re.compile(r"^(?:18|19|20)\d{2}[a-z]?\.$")
+    numbered_pattern = re.compile(r"^(?:\[\d+\]|\d+[.)])\s+")
+    year_count = sum(bool(year_pattern.fullmatch(segment.source.strip())) for segment in tail)
+    numbered_count = sum(bool(numbered_pattern.match(segment.source.strip())) for segment in tail)
+    if year_count < 2 and numbered_count < 2:
+        return segments
+
+    def flush() -> None:
+        if not current:
+            return
+        first = current[0]
+        result.append(
+            Segment(
+                index=0,
+                page=first.page,
+                source=" ".join(segment.source.strip() for segment in current if segment.source.strip()),
+                kind="citation",
+                assets=[asset for segment in current for asset in segment.assets],
+                paragraph=first.paragraph,
+                sentence=1,
+            )
+        )
+        current.clear()
+
+    for index, segment in enumerate(tail):
+        next_is_year = index + 1 < len(tail) and bool(year_pattern.fullmatch(tail[index + 1].source.strip()))
+        if segment.label == "asset":
+            flush()
+            result.append(segment)
+        elif (year_count >= 2 and next_is_year and current) or (
+            year_count < 2 and numbered_pattern.match(segment.source.strip()) and current
+        ):
+            flush()
+            current.append(segment)
+        else:
+            current.append(segment)
+    flush()
+    return result
+
+
+def _reindex_segments(segments: list[Segment]) -> list[Segment]:
+    paragraph_number = 0
+    sentence_number = 0
+    previous_paragraph: int | None = None
+    for index, segment in enumerate(segments):
+        if segment.paragraph != previous_paragraph:
+            paragraph_number += 1
+            sentence_number = 0
+            previous_paragraph = segment.paragraph
+        sentence_number += 1
+        segment.index = index
+        segment.paragraph = paragraph_number
+        segment.sentence = sentence_number
+    return segments
+
+
 def extract_document(
     path: Path,
     max_chars: int = 1000,
@@ -368,20 +550,38 @@ def extract_document(
         except ImportError as exc:
             raise RuntimeError("PDF処理に必要な pypdf がありません。setup.ps1 を実行してください。") from exc
         reader = PdfReader(str(path))
-        segments: list[Segment] = []
-        paragraph_offset = 0
-        for page_number, page in enumerate(reader.pages, start=1):
+        page_records: list[tuple[Any, str, list[tuple[float, float, str]], list[tuple[str, str]]]] = []
+        margin_counts: Counter[str] = Counter()
+        for page in reader.pages:
+            fragments: list[tuple[float, float, str]] = []
+            margin_candidates: list[tuple[str, str]] = []
+            page_height = float(page.mediabox.height)
             try:
-                fragments: list[tuple[float, float, str]] = []
 
-                def collect_fragment(value: str, _cm: Any, tm: list[float], _font: Any, _size: float) -> None:
-                    if value.strip():
-                        fragments.append((float(tm[4]), float(tm[5]), value))
+                def collect_fragment(value: str, _cm: Any, tm: list[float], _font: Any, size: float) -> None:
+                    if not value.strip():
+                        return
+                    x, y = float(tm[4]), float(tm[5])
+                    fragments.append((x, y, value))
+                    if float(size) <= 8.5 and 10 < y < 85:
+                        margin_candidates.append((value, "bottom"))
+                    elif float(size) <= 8.5 and page_height - 65 < y <= page_height:
+                        margin_candidates.append((value, "top"))
 
                 raw = page.extract_text(visitor_text=collect_fragment) or ""
             except TypeError:
                 fragments = []
+                margin_candidates = []
                 raw = page.extract_text() or ""
+            margin_counts.update({_margin_key(value) for value, _zone in margin_candidates if value.strip()})
+            page_records.append((page, raw, fragments, margin_candidates))
+
+        repeated_margin_keys = {key for key, count in margin_counts.items() if count >= 2}
+        repeated_margin_keys.add("__page_number__")
+        segments: list[Segment] = []
+        paragraph_offset = 0
+        for page_number, (page, raw, fragments, margin_candidates) in enumerate(page_records, start=1):
+            raw = _strip_repeated_margin_fragments(raw, margin_candidates, repeated_margin_keys)
             if fragments:
                 captions = _positioned_caption_blocks(fragments, float(page.mediabox.width) / 2)
                 raw = _mark_caption_boundaries(raw, captions)
@@ -424,7 +624,10 @@ def extract_document(
                     paragraph_offset += 1
         if not segments:
             raise ValueError("文字を抽出できませんでした。画像スキャンPDFはOCRしてから読み込んでください。")
-        return segments, len(reader.pages)
+        segments = _merge_page_continuations(segments)
+        segments = _merge_interrupted_sentences(segments)
+        segments = _merge_reference_entries(segments)
+        return _reindex_segments(segments), len(reader.pages)
 
     if suffix in {".txt", ".md"}:
         text = path.read_text(encoding="utf-8-sig")
