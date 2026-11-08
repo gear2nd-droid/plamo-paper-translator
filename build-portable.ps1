@@ -33,6 +33,22 @@ try {
     Copy-PackageLicense -Distribution "pypdf" -DestinationName "pypdf-LICENSE.txt"
     Copy-PackageLicense -Distribution "Pillow" -DestinationName "Pillow-LICENSE.txt"
     Copy-PackageLicense -Distribution "pyinstaller" -DestinationName "PyInstaller-COPYING.txt"
+    $PdfiumFinder = 'import sys; from pathlib import Path; from importlib.metadata import distribution; d=distribution(sys.argv[1]); p=next(Path(d.locate_file(f)) for f in (d.files or []) if "build_licenses" in str(f).lower()); print(next(x for x in (p, *p.parents) if x.name.lower() == "licenses"))'
+    $PdfiumLicenseSource = (& $Python -c $PdfiumFinder "pypdfium2").Trim()
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $PdfiumLicenseSource)) {
+        throw "pypdfium2/PDFium のライセンス一式が見つかりません。"
+    }
+    $PdfiumLicenseDestination = Join-Path $LicenseRoot "pypdfium2"
+    $ResolvedLicenseRoot = [IO.Path]::GetFullPath($LicenseRoot) + [IO.Path]::DirectorySeparatorChar
+    $ResolvedPdfiumLicenseDestination = [IO.Path]::GetFullPath($PdfiumLicenseDestination)
+    if (-not $ResolvedPdfiumLicenseDestination.StartsWith($ResolvedLicenseRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "PDFiumライセンスの出力先が配布用licensesフォルダー外です。"
+    }
+    if (Test-Path -LiteralPath $ResolvedPdfiumLicenseDestination) {
+        Remove-Item -Recurse -Force -LiteralPath $ResolvedPdfiumLicenseDestination
+    }
+    New-Item -ItemType Directory -Force -Path $PdfiumLicenseDestination | Out-Null
+    Copy-Item -Recurse -Force -Path (Join-Path $PdfiumLicenseSource "*") -Destination $PdfiumLicenseDestination
     New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "models"),(Join-Path $PackageRoot "runtime"),(Join-Path $PackageRoot "data") | Out-Null
     $Zip = Join-Path $AppRoot "dist\PLaMoPaperTranslator-Windows-portable.zip"
     if (Test-Path $Zip) { Remove-Item -LiteralPath $Zip -Force }

@@ -27,6 +27,8 @@ LANGUAGES = {
 
 CAPTION_MARKER = "\uE100"
 BODY_MARKER = "\uE101"
+EQUATION_MARKER = "\uE102"
+EQUATION_MARKER_PATTERN = re.compile(rf"^{re.escape(EQUATION_MARKER)}(\d{{1,3}}):\s*")
 PLAMO_LICENSE_URL = "https://plamo.preferredai.jp/info/plamo-community-license-ja"
 PLAMO_ATTRIBUTION = "Built with PLaMo"
 
@@ -55,6 +57,26 @@ class PositionedCaption:
     text: str
     x: float
     y: float
+
+
+@dataclass(frozen=True)
+class LayoutFragment:
+    order: int
+    x: float
+    y: float
+    text: str
+    size: float
+
+
+@dataclass(frozen=True)
+class PositionedEquation:
+    number: int
+    text: str
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    trim_top_context: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +116,11 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
             flush()
             continue
         if re.fullmatch(r"(?:page\s*)?\d{1,4}", line, re.I):
+            continue
+        verified_equation = line.startswith(EQUATION_MARKER)
+        if verified_equation:
+            flush()
+            paragraphs.append(line)
             continue
         verified_caption = line.startswith(CAPTION_MARKER)
         if verified_caption:
@@ -234,6 +261,254 @@ def _mark_caption_boundaries(text: str, caption_source: str | list[str]) -> str:
     return text
 
 
+def _layout_line_is_prose(fragments: list[LayoutFragment]) -> bool:
+    value = " ".join(fragment.text.strip() for fragment in fragments if fragment.text.strip())
+    math_symbols = len(re.findall(r"[=∑∫√±≤≥≈≠∞∂∇α-ωΑ-Ω^_{}|×·∈∀∪∩⊂]", value))
+    words = re.findall(r"[A-Za-z]{2,}", value)
+    has_long_prose_fragment = any(
+        len(re.findall(r"[A-Za-z]{2,}", fragment.text)) >= 5
+        and len(re.findall(r"[=≤≥≈≠∑∫√±{}|×·∈∀∪∩⊂]", fragment.text)) < 2
+        for fragment in fragments
+    )
+    prose_lead_in = len(words) >= 2 and bool(re.search(r"(?:\b(?:as|and|by)|:)\s*$", value, re.I))
+    return has_long_prose_fragment or prose_lead_in or (len(words) >= 5 and math_symbols < 2)
+
+
+def _positioned_equations(
+    fragments: list[LayoutFragment],
+    page_width: float,
+) -> list[PositionedEquation]:
+    midpoint = page_width / 2
+    equations: list[PositionedEquation] = []
+    for column in (0, 1):
+        column_left = 36.0 if column == 0 else midpoint
+        column_right = midpoint if column == 0 else page_width - 36.0
+        column_fragments = [fragment for fragment in fragments if (fragment.x < midpoint) == (column == 0)]
+        if not column_fragments:
+            continue
+        lines: list[list[LayoutFragment]] = []
+        for fragment in sorted(column_fragments, key=lambda item: (-item.y, item.x, item.order)):
+            if lines and abs(sum(item.y for item in lines[-1]) / len(lines[-1]) - fragment.y) <= 3.2:
+                lines[-1].append(fragment)
+            else:
+                lines.append([fragment])
+        line_y = [sum(fragment.y for fragment in line) / len(line) for line in lines]
+        number_locations: list[tuple[int, LayoutFragment]] = []
+        for line_index, line in enumerate(lines):
+            for fragment in line:
+                match = re.fullmatch(r"\((\d{1,3})\)", fragment.text.strip())
+                if not match:
+                    continue
+                near_right = fragment.x >= column_left + (column_right - column_left) * 0.55
+                if near_right and not _layout_line_is_prose(line):
+                    number_locations.append((line_index, fragment))
+
+        for line_index, number_fragment in number_locations:
+            selected = {line_index}
+            for direction in (-1, 1):
+                cursor = line_index + direction
+                previous_y = line_y[line_index]
+                while 0 <= cursor < len(lines):
+                    if abs(line_y[cursor] - previous_y) > 20.5:
+                        break
+                    if any(
+                        re.fullmatch(r"\(\d{1,3}\)", item.text.strip()) and item is not number_fragment
+                        for item in lines[cursor]
+                    ):
+                        break
+                    if _layout_line_is_prose(lines[cursor]):
+                        break
+                    compact_line = "".join(item.text.strip() for item in lines[cursor])
+                    next_cursor = cursor + direction
+                    paired_value = " ".join(
+                        item.text.strip()
+                        for pair_index in (cursor, next_cursor)
+                        if 0 <= pair_index < len(lines)
+                        for item in lines[pair_index]
+                        if item.text.strip()
+                    )
+                    if (
+                        0 <= next_cursor < len(lines)
+                        and re.search(r"\bmodel\b", paired_value, re.I)
+                        and _layout_line_is_prose(lines[cursor] + lines[next_cursor])
+                    ):
+                        # A superscript can split a short prose lead-in such
+                        # as "model M^d as" across two reported baselines.
+                        break
+                    if (
+                        len(compact_line) <= 3
+                        and 0 <= next_cursor < len(lines)
+                        and _layout_line_is_prose(lines[next_cursor])
+                        and abs(line_y[next_cursor] - line_y[cursor]) < abs(line_y[cursor] - previous_y)
+                    ):
+                        # Superscript/subscript fragments can be reported as a
+                        # separate layout line. Do not absorb one that belongs
+                        # to the prose line beyond the equation.
+                        break
+                    selected.add(cursor)
+                    previous_y = line_y[cursor]
+                    cursor += direction
+
+            block_fragments = [fragment for index in selected for fragment in lines[index]]
+            block_fragments.sort(key=lambda item: item.order)
+            block_text = re.sub(r"\s+", " ", "".join(fragment.text for fragment in block_fragments)).strip()
+            if not block_text:
+                continue
+            # The text matrix of a fragment can omit leading positioning
+            # spaces. Use the full column width so the printed equation
+            # number is never clipped; the rendered bitmap is trimmed later.
+            x0 = max(0.0, column_left - 4)
+            x1 = min(page_width, column_right + 4)
+            y0 = max(0.0, min(fragment.y - fragment.size * 0.35 for fragment in block_fragments) - 0.5)
+            y1 = max(fragment.y + fragment.size for fragment in block_fragments) + 1
+            highest_selected_y = max(line_y[index] for index in selected)
+            trim_top_context = any(
+                index not in selected and highest_selected_y < line_y[index] <= y1 for index in range(len(lines))
+            )
+            equations.append(
+                PositionedEquation(
+                    number=int(number_fragment.text.strip()[1:-1]),
+                    text=block_text,
+                    x0=x0,
+                    y0=y0,
+                    x1=x1,
+                    y1=y1,
+                    trim_top_context=trim_top_context,
+                )
+            )
+    return equations
+
+
+def _mark_equation_boundaries(text: str, equations: list[PositionedEquation]) -> str:
+    for equation in equations:
+        compact_equation = re.sub(r"\s+", "", equation.text)
+        if not compact_equation:
+            continue
+        patterns = [r"\s*".join(re.escape(character) for character in compact_equation)]
+        if len(compact_equation) >= 24:
+            patterns.append(
+                rf"{r'\s*'.join(re.escape(character) for character in compact_equation[:12])}"
+                rf"[\s\S]{{0,3000}}?"
+                rf"{r'\s*'.join(re.escape(character) for character in compact_equation[-12:])}"
+            )
+        for pattern in patterns:
+            text, replacements = re.subn(
+                pattern,
+                lambda match: (
+                    f"\n\n{EQUATION_MARKER}{equation.number}:"
+                    f"{re.sub(r'\s+', ' ', match.group(0)).strip()}\n\n"
+                ),
+                text,
+                count=1,
+            )
+            if replacements:
+                break
+    return text
+
+
+def _render_equation_images(
+    pdfium_document: Any,
+    page_number: int,
+    equations: list[PositionedEquation],
+    page_width: float,
+    page_height: float,
+    asset_dir: Path | None,
+    url_prefix: str,
+) -> dict[int, str]:
+    if asset_dir is None or pdfium_document is None or not equations:
+        return {}
+    from PIL import Image, ImageChops
+
+    def trim_stray_edge_ink(image: Any) -> Any:
+        grayscale = image.convert("L")
+        ink_rows = [
+            grayscale.crop((0, y, grayscale.width, y + 1)).getextrema()[0] < 245
+            for y in range(grayscale.height)
+        ]
+        bands: list[tuple[int, int]] = []
+        start: int | None = None
+        blank_rows = 0
+        for y, has_ink in enumerate(ink_rows + [False] * 8):
+            if has_ink:
+                if start is None:
+                    start = y
+                blank_rows = 0
+            elif start is not None:
+                blank_rows += 1
+                if blank_rows >= 8:
+                    bands.append((start, y - blank_rows))
+                    start = None
+                    blank_rows = 0
+        if len(bands) > 1 and bands[0][1] - bands[0][0] <= 5:
+            image = image.crop((0, max(0, bands[1][0] - 4), image.width, image.height))
+            bands = [(top - bands[1][0] + 4, bottom - bands[1][0] + 4) for top, bottom in bands[1:]]
+        if len(bands) > 1 and bands[-1][1] - bands[-1][0] <= 5:
+            image = image.crop((0, 0, image.width, min(image.height, bands[-2][1] + 5)))
+        return image
+
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    page = pdfium_document[page_number - 1]
+    assets: dict[int, str] = {}
+    try:
+        for equation in equations:
+            crop = (
+                max(0.0, equation.x0),
+                max(0.0, equation.y0),
+                max(0.0, page_width - equation.x1),
+                max(0.0, page_height - equation.y1),
+            )
+            image = page.render(scale=3, crop=crop).to_pil().convert("RGB")
+            if equation.trim_top_context:
+                grayscale = image.convert("L")
+                ink_rows = [grayscale.crop((0, y, grayscale.width, y + 1)).getextrema()[0] < 245 for y in range(grayscale.height)]
+                first_ink = next((y for y, has_ink in enumerate(ink_rows) if has_ink), None)
+                if first_ink is not None:
+                    blank_start: int | None = None
+                    for y in range(first_ink + 1, len(ink_rows)):
+                        if not ink_rows[y] and blank_start is None:
+                            blank_start = y
+                        elif ink_rows[y] and blank_start is not None:
+                            if y - blank_start >= 8:
+                                image = image.crop((0, max(0, y - 4), image.width, image.height))
+                                break
+                            blank_start = None
+            difference = ImageChops.difference(image, Image.new("RGB", image.size, "white"))
+            content_box = difference.getbbox()
+            if content_box:
+                padding = 12
+                left, top, right, bottom = content_box
+                image = image.crop(
+                    (
+                        max(0, left - padding),
+                        max(0, top - padding),
+                        min(image.width, right + padding),
+                        min(image.height, bottom + padding),
+                    )
+                )
+            image = trim_stray_edge_ink(image)
+            filename = f"page-{page_number:03d}-equation-{equation.number:03d}.png"
+            image.save(asset_dir / filename, format="PNG", optimize=True)
+            assets[equation.number] = f"{url_prefix.rstrip('/')}/{filename}"
+    finally:
+        page.close()
+    return assets
+
+
+def _attach_equation_images(
+    page_segments: list[Segment],
+    equation_assets: dict[int, str],
+) -> None:
+    for number, asset in equation_assets.items():
+        target = next(
+            (segment for segment in page_segments if segment.label == f"equation:{number}"),
+            None,
+        )
+        if target is None:
+            continue
+        target.kind = "equation"
+        target.assets.append(asset)
+
+
 def split_text(text: str, max_chars: int = 1800) -> list[str]:
     text = text.strip()
     if not text:
@@ -278,9 +553,12 @@ def split_text(text: str, max_chars: int = 1800) -> list[str]:
 
 def _block_kind(text: str) -> str:
     compact = text.strip()
+    if compact.startswith(EQUATION_MARKER):
+        return "equation"
     if compact.startswith(BODY_MARKER):
         return "sentence"
     compact = compact.removeprefix(CAPTION_MARKER)
+    compact = EQUATION_MARKER_PATTERN.sub("", compact)
     if re.match(
         r"^(?:abstract|introduction|background|related work|methods?|materials?|results?|discussion|conclusions?|references|acknowledg(?:e)?ments?)\s*$",
         compact,
@@ -334,6 +612,7 @@ def split_document_units(
     max_chars: int = 1000,
     *,
     include_positions: bool = False,
+    include_equation_numbers: bool = False,
 ) -> list[tuple[Any, ...]]:
     units: list[tuple[Any, ...]] = []
     paragraph = 0
@@ -342,8 +621,11 @@ def split_document_units(
             continue
         paragraph += 1
         kind = _block_kind(block)
+        equation_match = EQUATION_MARKER_PATTERN.match(block)
+        equation_number = int(equation_match.group(1)) if equation_match else 0
         force_sentence = block.startswith(BODY_MARKER)
         clean_block = block.replace(CAPTION_MARKER, "").replace(BODY_MARKER, "")
+        clean_block = EQUATION_MARKER_PATTERN.sub("", clean_block)
         split_as_sentences = kind in {"sentence", "figure"} or (
             kind == "table" and re.match(r"^Table\s*\d+", clean_block, re.I)
         )
@@ -357,7 +639,14 @@ def split_document_units(
             for chunk_number, chunk in enumerate(chunks, start=1):
                 resolved_kind = "sentence" if force_sentence else (kind if kind != "sentence" else _block_kind(chunk))
                 position = sentence if len(chunks) == 1 else sentence * 100 + chunk_number
-                units.append((chunk, resolved_kind, paragraph, position) if include_positions else (chunk, resolved_kind))
+                if include_positions and include_equation_numbers:
+                    units.append((chunk, resolved_kind, paragraph, position, equation_number))
+                elif include_positions:
+                    units.append((chunk, resolved_kind, paragraph, position))
+                elif include_equation_numbers:
+                    units.append((chunk, resolved_kind, equation_number))
+                else:
+                    units.append((chunk, resolved_kind))
     return units
 
 
@@ -745,10 +1034,20 @@ def extract_document(
         except ImportError as exc:
             raise RuntimeError("PDF処理に必要な pypdf がありません。setup.ps1 を実行してください。") from exc
         reader = PdfReader(str(path))
-        page_records: list[tuple[Any, str, list[tuple[float, float, str]], list[tuple[str, str]]]] = []
+        pdfium_document: Any = None
+        if asset_dir is not None:
+            try:
+                import pypdfium2 as pdfium
+            except ImportError as exc:
+                raise RuntimeError("数式画像の生成に必要な pypdfium2 がありません。setup.ps1 を実行してください。") from exc
+            pdfium_document = pdfium.PdfDocument(str(path))
+        page_records: list[
+            tuple[Any, str, list[tuple[float, float, str]], list[LayoutFragment], list[tuple[str, str]]]
+        ] = []
         margin_counts: Counter[str] = Counter()
         for page in reader.pages:
             fragments: list[tuple[float, float, str]] = []
+            layout_fragments: list[LayoutFragment] = []
             margin_candidates: list[tuple[str, str]] = []
             page_height = float(page.mediabox.height)
             try:
@@ -758,6 +1057,7 @@ def extract_document(
                         return
                     x, y = float(tm[4]), float(tm[5])
                     fragments.append((x, y, value))
+                    layout_fragments.append(LayoutFragment(len(layout_fragments), x, y, value, float(size)))
                     if float(size) <= 8.5 and 10 < y < 85:
                         margin_candidates.append((value, "bottom"))
                     elif float(size) <= 8.5 and page_height - 65 < y <= page_height:
@@ -766,36 +1066,57 @@ def extract_document(
                 raw = page.extract_text(visitor_text=collect_fragment) or ""
             except TypeError:
                 fragments = []
+                layout_fragments = []
                 margin_candidates = []
                 raw = page.extract_text() or ""
             margin_counts.update({_margin_key(value) for value, _zone in margin_candidates if value.strip()})
-            page_records.append((page, raw, fragments, margin_candidates))
+            page_records.append((page, raw, fragments, layout_fragments, margin_candidates))
 
         repeated_margin_keys = {key for key, count in margin_counts.items() if count >= 2}
         repeated_margin_keys.add("__page_number__")
         segments: list[Segment] = []
         paragraph_offset = 0
-        for page_number, (page, raw, fragments, margin_candidates) in enumerate(page_records, start=1):
+        for page_number, (page, raw, fragments, layout_fragments, margin_candidates) in enumerate(page_records, start=1):
             raw = _strip_repeated_margin_fragments(raw, margin_candidates, repeated_margin_keys)
             positioned_captions: list[PositionedCaption] = []
+            positioned_equations: list[PositionedEquation] = []
             if fragments:
                 positioned_captions = _positioned_captions(fragments, float(page.mediabox.width) / 2)
                 raw = _mark_caption_boundaries(raw, [caption.text for caption in positioned_captions])
+            if layout_fragments:
+                positioned_equations = _positioned_equations(layout_fragments, float(page.mediabox.width))
+                raw = _mark_equation_boundaries(raw, positioned_equations)
             normalized = _normalize_block(raw, captions_marked=bool(fragments))
             page_start = len(segments)
-            units = split_document_units(normalized, max_chars=max_chars, include_positions=True)
-            for chunk, kind, paragraph, sentence in units:
+            units = split_document_units(
+                normalized,
+                max_chars=max_chars,
+                include_positions=True,
+                include_equation_numbers=True,
+            )
+            for chunk, kind, paragraph, sentence, equation_number in units:
                 segments.append(
                     Segment(
                         index=len(segments),
                         page=page_number,
                         source=chunk,
                         kind=kind,
+                        label=f"equation:{equation_number}" if equation_number else "",
                         paragraph=paragraph_offset + paragraph,
                         sentence=sentence,
                     )
                 )
             paragraph_offset += max((unit[2] for unit in units), default=0)
+            equation_assets = _render_equation_images(
+                pdfium_document,
+                page_number,
+                positioned_equations,
+                float(page.mediabox.width),
+                float(page.mediabox.height),
+                asset_dir,
+                asset_url_prefix,
+            )
+            _attach_equation_images(segments[page_start:], equation_assets)
             images = _extract_page_images(page, asset_dir, page_number, asset_url_prefix)
             if images:
                 unassigned_images = _assign_page_images(
@@ -826,10 +1147,14 @@ def extract_document(
                     )
                     paragraph_offset += 1
         if not segments:
+            if pdfium_document is not None:
+                pdfium_document.close()
             raise ValueError("文字を抽出できませんでした。画像スキャンPDFはOCRしてから読み込んでください。")
         segments = _merge_page_continuations(segments)
         segments = _merge_interrupted_sentences(segments)
         segments = _merge_reference_entries(segments)
+        if pdfium_document is not None:
+            pdfium_document.close()
         return _reindex_segments(segments), len(reader.pages)
 
     if suffix in {".txt", ".md"}:
@@ -1001,6 +1326,19 @@ def bilingual_html(
         )
         if images:
             images = f'<div class="figure-gallery">{images}</div>'
+        equation_image = segment.kind == "equation" and bool(images)
+        if equation_image:
+            source_content = (
+                f'{images}<details class="equation-text"><summary>検索用テキスト</summary>'
+                f'<p>{html.escape(segment.source).replace(chr(10), "<br>")}</p></details>'
+            )
+            translation_content = (
+                f'{images}<details class="equation-text"><summary>抽出テキスト</summary>'
+                f'<p>{html.escape(translation).replace(chr(10), "<br>")}</p></details>'
+            )
+        else:
+            source_content = f'{images}<p>{html.escape(segment.source).replace(chr(10), "<br>")}</p>'
+            translation_content = f'<p>{html.escape(translation).replace(chr(10), "<br>")}</p>'
         paragraph_start = bool(segment.paragraph and segment.paragraph != previous_paragraph)
         if segment.paragraph:
             position = f"P{segment.paragraph}<br>S{segment.sentence}" if segment.sentence else f"P{segment.paragraph}"
@@ -1009,8 +1347,8 @@ def bilingual_html(
         rows.append(
             f'<section class="reader-row kind-{html.escape(segment.kind)}{" paragraph-start" if paragraph_start else ""}">'
             f'<div class="number"><b>{segment.index + 1}</b><span>{position}</span></div>'
-            f'<article class="source">{images}<p>{html.escape(segment.source).replace(chr(10), "<br>")}</p></article>'
-            f'<article class="translation"><p>{html.escape(translation).replace(chr(10), "<br>")}</p></article>'
+            f'<article class="source">{source_content}</article>'
+            f'<article class="translation">{translation_content}</article>'
             f'<aside class="note"><p>{html.escape(segment.note).replace(chr(10), "<br>") or "<span>メモなし</span>"}</p></aside>'
             "</section>"
         )
@@ -1028,6 +1366,7 @@ header{{padding:28px 32px;border-bottom:1px solid #d8d5ca;background:#fff;positi
 .number{{color:#728078;text-align:center;padding:22px 5px}}.number b,.number span{{display:block}}.number b{{font:italic .72rem Georgia,serif}}.number span{{font-size:.58rem;line-height:1.45;margin-top:7px}}p{{white-space:pre-wrap;line-height:1.78;margin:0;overflow-wrap:anywhere}}.source p{{font-family:Georgia,"Times New Roman","Yu Mincho",serif}}.translation{{background:#fbfcf9}}.note{{background:#f8f5ed;color:#5f675f;font-size:.86rem}}.note span{{color:#a0a49d}}
 .paragraph-start{{border-top:3px solid #9aab9f;margin-top:8px}}
 .kind-heading{{margin-top:24px;border-top:3px solid #174d36}}.kind-heading p{{font-weight:700;font-size:1.08rem}}.kind-equation p,.kind-table p{{font-family:"Cambria Math",Consolas,monospace;white-space:pre-wrap}}.figure-gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px}}figure{{margin:0;background:#fff}}img{{display:block;width:100%;height:100%;max-height:460px;object-fit:contain;margin:auto;border:1px solid #ddd}}
+.kind-equation .figure-gallery{{grid-template-columns:minmax(0,1fr);width:100%;min-width:0;margin-bottom:7px;overflow:hidden}}.kind-equation figure{{width:100%;max-width:100%;min-width:0}}.kind-equation img{{display:block;width:100%;max-width:100%;height:auto;border:0;max-height:300px;object-fit:contain}}.equation-text{{font-size:.68rem;color:#687169;text-align:left}}.equation-text summary{{cursor:pointer}}.equation-text p{{font-size:.68rem;line-height:1.45;margin-top:7px}}
 footer{{padding:24px 32px;text-align:center;font-size:.78rem;color:#687169}}
 @media(max-width:900px){{.labels,.reader-row{{grid-template-columns:36px minmax(260px,1fr) minmax(260px,1fr)}}.labels .memo-label{{display:none}}.note{{grid-column:2/4;border-top:1px dashed #d8d5ca}}}}
 @media(max-width:620px){{header{{padding:20px 16px}}.labels{{display:none}}.reader-row{{grid-template-columns:32px 1fr}}.reader-row>*{{grid-column:2}}.number{{grid-column:1!important;grid-row:1/4}}}}

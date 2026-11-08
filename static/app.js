@@ -90,16 +90,19 @@ function renderSegment(item, position, list, mode) {
   const kind = item.kind || 'sentence';
   const labels = {sentence:'文', heading:'見出し', equation:'数式', table:'表', figure:'図', list_item:'箇条書き', citation:'引用'};
   const translation = item.translation || `⚠ ${item.error || '未翻訳'}`;
-  const imageItems = (item.assets || []).map((asset, number) => `<figure><a href="${escapeHtml(asset)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(asset)}" alt="図 ${item.index + 1}-${number + 1}" loading="lazy"></a></figure>`).join('');
+  const imageItems = (item.assets || []).map((asset, number) => `<figure><a href="${escapeHtml(asset)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(asset)}" alt="${kind === 'equation' ? '数式' : '図'} ${item.index + 1}-${number + 1}" loading="lazy"></a></figure>`).join('');
   const images = imageItems ? `<div class="figure-gallery">${imageItems}</div>` : '';
+  const equationImage = kind === 'equation' && Boolean(imageItems);
+  const sourceContent = equationImage ? `${images}<details class="equation-text"><summary>検索用テキスト</summary><p>${escapeHtml(item.source)}</p></details>` : `${images}<p>${escapeHtml(item.source)}</p>`;
+  const translationContent = equationImage ? `${images}<details class="equation-text"><summary>抽出テキスト</summary><p>${escapeHtml(translation)}</p></details>` : `<p>${escapeHtml(translation)}</p>`;
   const hasPosition = Number(item.paragraph) > 0;
   const isParagraphStart = hasPosition && (position === 0 || item.paragraph !== list[position - 1].paragraph);
   const unitPosition = hasPosition ? (Number(item.sentence) > 0 ? `P${item.paragraph} / S${item.sentence}` : `P${item.paragraph}`) : '旧形式';
   const unitLabel = mode === 'paragraph' && kind === 'sentence' ? '段落' : (labels[kind] || kind);
   return `<section class="reader-row kind-${escapeHtml(kind)}${isParagraphStart ? ' paragraph-start' : ''}" data-index="${item.index}">
     <div class="unit-meta"><b>${String(item.index + 1).padStart(3, '0')}</b><span>${escapeHtml(unitPosition)}</span><i>${escapeHtml(unitLabel)}</i></div>
-    <article class="source-pane">${images}<p>${escapeHtml(item.source)}</p></article>
-    <article class="translation-pane"><p>${escapeHtml(translation)}</p></article>
+    <article class="source-pane">${sourceContent}</article>
+    <article class="translation-pane">${translationContent}</article>
     <aside class="memo-pane"><textarea class="note-editor" rows="1" data-note-index="${item.index}" aria-label="${item.index + 1}番のメモ" placeholder="この箇所へのメモ…">${escapeHtml(item.note || '')}</textarea><small class="note-status">${item.note ? '保存済み' : '未入力'}</small></aside>
   </section>`;
 }

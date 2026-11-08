@@ -9,15 +9,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from paper_core import (
     ExtractedPageImage,
+    LayoutFragment,
     LlamaTranslator,
     PositionedCaption,
     Segment,
+    _attach_equation_images,
     _assign_inline_images,
     _assign_page_images,
     _mark_caption_boundaries,
+    _mark_equation_boundaries,
     _merge_page_continuations,
     _merge_reference_entries,
     _normalize_block,
+    _positioned_equations,
     _sentence_parts,
     _strip_repeated_margin_fragments,
     bilingual_html,
@@ -238,6 +242,38 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(remaining, [])
         self.assertEqual(target.assets, ["/inline.jpg"])
 
+    def test_numbered_display_equation_gets_stable_identity(self):
+        fragments = [
+            LayoutFragment(0, 80, 500, "E = mc", 10),
+            LayoutFragment(1, 140, 505, "2", 7),
+            LayoutFragment(2, 250, 500, " (7)", 10),
+            LayoutFragment(3, 40, 450, "(7) Given a prose instruction.", 10),
+        ]
+        equations = _positioned_equations(fragments, 612)
+        self.assertEqual([equation.number for equation in equations], [7])
+
+        marked = _mark_equation_boundaries("E = mc 2 (7)\n(7) Given a prose instruction.", equations)
+        units = split_document_units(
+            _normalize_block(marked),
+            include_positions=True,
+            include_equation_numbers=True,
+        )
+        equation_unit = next(unit for unit in units if unit[4] == 7)
+        self.assertEqual(equation_unit[1], "equation")
+        self.assertEqual(equation_unit[0], "E = mc 2 (7)")
+
+    def test_equation_image_only_attaches_to_matching_identity(self):
+        equation = Segment(0, 1, "x = 1 (7)", kind="equation", label="equation:7")
+        numbered_prose = Segment(1, 1, "(8) Given the input.", kind="list_item")
+        unrelated_equation = Segment(2, 1, "y = 2 (8)", kind="equation")
+        _attach_equation_images(
+            [equation, numbered_prose, unrelated_equation],
+            {7: "/equation-7.png", 8: "/equation-8.png"},
+        )
+        self.assertEqual(equation.assets, ["/equation-7.png"])
+        self.assertEqual(numbered_prose.assets, [])
+        self.assertEqual(unrelated_equation.assets, [])
+
     def test_translation_payload_uses_official_options(self):
         captured = {}
 
@@ -270,6 +306,21 @@ class CoreTests(unittest.TestCase):
         self.assertIn("MEMO", output)
         self.assertIn("P2<br>S3", output)
         self.assertIn("Built with PLaMo", output)
+
+    def test_equation_export_uses_image_and_collapsed_search_text(self):
+        segment = Segment(
+            0,
+            1,
+            "E = mc^2 (1)",
+            "E = mc^2 (1)",
+            kind="equation",
+            label="equation:1",
+            assets=["/equation.png"],
+        )
+        output = bilingual_html("Paper", [segment])
+        self.assertEqual(output.count('src="/equation.png"'), 2)
+        self.assertIn('class="equation-text"', output)
+        self.assertIn("検索用テキスト", output)
 
     def test_exports_include_plamo_attribution(self):
         segments = [Segment(0, 1, "Source.", "訳文。", paragraph=1, sentence=1)]

@@ -209,7 +209,11 @@ def _translate_job(job_id: str) -> None:
                 return
             job["message"] = f"{index + 1} / {len(segments)} 行を翻訳中"
             job["completed"] = index
-        if segment.label != "asset":
+        if segment.kind == "equation" and segment.assets:
+            # Preserve the source equation exactly. The bitmap is authoritative;
+            # extracted text remains available only for search and copying.
+            segment.translation = segment.source
+        elif segment.label != "asset":
             context = neighboring_context(segments, index, job.get("context", ""))
             try:
                 segment.translation = translator.translate(

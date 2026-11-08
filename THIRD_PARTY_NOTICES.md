@@ -30,6 +30,14 @@
 - License: MIT-CMU
 - Included license: `licenses/Pillow-LICENSE.txt`
 
+## pypdfium2 / PDFium
+
+- Project: https://github.com/pypdfium2-team/pypdfium2
+- License: Apache-2.0 OR BSD-3-Clause; PDFium and bundled dependencies use the licenses shipped with the wheel
+- Included licenses: `licenses/pypdfium2/`
+
+PDFiumは独立表示数式をPDFから画像として切り出すために使用します。バイナリ配布時はwheelに収録された `BUILD_LICENSES/` を含むライセンス一式を同梱します。
+
 ## Python
 
 - Project: https://www.python.org/
