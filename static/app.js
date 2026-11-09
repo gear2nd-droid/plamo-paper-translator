@@ -5,7 +5,8 @@ const CLIP_PARTS = {
   translation: {key:'J', label:'日本語'},
   note: {key:'M', label:'メモ'},
 };
-const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], tocObserver: null };
+const REFERENCE_PATTERN = /\b(?:fig(?:ure)?s?\.?\s*\d+(?:\s*[-–]\s*\d+)?|eq(?:uation)?s?\.?\s*\(?\d+\)?|tables?\s+\d+)|(?:図|式|表)\s*\(?\d+\)?/gi;
+const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], tocObserver: null, referenceTargets: new Map(), referenceHistory: [] };
 const noteTimers = new Map();
 const $ = (id) => document.getElementById(id);
 
@@ -86,7 +87,12 @@ function showResults(data) {
   $('readerLayout').classList.remove('hidden');
   $('readerHeader').classList.remove('hidden');
   const mode = data.segmentation_mode || 'sentence';
-  state.segments = (data.segments || []).map((item) => ({...item, clips:itemClips(item)}));
+  const loadedSegments = (data.segments || []).map((item) => ({...item, clips:itemClips(item)}));
+  const referenceLayout = prepareReferenceLayout(loadedSegments);
+  state.segments = referenceLayout.segments;
+  state.referenceTargets = referenceLayout.targets;
+  state.referenceHistory = [];
+  updateReferenceBackButton();
   $('resultSubtitle').textContent = mode === 'paragraph' ? `${data.total}段落・構造ブロックの対訳が完成しました。` : `${data.total}行の対訳が完成しました。Pは段落、Sは段落内の文番号です。`;
   ['Html','Md','Json'].forEach((format) => $(`export${format}`).href = `/api/jobs/${state.jobId}/export?format=${format.toLowerCase()}`);
   $('results').innerHTML = state.segments.map((item, position, list) => renderSegment(item, position, list, mode)).join('');
@@ -103,8 +109,10 @@ function renderSegment(item, position, list, mode) {
   const imageItems = (item.assets || []).map((asset, number) => `<figure><a href="${escapeHtml(asset)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(asset)}" alt="${kind === 'equation' ? '数式' : '図'} ${item.index + 1}-${number + 1}" loading="lazy"></a></figure>`).join('');
   const images = imageItems ? `<div class="figure-gallery">${imageItems}</div>` : '';
   const equationImage = kind === 'equation' && Boolean(imageItems);
-  const sourceContent = equationImage ? `${images}<details class="equation-text"><summary>検索用テキスト</summary><p>${escapeHtml(item.source)}</p></details>` : `${images}<p>${escapeHtml(item.source)}</p>`;
-  const translationContent = equationImage ? `${images}<details class="equation-text"><summary>抽出テキスト</summary><p>${escapeHtml(translation)}</p></details>` : `<p>${escapeHtml(translation)}</p>`;
+  const sourceText = renderReferencedText(item.source, item.index);
+  const translationText = renderReferencedText(translation, item.index);
+  const sourceContent = equationImage ? `${images}<details class="equation-text"><summary>検索用テキスト</summary><p>${sourceText}</p></details>` : `${images}<p>${sourceText}</p>`;
+  const translationContent = equationImage ? `${images}<details class="equation-text"><summary>抽出テキスト</summary><p>${translationText}</p></details>` : `<p>${translationText}</p>`;
   const hasPosition = Number(item.paragraph) > 0;
   const isParagraphStart = hasPosition && (position === 0 || item.paragraph !== list[position - 1].paragraph);
   const unitPosition = hasPosition ? (Number(item.sentence) > 0 ? `P${item.paragraph} / S${item.sentence}` : `P${item.paragraph}`) : '旧形式';
@@ -128,6 +136,165 @@ function renderSegment(item, position, list, mode) {
 function navigationLabel(item, limit = 68) {
   const compact = String(item.source || '').replace(/\s+/g, ' ').trim();
   return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+}
+
+function referenceKey(type, number) {
+  return `${type}:${Number(number)}`;
+}
+
+function segmentReferenceDeclarations(item) {
+  const declarations = new Map();
+  const add = (type, number) => {
+    if (number) declarations.set(referenceKey(type, number), {type, number:String(Number(number))});
+  };
+  const labelEquation = String(item.label || '').match(/^equation:(\d+)$/i);
+  if (labelEquation) add('equation', labelEquation[1]);
+  [item.source, item.translation].forEach((value) => {
+    const text = String(value || '').trim();
+    const captionSuffix = hasVisualAsset(item) ? '(?:[.．:：]|\\s|$)' : '(?:[.．:：]|$)';
+    const figure = text.match(new RegExp(`^(?:figure|fig\\.?)\\s*(\\d+)\\s*${captionSuffix}`, 'i'))
+      || text.match(new RegExp(`^図\\s*(\\d+)\\s*${captionSuffix}`));
+    const table = text.match(new RegExp(`^table\\s*(\\d+)\\s*${captionSuffix}`, 'i'))
+      || text.match(new RegExp(`^表\\s*(\\d+)\\s*${captionSuffix}`));
+    if (figure) add('figure', figure[1]);
+    if (table) add('table', table[1]);
+  });
+  if ((item.kind || '') === 'equation') {
+    const trailingNumber = String(item.source || '').match(/\(\s*(\d+)\s*\)\s*$/);
+    if (trailingNumber) add('equation', trailingNumber[1]);
+  }
+  return [...declarations.values()];
+}
+
+function hasVisualAsset(item) {
+  return Array.isArray(item.assets) && item.assets.length > 0;
+}
+
+function associatedVisualCandidate(segments, declarationPosition, identity) {
+  if (!['figure', 'equation'].includes(identity.type)) return null;
+  const declaration = segments[declarationPosition];
+  const candidates = [];
+  segments.forEach((item, position) => {
+    if (!hasVisualAsset(item) || position === declarationPosition) return;
+    if (Number(item.page) !== Number(declaration.page)) return;
+    const distance = Math.abs(position - declarationPosition);
+    if (distance > 6) return;
+    const conflictingDeclaration = segmentReferenceDeclarations(item)
+      .some((entry) => entry.type === identity.type && entry.number !== identity.number);
+    if (conflictingDeclaration) return;
+    const sameParagraph = Number(declaration.paragraph) > 0
+      && Number(item.paragraph) === Number(declaration.paragraph);
+    const afterDeclaration = position > declarationPosition;
+    const kindMatches = (identity.type === 'figure' && (item.kind || '') === 'figure')
+      || (identity.type === 'equation' && (item.kind || '') === 'equation');
+    const score = (sameParagraph ? 900 : 600)
+      + (afterDeclaration ? 30 : 0)
+      + (kindMatches ? 20 : 0)
+      - distance;
+    candidates.push({item, position, score});
+  });
+  candidates.sort((left, right) => right.score - left.score || left.position - right.position);
+  return candidates[0] || null;
+}
+
+function buildReferenceCatalog(segments) {
+  const catalog = new Map();
+  const register = (identity, item, position, score) => {
+    const key = referenceKey(identity.type, identity.number);
+    const existing = catalog.get(key);
+    if (!existing || score > existing.score || (score === existing.score && position < existing.position)) {
+      catalog.set(key, {...identity, item, position, score});
+    }
+  };
+  segments.forEach((item, position) => {
+    segmentReferenceDeclarations(item).forEach((identity) => {
+      if (hasVisualAsset(item)) {
+        register(identity, item, position, 1200);
+        return;
+      }
+      const associated = associatedVisualCandidate(segments, position, identity);
+      if (associated) register(identity, associated.item, associated.position, associated.score);
+      register(identity, item, position, 100);
+    });
+  });
+  return catalog;
+}
+
+function findFirstReferenceAnchors(segments, targets) {
+  const anchors = new Map();
+  segments.forEach((item, position) => {
+    [item.source, item.translation].forEach((value) => {
+      for (const match of String(value || '').matchAll(REFERENCE_PATTERN)) {
+        const identity = referenceIdentity(match[0]);
+        if (!identity) continue;
+        const key = referenceKey(identity.type, identity.number);
+        const target = targets.get(key);
+        if (!Number.isInteger(target) || target === Number(item.index) || anchors.has(key)) continue;
+        anchors.set(key, {item, position});
+      }
+    });
+  });
+  return anchors;
+}
+
+function prepareReferenceLayout(segments) {
+  const catalog = buildReferenceCatalog(segments);
+  const targets = new Map([...catalog].map(([key, entry]) => [key, Number(entry.item.index)]));
+  const anchors = findFirstReferenceAnchors(segments, targets);
+  const plans = [...catalog.entries()].flatMap(([key, entry]) => {
+    const anchor = anchors.get(key);
+    const movable = ['figure', 'equation'].includes(entry.type) && hasVisualAsset(entry.item);
+    return movable && anchor && anchor.position < entry.position
+      ? [{anchor, target:entry.item, targetPosition:entry.position}]
+      : [];
+  }).sort((left, right) => left.anchor.position - right.anchor.position || left.targetPosition - right.targetPosition);
+
+  const arranged = [...segments];
+  const anchorTails = new Map();
+  plans.forEach(({anchor, target}) => {
+    const anchorKey = Number(anchor.item.index);
+    const insertionAnchor = anchorTails.get(anchorKey) || anchor.item;
+    let targetPosition = arranged.indexOf(target);
+    let anchorPosition = arranged.indexOf(insertionAnchor);
+    if (targetPosition < 0 || anchorPosition < 0) return;
+    if (targetPosition === anchorPosition + 1) {
+      anchorTails.set(anchorKey, target);
+      return;
+    }
+    arranged.splice(targetPosition, 1);
+    anchorPosition = arranged.indexOf(insertionAnchor);
+    arranged.splice(anchorPosition + 1, 0, target);
+    target.reference_relocated = true;
+    anchorTails.set(anchorKey, target);
+  });
+  return {segments: arranged, targets};
+}
+
+function referenceIdentity(text) {
+  const number = String(text).match(/\d+/)?.[0];
+  if (!number) return null;
+  if (/^(?:fig|figure|図)/i.test(text)) return {type:'figure', number};
+  if (/^(?:eq|equation|式)/i.test(text)) return {type:'equation', number};
+  if (/^(?:table|表)/i.test(text)) return {type:'table', number};
+  return null;
+}
+
+function renderReferencedText(value, currentIndex) {
+  const text = String(value ?? '');
+  let rendered = '';
+  let lastIndex = 0;
+  for (const match of text.matchAll(REFERENCE_PATTERN)) {
+    rendered += escapeHtml(text.slice(lastIndex, match.index));
+    const identity = referenceIdentity(match[0]);
+    const target = identity ? state.referenceTargets.get(referenceKey(identity.type, identity.number)) : undefined;
+    if (Number.isInteger(target) && target !== Number(currentIndex)) {
+      rendered += `<button type="button" class="reference-link" data-reference-index="${target}" title="参照先へ移動">${escapeHtml(match[0])}</button>`;
+    } else {
+      rendered += escapeHtml(match[0]);
+    }
+    lastIndex = match.index + match[0].length;
+  }
+  return rendered + escapeHtml(text.slice(lastIndex));
 }
 
 function renderPaperNavigation() {
@@ -172,11 +339,12 @@ function renderClipCard(item, part) {
   const definition = CLIP_PARTS[part];
   const translation = item.translation || `⚠ ${item.error || '未翻訳'}`;
   const text = part === 'source' ? item.source : (part === 'translation' ? translation : (item.note || '（メモは未入力です）'));
+  const renderedText = part === 'note' ? escapeHtml(text) : renderReferencedText(text, item.index);
   const assets = part === 'note' ? '' : (item.assets || []).map((asset, number) => `<figure><a href="${escapeHtml(asset)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(asset)}" alt="${kind === 'equation' ? '数式' : '図'} ${item.index + 1}-${number + 1}"></a></figure>`).join('');
   return `<article class="clip-card clip-${part} kind-${escapeHtml(kind)}" data-clip-index="${item.index}" data-clip-part="${part}">
     <header><button type="button" class="clip-jump" data-nav-index="${item.index}" title="元の位置へ移動">${String(item.index + 1).padStart(3, '0')}</button><span><b>${definition.key}</b> ${definition.label} · ${escapeHtml(labels[kind] || kind)}</span><button type="button" class="clip-toggle clip-remove" data-clip-index="${item.index}" data-clip-part="${part}" aria-label="${item.index + 1}番の${definition.label}をクリップから外す">×</button></header>
     ${assets ? `<div class="clip-assets">${assets}</div>` : ''}
-    <div class="clip-card-body"><p>${escapeHtml(text)}</p></div>
+    <div class="clip-card-body"><p>${renderedText}</p></div>
   </article>`;
 }
 
@@ -207,6 +375,23 @@ function jumpToSegment(index) {
   window.scrollTo({top: Math.max(0, top), behavior: 'smooth'});
   row.classList.add('jump-highlight');
   setTimeout(() => row.classList.remove('jump-highlight'), 1300);
+}
+
+function updateReferenceBackButton() {
+  $('referenceBack').classList.toggle('hidden', state.referenceHistory.length === 0);
+}
+
+function jumpToReference(index) {
+  state.referenceHistory.push(window.scrollY);
+  if (state.referenceHistory.length > 20) state.referenceHistory.shift();
+  updateReferenceBackButton();
+  jumpToSegment(index);
+}
+
+function returnFromReference() {
+  const top = state.referenceHistory.pop();
+  updateReferenceBackButton();
+  if (Number.isFinite(top)) window.scrollTo({top, behavior:'smooth'});
 }
 
 function applyBookmark(index, bookmarked) {
@@ -316,6 +501,7 @@ $('targetLang').addEventListener('change', () => $('form').closest('label').styl
 $('startTranslation').addEventListener('click', startJob);
 $('cancelJob').addEventListener('click', async () => { if(state.jobId) await fetch(`/api/jobs/${state.jobId}/cancel`, {method:'POST'}); });
 $('newPaper').addEventListener('click', () => { localStorage.removeItem(JOB_STORAGE_KEY); location.href = '/'; });
+$('referenceBack').addEventListener('click', returnFromReference);
 $('results').addEventListener('input', (event) => {
   const editor = event.target.closest('.note-editor'); if (!editor) return;
   resizeNote(editor);
@@ -334,6 +520,8 @@ $('results').addEventListener('click', (event) => {
 $('readerLayout').addEventListener('click', (event) => {
   const clipButton = event.target.closest('.clip-toggle');
   if (clipButton) { toggleClip(clipButton); return; }
+  const reference = event.target.closest('.reference-link');
+  if (reference) { jumpToReference(Number(reference.dataset.referenceIndex)); return; }
   const target = event.target.closest('[data-nav-index]');
   if (target) jumpToSegment(Number(target.dataset.navIndex));
 });
