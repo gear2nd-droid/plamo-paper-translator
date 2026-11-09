@@ -765,14 +765,24 @@ def _extract_page_images(
     asset_dir: Path | None,
     page_number: int,
     url_prefix: str,
+    *,
+    pdfium_document: Any = None,
+    page_width: float | None = None,
+    page_height: float | None = None,
 ) -> list[ExtractedPageImage]:
     if asset_dir is None:
         return []
     assets: list[ExtractedPageImage] = []
+    pdfium_page: Any = None
     try:
         images = page.images
         display_boxes = _image_display_boxes(page)
         asset_dir.mkdir(parents=True, exist_ok=True)
+        if pdfium_document is not None and page_width and page_height:
+            try:
+                pdfium_page = pdfium_document[page_number - 1]
+            except (IndexError, RuntimeError, ValueError):
+                pdfium_page = None
         for image_number, image_file in enumerate(images, start=1):
             image = image_file.image
             width, height = image.size
@@ -784,19 +794,52 @@ def _extract_page_images(
             suffix = Path(image_file.name).suffix.lower()
             if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}:
                 suffix = ".png"
-                from io import BytesIO
-
-                buffer = BytesIO()
-                image.save(buffer, format="PNG")
-                data = buffer.getvalue()
             filename = f"page-{page_number:03d}-figure-{image_number:02d}{suffix}"
-            (asset_dir / filename).write_bytes(data)
             resource_name = Path(image_file.name).stem.lstrip("/")
             box = next(iter(display_boxes.get(resource_name, [])), None)
+            output_path = asset_dir / filename
+            rendered = False
+            if pdfium_page is not None and box is not None and page_width and page_height:
+                x0, y0, x1, y1 = box
+                padding = 1.5
+                crop = (
+                    max(0.0, x0 - padding),
+                    max(0.0, y0 - padding),
+                    max(0.0, page_width - x1 - padding),
+                    max(0.0, page_height - y1 - padding),
+                )
+                try:
+                    rendered_image = pdfium_page.render(scale=3, crop=crop).to_pil().convert("RGB")
+                    if suffix in {".jpg", ".jpeg"}:
+                        rendered_image.save(output_path, format="JPEG", quality=95, subsampling=0, optimize=True)
+                    elif suffix == ".webp":
+                        rendered_image.save(output_path, format="WEBP", quality=95, method=6)
+                    elif suffix in {".tif", ".tiff"}:
+                        rendered_image.save(output_path, format="TIFF", compression="tiff_lzw")
+                    else:
+                        rendered_image.save(output_path, format="PNG", optimize=True)
+                    rendered = True
+                except (OSError, RuntimeError, ValueError):
+                    rendered = False
+            if not rendered:
+                if suffix == ".png" and Path(image_file.name).suffix.lower() not in {
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".webp",
+                    ".tif",
+                    ".tiff",
+                }:
+                    image.save(output_path, format="PNG", optimize=True)
+                else:
+                    output_path.write_bytes(data)
             asset = f"{url_prefix.rstrip('/')}/{filename}"
             assets.append(ExtractedPageImage(asset, *(box or (None, None, None, None))))
     except (ImportError, OSError, ValueError):
         return []
+    finally:
+        if pdfium_page is not None:
+            pdfium_page.close()
     return assets
 
 
@@ -1168,7 +1211,15 @@ def extract_document(
                 asset_url_prefix,
             )
             _attach_equation_images(segments[page_start:], equation_assets)
-            images = _extract_page_images(page, asset_dir, page_number, asset_url_prefix)
+            images = _extract_page_images(
+                page,
+                asset_dir,
+                page_number,
+                asset_url_prefix,
+                pdfium_document=pdfium_document,
+                page_width=float(page.mediabox.width),
+                page_height=float(page.mediabox.height),
+            )
             if images:
                 unassigned_images = _assign_page_images(
                     segments[page_start:],

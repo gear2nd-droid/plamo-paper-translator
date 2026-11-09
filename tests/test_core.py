@@ -16,6 +16,7 @@ from paper_core import (
     _attach_equation_images,
     _assign_inline_images,
     _assign_page_images,
+    _extract_page_images,
     _mark_caption_boundaries,
     _mark_equation_boundaries,
     _merge_page_continuations,
@@ -250,6 +251,67 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(unassigned, [])
         self.assertEqual(left.assets, ["/left.jpg"])
         self.assertEqual(right.assets, ["/right.jpg"])
+
+    def test_page_image_is_rendered_with_pdf_overlays_and_keeps_url(self):
+        from PIL import Image
+
+        class FakeImageFile:
+            name = "/Im1.jpg"
+            data = b"x" * 4096
+            image = Image.new("RGB", (300, 200), "blue")
+
+        class FakePage:
+            images = [FakeImageFile()]
+
+        class FakeBitmap:
+            def to_pil(self):
+                return Image.new("RGB", (640, 360), "white")
+
+        class FakePdfiumPage:
+            def __init__(self):
+                self.crop = None
+                self.closed = False
+
+            def render(self, *, scale, crop):
+                self.scale = scale
+                self.crop = crop
+                return FakeBitmap()
+
+            def close(self):
+                self.closed = True
+
+        class FakePdfiumDocument:
+            def __init__(self, rendered_page):
+                self.rendered_page = rendered_page
+
+            def __getitem__(self, index):
+                self.index = index
+                return self.rendered_page
+
+        rendered_page = FakePdfiumPage()
+        document = FakePdfiumDocument(rendered_page)
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "paper_core._image_display_boxes",
+            return_value={"Im1": [(50.0, 100.0, 250.0, 300.0)]},
+        ):
+            extracted = _extract_page_images(
+                FakePage(),
+                Path(directory),
+                1,
+                "/api/assets/document",
+                pdfium_document=document,
+                page_width=612.0,
+                page_height=792.0,
+            )
+            output = Path(directory) / "page-001-figure-01.jpg"
+            self.assertTrue(output.exists())
+            with Image.open(output) as rendered_image:
+                self.assertEqual(rendered_image.size, (640, 360))
+        self.assertEqual(extracted[0].asset, "/api/assets/document/page-001-figure-01.jpg")
+        self.assertEqual(document.index, 0)
+        self.assertEqual(rendered_page.scale, 3)
+        self.assertEqual(rendered_page.crop, (48.5, 98.5, 360.5, 490.5))
+        self.assertTrue(rendered_page.closed)
 
     def test_uncaptioned_inline_image_uses_nearby_figure_reference(self):
         first = Segment(0, 1, "Unrelated paragraph.", paragraph=1, sentence=1)
