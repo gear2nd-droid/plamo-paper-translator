@@ -32,7 +32,7 @@ try {
 
     function Copy-PackageLicense {
         param([string]$Distribution, [string]$DestinationName)
-        $Finder = 'import sys; from importlib.metadata import distribution; d=distribution(sys.argv[1]); files=[f for f in (d.files or []) if "license" in str(f).lower() or "copying" in str(f).lower()]; print(d.locate_file(files[0])) if files else sys.exit(1)'
+        $Finder = "import sys; from importlib.metadata import distribution; d=distribution(sys.argv[1]); files=[f for f in (d.files or []) if 'license' in str(f).lower() or 'copying' in str(f).lower()]; print(d.locate_file(files[0])) if files else sys.exit(1)"
         $Source = (& $Python -c $Finder $Distribution).Trim()
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $Source)) {
             throw "$Distribution のライセンス本文が見つかりません。"
@@ -43,7 +43,7 @@ try {
     Copy-PackageLicense -Distribution "pypdf" -DestinationName "pypdf-LICENSE.txt"
     Copy-PackageLicense -Distribution "Pillow" -DestinationName "Pillow-LICENSE.txt"
     Copy-PackageLicense -Distribution "pyinstaller" -DestinationName "PyInstaller-COPYING.txt"
-    $PdfiumFinder = 'import sys; from pathlib import Path; from importlib.metadata import distribution; d=distribution(sys.argv[1]); p=next(Path(d.locate_file(f)) for f in (d.files or []) if "build_licenses" in str(f).lower()); print(next(x for x in (p, *p.parents) if x.name.lower() == "licenses"))'
+    $PdfiumFinder = "import sys; from pathlib import Path; from importlib.metadata import distribution; d=distribution(sys.argv[1]); p=next(Path(d.locate_file(f)) for f in (d.files or []) if 'build_licenses' in str(f).lower()); print(next(x for x in (p, *p.parents) if x.name.lower() == 'licenses'))"
     $PdfiumLicenseSource = (& $Python -c $PdfiumFinder "pypdfium2").Trim()
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $PdfiumLicenseSource)) {
         throw "pypdfium2/PDFium のライセンス一式が見つかりません。"

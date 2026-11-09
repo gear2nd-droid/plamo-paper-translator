@@ -75,8 +75,28 @@
             <label class="reader-search"><span>文中検索</span><input id="readerSearch" type="search" placeholder="原文・訳文・メモ"></label>
             <button id="newPaper" class="text-button">別の論文を翻訳</button>
           </div>
-          <div id="readerHeader" class="reader-header hidden"><span>NO.</span><b>原文</b><b>対訳</b><b>メモ <small>自動保存</small></b></div>
-          <div id="results" class="results"></div>
+          <div id="readerLayout" class="reader-layout hidden">
+            <aside id="paperNavigation" class="paper-navigation" aria-label="論文ナビゲーション">
+              <section>
+                <div class="navigation-heading"><span>OUTLINE</span><h3>目次</h3></div>
+                <nav id="tableOfContents" class="toc-list" aria-label="論文の目次"></nav>
+              </section>
+            </aside>
+            <div class="reader-content">
+              <div id="readerStickyStack" class="reader-sticky-stack">
+                <div id="readerHeader" class="reader-header hidden"><span>NO.</span><b>原文</b><b>対訳</b><b>メモ <small>自動保存</small></b></div>
+              </div>
+              <div id="results" class="results"></div>
+            </div>
+            <aside id="bookmarkNavigation" class="bookmark-navigation-panel" aria-label="ブックマークナビゲーション">
+              <div class="navigation-heading"><span>SAVED</span><h3>ブックマーク</h3></div>
+              <nav id="bookmarkList" class="bookmark-list" aria-label="ブックマーク一覧"></nav>
+            </aside>
+            <aside id="clipShelf" class="clip-shelf hidden" aria-label="固定表示中のクリップ">
+              <div class="clip-shelf-heading"><span>CLIPS</span><b>固定表示</b><small id="clipCount">0 / 3</small></div>
+              <div id="clipShelfItems" class="clip-shelf-items"></div>
+            </aside>
+          </div>
         </section>
       </div>
     </section>

@@ -27,6 +27,7 @@ from paper_core import (
     bilingual_html,
     bilingual_markdown,
     document_to_dict,
+    heading_level,
     neighboring_context,
     parse_glossary,
     segments_for_mode,
@@ -80,6 +81,29 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(units[2][2:], (2, 2))
         self.assertEqual(units[3][2:], (3, 1))
 
+    def test_heading_levels_capture_section_and_subsection_structure(self):
+        self.assertEqual(heading_level("1 Introduction"), 1)
+        self.assertEqual(heading_level("2.3 Training Procedure"), 2)
+        self.assertEqual(heading_level("2.3.1 Optimization Details"), 3)
+        self.assertEqual(heading_level("1.2.1 Multi-axis 3D printing."), 3)
+        self.assertEqual(heading_level("II. RELATED WORK"), 1)
+        self.assertEqual(heading_level("A. Training Procedure"), 2)
+        self.assertEqual(heading_level("第2節 実験方法"), 2)
+        self.assertEqual(heading_level("This is an ordinary sentence."), 0)
+
+        units = split_document_units(
+            "II. RELATED WORK\n\nA. Training Procedure\n\nBody text.",
+            include_positions=True,
+        )
+        self.assertEqual([unit[1] for unit in units], ["heading", "heading", "sentence"])
+
+    def test_heading_segment_derives_level_for_saved_jobs(self):
+        segment = Segment(0, 1, "3.2 Evaluation Protocol", kind="heading")
+        self.assertEqual(segment.heading_level, 2)
+        legacy_segment = Segment(1, 1, "3.2.1 Evaluation Metrics.", kind="sentence")
+        self.assertEqual(legacy_segment.heading_level, 3)
+        self.assertEqual(legacy_segment.kind, "heading")
+
     def test_sentence_split_keeps_closing_quote_and_paragraph(self):
         units = split_document_units('The authors call it "robust." This is the second sentence.', include_positions=True)
         self.assertEqual([unit[0] for unit in units], ['The authors call it "robust."', "This is the second sentence."])
@@ -103,7 +127,7 @@ class CoreTests(unittest.TestCase):
 
     def test_paragraph_mode_groups_sentence_rows(self):
         segments = [
-            Segment(0, 1, "First sentence.", kind="sentence", paragraph=1, sentence=1),
+            Segment(0, 1, "First sentence.", kind="sentence", bookmarked=True, clips=["source", "note"], paragraph=1, sentence=1),
             Segment(1, 1, "Second sentence.", kind="sentence", paragraph=1, sentence=2),
             Segment(2, 1, "Figure 1: Sample.", kind="figure", assets=["/figure.png"], paragraph=2, sentence=1),
         ]
@@ -113,6 +137,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(grouped[0].sentence, 0)
         self.assertEqual(grouped[1].assets, ["/figure.png"])
         self.assertEqual([segment.index for segment in grouped], [0, 1])
+        self.assertTrue(grouped[0].bookmarked)
+        self.assertTrue(grouped[0].clipped)
+        self.assertEqual(grouped[0].clips, ["source", "note"])
 
     def test_sentence_mode_returns_independent_copies(self):
         original = Segment(0, 1, "One.", paragraph=1, sentence=1)
@@ -330,6 +357,17 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(payload["attribution"], "Built with PLaMo")
         self.assertEqual(payload["generated_by"], "PLaMo 3 Translate")
         self.assertIn("plamo-community-license", payload["model_license"])
+
+    def test_exports_preserve_bookmarks(self):
+        segment = Segment(0, 1, "1 Introduction", "1 はじめに", kind="heading", bookmarked=True, clips=["translation"])
+        markdown = bilingual_markdown("Paper", [segment])
+        output = bilingual_html("Paper", [segment])
+        payload = document_to_dict("Paper", [segment])
+        self.assertIn("★", markdown)
+        self.assertIn("★ ブックマーク", output)
+        self.assertTrue(payload["segments"][0]["bookmarked"])
+        self.assertTrue(payload["segments"][0]["clipped"])
+        self.assertEqual(payload["segments"][0]["clips"], ["translation"])
 
 
 if __name__ == "__main__":

@@ -58,6 +58,8 @@ elif getattr(sys, "frozen", False):
 else:
     USER_DIR = APP_DIR
 APP_URL = "http://127.0.0.1:7865/"
+MAX_CLIPS = 3
+CLIP_PARTS = {"source", "translation", "note"}
 NATIVE_HOST_NAME = "jp.gear2.plamo_paper_translator"
 CHROME_EXTENSION_ID = "cpiiadekehcofkocnlplcaolgioefcjd"
 CHROME_EXTENSION_ORIGIN = f"chrome-extension://{CHROME_EXTENSION_ID}/"
@@ -301,6 +303,42 @@ def _load_saved_job(job_id: str) -> dict[str, Any] | None:
     return payload
 
 
+def _set_segment_bookmark(job: dict[str, Any], index: int, bookmarked: bool) -> Segment:
+    if type(bookmarked) is not bool:
+        raise ValueError("ブックマークの値が不正です。")
+    segments = job.get("segments", [])
+    if index < 0 or index >= len(segments):
+        raise IndexError("対訳位置が不正です。")
+    segment = segments[index]
+    if not isinstance(segment, Segment):
+        raise TypeError("対訳データが不正です。")
+    segment.bookmarked = bookmarked
+    return segment
+
+
+def _set_segment_clip(job: dict[str, Any], index: int, part: str, clipped: bool) -> Segment:
+    if type(clipped) is not bool:
+        raise ValueError("クリップの値が不正です。")
+    if part not in CLIP_PARTS:
+        raise ValueError("クリップ対象が不正です。")
+    segments = job.get("segments", [])
+    if index < 0 or index >= len(segments):
+        raise IndexError("対訳位置が不正です。")
+    segment = segments[index]
+    if not isinstance(segment, Segment):
+        raise TypeError("対訳データが不正です。")
+    if clipped and part not in segment.clips:
+        clipped_count = sum(len(item.clips) for item in segments if isinstance(item, Segment))
+        if clipped_count >= MAX_CLIPS:
+            raise ValueError(f"クリップは{MAX_CLIPS}件までです。先に1件外してください。")
+    if clipped:
+        segment.clips.append(part)
+    else:
+        segment.clips = [item for item in segment.clips if item != part]
+    segment.clipped = bool(segment.clips)
+    return segment
+
+
 def _translate_job(job_id: str) -> None:
     with state_lock:
         job = jobs[job_id]
@@ -501,6 +539,54 @@ class Handler(BaseHTTPRequestHandler):
                 job["segments"][index].note = note
                 _save_job(job)
             self._json({"ok": True, "index": index})
+            return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/bookmarks", parsed.path)
+        if match:
+            job = _load_saved_job(match.group(1))
+            if not job:
+                self._error("ジョブが見つかりません。", 404)
+                return
+            try:
+                data = self._read_json()
+                index = int(data.get("index", -1))
+                bookmarked = data.get("bookmarked")
+                with state_lock:
+                    segment = _set_segment_bookmark(job, index, bookmarked)
+                    _save_job(job)
+            except (IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._error(str(exc) or "ブックマークを保存できません。")
+                return
+            self._json({"ok": True, "index": index, "bookmarked": segment.bookmarked})
+            return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/clips", parsed.path)
+        if match:
+            job = _load_saved_job(match.group(1))
+            if not job:
+                self._error("ジョブが見つかりません。", 404)
+                return
+            try:
+                data = self._read_json()
+                index = int(data.get("index", -1))
+                part = data.get("part")
+                clipped = data.get("clipped")
+                with state_lock:
+                    segment = _set_segment_clip(job, index, part, clipped)
+                    _save_job(job)
+                    clipped_count = sum(len(item.clips) for item in job["segments"])
+            except (IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._error(str(exc) or "クリップを保存できません。")
+                return
+            self._json(
+                {
+                    "ok": True,
+                    "index": index,
+                    "part": part,
+                    "clipped": part in segment.clips,
+                    "clips": segment.clips,
+                    "count": clipped_count,
+                    "max": MAX_CLIPS,
+                }
+            )
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/cancel", parsed.path)
         if match:

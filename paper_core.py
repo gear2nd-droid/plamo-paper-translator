@@ -35,6 +35,45 @@ PLAMO_ATTRIBUTION = "Built with PLaMo"
 LIST_PATTERN = re.compile(r"^(?:[•●◦▪‣*-]\s+|\((?:[1-9]|1[01])\)\s+|(?:[1-9]|1[01])[.)]\s+)")
 
 POSITIONED_CAPTION_PATTERN = re.compile(r"^(?:figure|fig\.?|table)\s*\d+\s*[.:]", re.I)
+SECTION_NAME_PATTERN = re.compile(
+    r"^(?:abstract|introduction|background|related work|methods?|materials?|results?|discussion|"
+    r"conclusions?|references|acknowledg(?:e)?ments?|appendix|supplementary materials?)\s*$",
+    re.I,
+)
+NUMBERED_SECTION_PATTERN = re.compile(r"^(\d+(?:\.\d+){0,5})\.?\s+(.{1,110})$")
+ROMAN_SECTION_PATTERN = re.compile(r"^([IVXLC]+)[.)]\s+(.{1,110})$")
+LETTER_SECTION_PATTERN = re.compile(r"^([A-Z])[.)]\s+(.{1,110})$")
+
+
+def heading_level(text: str) -> int:
+    """Infer a section depth from a normalized academic-paper heading."""
+    compact = text.strip().removeprefix(CAPTION_MARKER).removeprefix(BODY_MARKER)
+    compact = EQUATION_MARKER_PATTERN.sub("", compact).strip()
+    if not compact or len(compact) > 120:
+        return 0
+    if SECTION_NAME_PATTERN.fullmatch(compact):
+        return 1
+    japanese = re.match(r"^第\s*\d+\s*(章|節|項)\s*(.*)$", compact)
+    if japanese:
+        return {"章": 1, "節": 2, "項": 3}[japanese.group(1)]
+    numbered = NUMBERED_SECTION_PATTERN.fullmatch(compact)
+    if numbered:
+        title = numbered.group(2).strip().rstrip(".。")
+        if title and not re.search(r"[.!?。！？]", title):
+            return min(6, numbered.group(1).count(".") + 1)
+    roman = ROMAN_SECTION_PATTERN.fullmatch(compact)
+    if roman:
+        title = roman.group(2).strip()
+        words = re.findall(r"[A-Za-z\u3040-\u30ff\u3400-\u9fff]+", title)
+        if not re.search(r"[.!?。！？]", title) and (title.isupper() or len(words) >= 2):
+            return 1
+    letter = LETTER_SECTION_PATTERN.fullmatch(compact)
+    if letter:
+        title = letter.group(2).strip()
+        words = re.findall(r"[A-Za-z\u3040-\u30ff\u3400-\u9fff]+", title)
+        if not re.search(r"[.!?。！？]", title) and (title.isupper() or len(words) >= 2):
+            return 2
+    return 0
 
 
 @dataclass
@@ -48,8 +87,27 @@ class Segment:
     label: str = ""
     assets: list[str] = field(default_factory=list)
     note: str = ""
+    bookmarked: bool = False
+    clipped: bool = False
+    clips: list[str] = field(default_factory=list)
+    heading_level: int = 0
     paragraph: int = 0
     sentence: int = 0
+
+    def __post_init__(self) -> None:
+        allowed_clip_parts = {"source", "translation", "note"}
+        self.clips = list(dict.fromkeys(part for part in self.clips if part in allowed_clip_parts))
+        if self.clipped and not self.clips:
+            self.clips = ["source"]
+        self.clipped = bool(self.clips)
+        if self.heading_level <= 0:
+            derived_level = heading_level(self.source)
+            if derived_level:
+                self.heading_level = derived_level
+                if self.kind == "sentence":
+                    self.kind = "heading"
+            elif self.kind == "heading":
+                self.heading_level = 1
 
 
 @dataclass(frozen=True)
@@ -167,13 +225,7 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
             flush()
             paragraphs.append(line)
             continue
-        is_heading = (
-            len(line) < 120
-            and (
-                re.match(r"^(?:abstract|introduction|background|methods?|results?|discussion|conclusion|references)\b", line, re.I)
-                or re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Z\u3040-\u30ff\u3400-\u9fff]", line)
-            )
-        )
+        is_heading = heading_level(line) > 0
         if is_heading:
             flush()
         if is_heading:
@@ -559,11 +611,7 @@ def _block_kind(text: str) -> str:
         return "sentence"
     compact = compact.removeprefix(CAPTION_MARKER)
     compact = EQUATION_MARKER_PATTERN.sub("", compact)
-    if re.match(
-        r"^(?:abstract|introduction|background|related work|methods?|materials?|results?|discussion|conclusions?|references|acknowledg(?:e)?ments?)\s*$",
-        compact,
-        re.I,
-    ) or re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Z\u3040-\u30ff\u3400-\u9fff][^.!?]{0,100}$", compact):
+    if heading_level(compact) > 0:
         return "heading"
     if LIST_PATTERN.match(compact):
         return "list_item"
@@ -680,6 +728,9 @@ def segments_for_mode(segments: Iterable[Segment], mode: str) -> list[Segment]:
                 label=next((member.label for member in members if member.label), ""),
                 assets=[asset for member in members for asset in member.assets],
                 note="\n".join(member.note for member in members if member.note),
+                bookmarked=any(member.bookmarked for member in members),
+                clips=list(dict.fromkeys(part for member in members for part in member.clips)),
+                heading_level=first.heading_level,
                 paragraph=first.paragraph,
                 sentence=0,
             )
@@ -1289,7 +1340,9 @@ def bilingual_markdown(title: str, segments: Iterable[Segment]) -> str:
     ]
     for segment in segments:
         if segment.kind == "heading":
-            lines.extend([f"## {segment.source}", "", f"**訳:** {segment.translation or segment.source}", ""])
+            marker = " ★" if segment.bookmarked else ""
+            level = min(6, max(2, segment.heading_level + 1))
+            lines.extend([f"{'#' * level} {segment.source}{marker}", "", f"**訳:** {segment.translation or segment.source}", ""])
             continue
         position = f"P{segment.paragraph} / S{segment.sentence}" if segment.sentence else f"P{segment.paragraph}"
         for asset in segment.assets:
@@ -1308,6 +1361,8 @@ def bilingual_markdown(title: str, segments: Iterable[Segment]) -> str:
         )
         if segment.note:
             lines.extend(["**メモ**", "", segment.note, ""])
+        if segment.bookmarked:
+            lines.extend(["> ★ ブックマーク", ""])
     return "\n".join(lines)
 
 
@@ -1344,12 +1399,13 @@ def bilingual_html(
             position = f"P{segment.paragraph}<br>S{segment.sentence}" if segment.sentence else f"P{segment.paragraph}"
         else:
             position = "旧形式"
+        bookmark = '<b class="bookmark">★ ブックマーク</b>' if segment.bookmarked else ""
         rows.append(
-            f'<section class="reader-row kind-{html.escape(segment.kind)}{" paragraph-start" if paragraph_start else ""}">'
+            f'<section class="reader-row kind-{html.escape(segment.kind)}{" paragraph-start" if paragraph_start else ""}{" bookmarked" if segment.bookmarked else ""}">'
             f'<div class="number"><b>{segment.index + 1}</b><span>{position}</span></div>'
             f'<article class="source">{source_content}</article>'
             f'<article class="translation">{translation_content}</article>'
-            f'<aside class="note"><p>{html.escape(segment.note).replace(chr(10), "<br>") or "<span>メモなし</span>"}</p></aside>'
+            f'<aside class="note">{bookmark}<p>{html.escape(segment.note).replace(chr(10), "<br>") or "<span>メモなし</span>"}</p></aside>'
             "</section>"
         )
         previous_paragraph = segment.paragraph
@@ -1364,6 +1420,7 @@ header{{padding:28px 32px;border-bottom:1px solid #d8d5ca;background:#fff;positi
 .labels{{position:sticky;top:89px;z-index:2;background:#174d36;color:#fff;font-size:.72rem;letter-spacing:.1em}}.labels>*{{padding:10px 18px;border-right:1px solid #376750}}
 .reader-row{{background:#fff;border-bottom:1px solid #dedbd1;align-items:stretch}}.reader-row>*{{padding:10px 12px;border-right:1px solid #e1ded5;min-width:0}}
 .number{{color:#728078;text-align:center;padding:22px 5px}}.number b,.number span{{display:block}}.number b{{font:italic .72rem Georgia,serif}}.number span{{font-size:.58rem;line-height:1.45;margin-top:7px}}p{{white-space:pre-wrap;line-height:1.78;margin:0;overflow-wrap:anywhere}}.source p{{font-family:Georgia,"Times New Roman","Yu Mincho",serif}}.translation{{background:#fbfcf9}}.note{{background:#f8f5ed;color:#5f675f;font-size:.86rem}}.note span{{color:#a0a49d}}
+.bookmark{{display:block;color:#916d16;font-size:.68rem;margin-bottom:7px}}.bookmarked{{box-shadow:inset -4px 0 #c79b36}}
 .paragraph-start{{border-top:3px solid #9aab9f;margin-top:8px}}
 .kind-heading{{margin-top:24px;border-top:3px solid #174d36}}.kind-heading p{{font-weight:700;font-size:1.08rem}}.kind-equation p,.kind-table p{{font-family:"Cambria Math",Consolas,monospace;white-space:pre-wrap}}.figure-gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px}}figure{{margin:0;background:#fff}}img{{display:block;width:100%;height:100%;max-height:460px;object-fit:contain;margin:auto;border:1px solid #ddd}}
 .kind-equation .figure-gallery{{grid-template-columns:minmax(0,1fr);width:100%;min-width:0;margin-bottom:7px;overflow:hidden}}.kind-equation figure{{width:100%;max-width:100%;min-width:0}}.kind-equation img{{display:block;width:100%;max-width:100%;height:auto;border:0;max-height:300px;object-fit:contain}}.equation-text{{font-size:.68rem;color:#687169;text-align:left}}.equation-text summary{{cursor:pointer}}.equation-text p{{font-size:.68rem;line-height:1.45;margin-top:7px}}

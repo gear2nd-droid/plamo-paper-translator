@@ -58,6 +58,51 @@ class SavedJobTests(unittest.TestCase):
         self.assertEqual(saved["status"], "failed")
         self.assertIn("再起動", loaded["message"])
 
+    def test_bookmark_round_trip_on_disk(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "JOB_DIR", Path(directory)):
+            job = dict(self.payload)
+            job["segments"] = [Segment(0, 1, "1 Introduction", kind="heading")]
+            app._set_segment_bookmark(job, 0, True)
+            app._save_job(job)
+            app.jobs.pop(self.job_id, None)
+            loaded = app._load_saved_job(self.job_id)
+
+        self.assertTrue(loaded["segments"][0].bookmarked)
+        self.assertEqual(loaded["segments"][0].heading_level, 1)
+
+    def test_bookmark_update_validates_value_and_index(self):
+        job = {"segments": [Segment(0, 1, "Source")]}
+        self.assertTrue(app._set_segment_bookmark(job, 0, True).bookmarked)
+        with self.assertRaises(ValueError):
+            app._set_segment_bookmark(job, 0, "true")
+        with self.assertRaises(IndexError):
+            app._set_segment_bookmark(job, 2, False)
+
+    def test_clip_round_trip_and_limit(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "JOB_DIR", Path(directory)):
+            job = dict(self.payload)
+            job["segments"] = [Segment(0, 1, "Source")]
+            for part in ("source", "translation", "note"):
+                app._set_segment_clip(job, 0, part, True)
+            with self.assertRaises(ValueError):
+                job["segments"].append(Segment(1, 1, "Other"))
+                app._set_segment_clip(job, 1, "source", True)
+            app._save_job(job)
+            app.jobs.pop(self.job_id, None)
+            loaded = app._load_saved_job(self.job_id)
+
+        self.assertEqual(loaded["segments"][0].clips, ["source", "translation", "note"])
+        self.assertNotIn("source", app._set_segment_clip(loaded, 0, "source", False).clips)
+
+    def test_clip_update_validates_value_and_index(self):
+        job = {"segments": [Segment(0, 1, "Source")]}
+        with self.assertRaises(ValueError):
+            app._set_segment_clip(job, 0, "source", "true")
+        with self.assertRaises(ValueError):
+            app._set_segment_clip(job, 0, "invalid", True)
+        with self.assertRaises(IndexError):
+            app._set_segment_clip(job, 2, "source", False)
+
 
 class NativeMessagingTests(unittest.TestCase):
     def test_frozen_launcher_config_selects_matching_app_home(self):

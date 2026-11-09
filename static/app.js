@@ -1,5 +1,11 @@
 const JOB_STORAGE_KEY = 'plamo-paper-translator.job-id';
-const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0 };
+const MAX_CLIPS = 3;
+const CLIP_PARTS = {
+  source: {key:'E', label:'英語'},
+  translation: {key:'J', label:'日本語'},
+  note: {key:'M', label:'メモ'},
+};
+const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], tocObserver: null };
 const noteTimers = new Map();
 const $ = (id) => document.getElementById(id);
 
@@ -40,7 +46,7 @@ async function upload(file) {
 async function startJob() {
   if (!state.documentId) return toast('先に論文を読み込んでください');
   const payload = {document_id: state.documentId, title: $('title').value, segmentation_mode: document.querySelector('input[name="segmentationMode"]:checked').value, source_lang: $('sourceLang').value, target_lang: $('targetLang').value, form: $('form').value, context: $('context').value, glossary: $('glossary').value};
-  showStep(3); $('progressBox').classList.remove('hidden'); $('resultActions').classList.add('hidden'); $('results').innerHTML = '';
+  showStep(3); $('progressBox').classList.remove('hidden'); $('resultActions').classList.add('hidden'); $('readerLayout').classList.add('hidden'); $('results').innerHTML = '';
   try {
     const response = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
     const data = await response.json(); if (!response.ok) throw new Error(data.error || '翻訳を開始できませんでした');
@@ -77,12 +83,16 @@ async function pollJob() {
 
 function showResults(data) {
   $('progressBox').classList.add('hidden'); $('resultActions').classList.remove('hidden');
+  $('readerLayout').classList.remove('hidden');
   $('readerHeader').classList.remove('hidden');
   const mode = data.segmentation_mode || 'sentence';
+  state.segments = (data.segments || []).map((item) => ({...item, clips:itemClips(item)}));
   $('resultSubtitle').textContent = mode === 'paragraph' ? `${data.total}段落・構造ブロックの対訳が完成しました。` : `${data.total}行の対訳が完成しました。Pは段落、Sは段落内の文番号です。`;
   ['Html','Md','Json'].forEach((format) => $(`export${format}`).href = `/api/jobs/${state.jobId}/export?format=${format.toLowerCase()}`);
-  $('results').innerHTML = data.segments.map((item, position, list) => renderSegment(item, position, list, mode)).join('');
+  $('results').innerHTML = state.segments.map((item, position, list) => renderSegment(item, position, list, mode)).join('');
   document.querySelectorAll('.note-editor').forEach(resizeNote);
+  renderPaperNavigation();
+  renderClipShelf();
   toast('翻訳が完了しました');
 }
 
@@ -99,12 +109,181 @@ function renderSegment(item, position, list, mode) {
   const isParagraphStart = hasPosition && (position === 0 || item.paragraph !== list[position - 1].paragraph);
   const unitPosition = hasPosition ? (Number(item.sentence) > 0 ? `P${item.paragraph} / S${item.sentence}` : `P${item.paragraph}`) : '旧形式';
   const unitLabel = mode === 'paragraph' && kind === 'sentence' ? '段落' : (labels[kind] || kind);
-  return `<section class="reader-row kind-${escapeHtml(kind)}${isParagraphStart ? ' paragraph-start' : ''}" data-index="${item.index}">
+  const bookmarked = Boolean(item.bookmarked);
+  const clips = itemClips(item);
+  const clipped = clips.length > 0;
+  const clipButtons = Object.entries(CLIP_PARTS).map(([part, definition]) => {
+    const active = clips.includes(part);
+    return `<button type="button" class="clip-toggle clip-part-toggle" data-clip-index="${item.index}" data-clip-part="${part}" aria-pressed="${active}" aria-label="${item.index + 1}番の${definition.label}をクリップ${active ? 'から外す' : 'して固定表示'}"><b>${definition.key}</b><span>${definition.label}</span></button>`;
+  }).join('');
+  const headingLevel = Math.max(0, Number(item.heading_level) || (kind === 'heading' ? 1 : 0));
+  return `<section id="segment-${item.index}" class="reader-row kind-${escapeHtml(kind)}${isParagraphStart ? ' paragraph-start' : ''}${bookmarked ? ' bookmarked' : ''}${clipped ? ' clipped' : ''}" data-index="${item.index}"${headingLevel ? ` data-heading-level="${headingLevel}"` : ''}>
     <div class="unit-meta"><b>${String(item.index + 1).padStart(3, '0')}</b><span>${escapeHtml(unitPosition)}</span><i>${escapeHtml(unitLabel)}</i></div>
     <article class="source-pane">${sourceContent}</article>
     <article class="translation-pane">${translationContent}</article>
-    <aside class="memo-pane"><textarea class="note-editor" rows="1" data-note-index="${item.index}" aria-label="${item.index + 1}番のメモ" placeholder="この箇所へのメモ…">${escapeHtml(item.note || '')}</textarea><small class="note-status">${item.note ? '保存済み' : '未入力'}</small></aside>
+    <aside class="memo-pane"><div class="annotation-actions"><button type="button" class="bookmark-toggle" data-bookmark-index="${item.index}" aria-pressed="${bookmarked}" aria-label="${item.index + 1}番をブックマーク${bookmarked ? 'から削除' : 'に追加'}"><span aria-hidden="true">${bookmarked ? '★' : '☆'}</span>${bookmarked ? '登録済み' : 'ブックマーク'}</button><span class="clip-button-group" aria-label="クリップ対象">${clipButtons}</span></div><textarea class="note-editor" rows="1" data-note-index="${item.index}" aria-label="${item.index + 1}番のメモ" placeholder="この箇所へのメモ…">${escapeHtml(item.note || '')}</textarea><small class="note-status">${item.note ? '保存済み' : '未入力'}</small></aside>
   </section>`;
+}
+
+function navigationLabel(item, limit = 68) {
+  const compact = String(item.source || '').replace(/\s+/g, ' ').trim();
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+}
+
+function renderPaperNavigation() {
+  const headings = state.segments.filter((item) => Number(item.heading_level) > 0 || (item.kind || '') === 'heading');
+  $('tableOfContents').innerHTML = headings.length
+    ? headings.map((item) => {
+        const level = Math.min(6, Math.max(1, Number(item.heading_level) || 1));
+        return `<button type="button" class="toc-link level-${level}" data-nav-index="${item.index}"><span>${escapeHtml(navigationLabel(item))}</span><small>p.${Number(item.page) || 1}</small></button>`;
+      }).join('')
+    : '<p class="navigation-empty">見出しを検出できませんでした。</p>';
+  renderBookmarkList();
+  observeTableOfContents(headings);
+}
+
+function renderBookmarkList() {
+  const bookmarked = state.segments.filter((item) => Boolean(item.bookmarked));
+  $('bookmarkList').innerHTML = bookmarked.length
+    ? bookmarked.map((item) => `<button type="button" class="bookmark-link" data-nav-index="${item.index}"><span aria-hidden="true">★</span><b>${escapeHtml(navigationLabel(item, 54))}</b><small>${String(item.index + 1).padStart(3, '0')}</small></button>`).join('')
+    : '<p class="navigation-empty">右側の☆から追加できます。</p>';
+}
+
+function itemClips(item) {
+  const clips = Array.isArray(item?.clips) ? item.clips.filter((part) => Boolean(CLIP_PARTS[part])) : [];
+  if (!clips.length && item?.clipped) return ['source'];
+  return [...new Set(clips)];
+}
+
+function totalClipCount() {
+  return state.segments.reduce((count, item) => count + itemClips(item).length, 0);
+}
+
+function renderClipShelf() {
+  const clipped = state.segments.flatMap((item) => itemClips(item).map((part) => ({item, part})));
+  $('clipShelf').classList.toggle('hidden', clipped.length === 0);
+  $('clipCount').textContent = `${clipped.length} / ${MAX_CLIPS}`;
+  $('clipShelfItems').innerHTML = clipped.map(({item, part}) => renderClipCard(item, part)).join('');
+}
+
+function renderClipCard(item, part) {
+  const kind = item.kind || 'sentence';
+  const labels = {sentence:'文', heading:'見出し', equation:'数式', table:'表', figure:'図', list_item:'箇条書き', citation:'引用'};
+  const definition = CLIP_PARTS[part];
+  const translation = item.translation || `⚠ ${item.error || '未翻訳'}`;
+  const text = part === 'source' ? item.source : (part === 'translation' ? translation : (item.note || '（メモは未入力です）'));
+  const assets = part === 'note' ? '' : (item.assets || []).map((asset, number) => `<figure><a href="${escapeHtml(asset)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(asset)}" alt="${kind === 'equation' ? '数式' : '図'} ${item.index + 1}-${number + 1}"></a></figure>`).join('');
+  return `<article class="clip-card clip-${part} kind-${escapeHtml(kind)}" data-clip-index="${item.index}" data-clip-part="${part}">
+    <header><button type="button" class="clip-jump" data-nav-index="${item.index}" title="元の位置へ移動">${String(item.index + 1).padStart(3, '0')}</button><span><b>${definition.key}</b> ${definition.label} · ${escapeHtml(labels[kind] || kind)}</span><button type="button" class="clip-toggle clip-remove" data-clip-index="${item.index}" data-clip-part="${part}" aria-label="${item.index + 1}番の${definition.label}をクリップから外す">×</button></header>
+    ${assets ? `<div class="clip-assets">${assets}</div>` : ''}
+    <div class="clip-card-body"><p>${escapeHtml(text)}</p></div>
+  </article>`;
+}
+
+function observeTableOfContents(headings) {
+  if (state.tocObserver) state.tocObserver.disconnect();
+  if (!headings.length || !('IntersectionObserver' in window)) return;
+  state.tocObserver = new IntersectionObserver((entries) => {
+    const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+    if (!visible.length) return;
+    const index = visible[0].target.dataset.index;
+    document.querySelectorAll('.toc-link').forEach((link) => link.classList.toggle('active', link.dataset.navIndex === index));
+  }, {rootMargin: '-120px 0px -68% 0px', threshold: 0});
+  headings.forEach((item) => {
+    const row = $(`segment-${item.index}`);
+    if (row) state.tocObserver.observe(row);
+  });
+}
+
+function jumpToSegment(index) {
+  const row = $(`segment-${index}`);
+  if (!row) return;
+  if (row.classList.contains('filtered')) {
+    $('readerSearch').value = '';
+    document.querySelectorAll('.reader-row').forEach((item) => item.classList.remove('filtered'));
+  }
+  const stickyHeight = $('readerStickyStack')?.offsetHeight || 0;
+  const top = row.getBoundingClientRect().top + window.scrollY - stickyHeight - 86;
+  window.scrollTo({top: Math.max(0, top), behavior: 'smooth'});
+  row.classList.add('jump-highlight');
+  setTimeout(() => row.classList.remove('jump-highlight'), 1300);
+}
+
+function applyBookmark(index, bookmarked) {
+  const item = state.segments.find((segment) => Number(segment.index) === index);
+  if (item) item.bookmarked = bookmarked;
+  const row = $(`segment-${index}`);
+  if (row) row.classList.toggle('bookmarked', bookmarked);
+  const button = document.querySelector(`.bookmark-toggle[data-bookmark-index="${index}"]`);
+  if (button) {
+    button.setAttribute('aria-pressed', String(bookmarked));
+    button.setAttribute('aria-label', `${index + 1}番をブックマーク${bookmarked ? 'から削除' : 'に追加'}`);
+    button.innerHTML = `<span aria-hidden="true">${bookmarked ? '★' : '☆'}</span>${bookmarked ? '登録済み' : 'ブックマーク'}`;
+  }
+  renderBookmarkList();
+}
+
+async function toggleBookmark(button) {
+  const index = Number(button.dataset.bookmarkIndex);
+  const item = state.segments.find((segment) => Number(segment.index) === index);
+  if (!item || button.disabled) return;
+  const previous = Boolean(item.bookmarked);
+  const next = !previous;
+  button.disabled = true;
+  applyBookmark(index, next);
+  try {
+    const response = await fetch(`/api/jobs/${state.jobId}/bookmarks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index, bookmarked:next})});
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'ブックマークを保存できません');
+    applyBookmark(index, Boolean(data.bookmarked));
+  } catch (error) {
+    applyBookmark(index, previous);
+    toast(error.message || 'ブックマークを保存できません');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function applyClip(index, part, clipped) {
+  const item = state.segments.find((segment) => Number(segment.index) === index);
+  if (!item || !CLIP_PARTS[part]) return;
+  const clips = new Set(itemClips(item));
+  if (clipped) clips.add(part); else clips.delete(part);
+  item.clips = [...clips];
+  item.clipped = item.clips.length > 0;
+  const row = $(`segment-${index}`);
+  if (row) row.classList.toggle('clipped', item.clipped);
+  const button = document.querySelector(`.memo-pane .clip-toggle[data-clip-index="${index}"][data-clip-part="${part}"]`);
+  if (button) {
+    button.setAttribute('aria-pressed', String(clipped));
+    button.setAttribute('aria-label', `${index + 1}番の${CLIP_PARTS[part].label}をクリップ${clipped ? 'から外す' : 'して固定表示'}`);
+  }
+  renderClipShelf();
+}
+
+async function toggleClip(button) {
+  const index = Number(button.dataset.clipIndex);
+  const part = button.dataset.clipPart;
+  const item = state.segments.find((segment) => Number(segment.index) === index);
+  if (!item || !CLIP_PARTS[part] || button.disabled) return;
+  const previous = itemClips(item).includes(part);
+  const next = !previous;
+  if (next && totalClipCount() >= MAX_CLIPS) {
+    toast(`クリップは${MAX_CLIPS}件までです。先に1件外してください`);
+    return;
+  }
+  button.disabled = true;
+  applyClip(index, part, next);
+  try {
+    const response = await fetch(`/api/jobs/${state.jobId}/clips`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index, part, clipped:next})});
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'クリップを保存できません');
+    applyClip(index, part, Boolean(data.clipped));
+  } catch (error) {
+    applyClip(index, part, previous);
+    toast(error.message || 'クリップを保存できません');
+  } finally {
+    const currentButton = document.querySelector(`.memo-pane .clip-toggle[data-clip-index="${index}"][data-clip-part="${part}"]`);
+    if (currentButton) currentButton.disabled = false;
+  }
 }
 
 function resizeNote(editor) {
@@ -141,12 +320,30 @@ $('results').addEventListener('input', (event) => {
   const editor = event.target.closest('.note-editor'); if (!editor) return;
   resizeNote(editor);
   const index = Number(editor.dataset.noteIndex); const status = editor.nextElementSibling;
+  const item = state.segments.find((segment) => Number(segment.index) === index);
+  if (item) item.note = editor.value;
+  const clippedNote = document.querySelector(`.clip-card[data-clip-index="${index}"][data-clip-part="note"] .clip-card-body p`);
+  if (clippedNote) clippedNote.textContent = editor.value || '（メモは未入力です）';
   clearTimeout(noteTimers.get(index)); status.textContent = '保存中…'; status.className = 'note-status saving';
   noteTimers.set(index, setTimeout(() => saveNote(index, editor.value, status), 650));
 });
+$('results').addEventListener('click', (event) => {
+  const button = event.target.closest('.bookmark-toggle');
+  if (button) toggleBookmark(button);
+});
+$('readerLayout').addEventListener('click', (event) => {
+  const clipButton = event.target.closest('.clip-toggle');
+  if (clipButton) { toggleClip(clipButton); return; }
+  const target = event.target.closest('[data-nav-index]');
+  if (target) jumpToSegment(Number(target.dataset.navIndex));
+});
 $('readerSearch').addEventListener('input', (event) => {
   const query = event.target.value.trim().toLocaleLowerCase();
-  document.querySelectorAll('.reader-row').forEach((row) => row.classList.toggle('filtered', Boolean(query) && !row.textContent.toLocaleLowerCase().includes(query)));
+  document.querySelectorAll('.reader-row').forEach((row) => {
+    const editor = row.querySelector('.note-editor');
+    const searchable = `${row.querySelector('.source-pane')?.textContent || ''} ${row.querySelector('.translation-pane')?.textContent || ''} ${editor?.value || ''}`.toLocaleLowerCase();
+    row.classList.toggle('filtered', Boolean(query) && !searchable.includes(query));
+  });
 });
 
 function resumeJob() {
