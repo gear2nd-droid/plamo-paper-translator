@@ -27,6 +27,8 @@ class SavedJobTests(unittest.TestCase):
             "form": "plain",
             "context": "",
             "glossary": [],
+            "tags": [],
+            "paper_summary": "",
             "segments": [Segment(0, 1, "Source", "訳文").__dict__],
             "cancelled": False,
         }
@@ -102,6 +104,31 @@ class SavedJobTests(unittest.TestCase):
             app._set_segment_clip(job, 0, "invalid", True)
         with self.assertRaises(IndexError):
             app._set_segment_clip(job, 2, "source", False)
+
+    def test_paper_summary_round_trip_on_disk(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "JOB_DIR", Path(directory)):
+            job = dict(self.payload)
+            job["segments"] = [Segment(0, 1, "Source")]
+            tags, summary = app._set_job_summary(job, [" LLM ", "翻訳", "LLM"], "要点を記録する。")
+            app._save_job(job)
+            app.jobs.pop(self.job_id, None)
+            loaded = app._load_saved_job(self.job_id)
+
+        self.assertEqual(tags, ["LLM", "翻訳"])
+        self.assertEqual(summary, "要点を記録する。")
+        self.assertEqual(loaded["tags"], ["LLM", "翻訳"])
+        self.assertEqual(loaded["paper_summary"], "要点を記録する。")
+
+    def test_paper_summary_validates_limits(self):
+        job = {}
+        with self.assertRaises(ValueError):
+            app._set_job_summary(job, "tag", "summary")
+        with self.assertRaises(ValueError):
+            app._set_job_summary(job, ["x" * (app.MAX_PAPER_TAG_LENGTH + 1)], "summary")
+        with self.assertRaises(ValueError):
+            app._set_job_summary(job, [str(index) for index in range(app.MAX_PAPER_TAGS + 1)], "summary")
+        with self.assertRaises(ValueError):
+            app._set_job_summary(job, [], "x" * (app.MAX_PAPER_SUMMARY_LENGTH + 1))
 
 
 class NativeMessagingTests(unittest.TestCase):

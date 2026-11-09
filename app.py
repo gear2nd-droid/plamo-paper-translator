@@ -60,6 +60,9 @@ else:
 APP_URL = "http://127.0.0.1:7865/"
 MAX_CLIPS = 3
 CLIP_PARTS = {"source", "translation", "note"}
+MAX_PAPER_TAGS = 20
+MAX_PAPER_TAG_LENGTH = 40
+MAX_PAPER_SUMMARY_LENGTH = 20_000
 NATIVE_HOST_NAME = "jp.gear2.plamo_paper_translator"
 CHROME_EXTENSION_ID = "cpiiadekehcofkocnlplcaolgioefcjd"
 CHROME_EXTENSION_ORIGIN = f"chrome-extension://{CHROME_EXTENSION_ID}/"
@@ -292,6 +295,11 @@ def _load_saved_job(job_id: str) -> dict[str, Any] | None:
             segment if isinstance(segment, Segment) else Segment(**segment)
             for segment in payload.get("segments", [])
         ]
+        _set_job_summary(
+            payload,
+            payload.get("tags", []),
+            payload.get("paper_summary", ""),
+        )
     except (OSError, ValueError, TypeError):
         return None
     if payload.get("status") in {"queued", "running"}:
@@ -337,6 +345,28 @@ def _set_segment_clip(job: dict[str, Any], index: int, part: str, clipped: bool)
         segment.clips = [item for item in segment.clips if item != part]
     segment.clipped = bool(segment.clips)
     return segment
+
+
+def _set_job_summary(job: dict[str, Any], tags: Any, summary: Any) -> tuple[list[str], str]:
+    if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+        raise ValueError("タグの形式が不正です。")
+    if not isinstance(summary, str):
+        raise ValueError("概要の形式が不正です。")
+    normalized_tags: list[str] = []
+    for raw_tag in tags:
+        tag = re.sub(r"\s+", " ", raw_tag).strip()
+        if not tag or tag in normalized_tags:
+            continue
+        if len(tag) > MAX_PAPER_TAG_LENGTH:
+            raise ValueError(f"タグは1件{MAX_PAPER_TAG_LENGTH}文字以内にしてください。")
+        normalized_tags.append(tag)
+    if len(normalized_tags) > MAX_PAPER_TAGS:
+        raise ValueError(f"タグは{MAX_PAPER_TAGS}件までです。")
+    if len(summary) > MAX_PAPER_SUMMARY_LENGTH:
+        raise ValueError(f"概要は{MAX_PAPER_SUMMARY_LENGTH:,}文字以内にしてください。")
+    job["tags"] = normalized_tags
+    job["paper_summary"] = summary
+    return normalized_tags, summary
 
 
 def _translate_job(job_id: str) -> None:
@@ -469,17 +499,16 @@ class Handler(BaseHTTPRequestHandler):
                 content = bilingual_markdown(job["title"], job["segments"]).encode("utf-8")
                 content_type, ext = "text/markdown; charset=utf-8", "md"
             elif fmt == "json":
-                content = json.dumps(
-                    document_to_dict(
-                        job["title"],
-                        job["segments"],
-                        source_lang=job["source_lang"],
-                        target_lang=job["target_lang"],
-                        segmentation_mode=job.get("segmentation_mode", "sentence"),
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
-                ).encode("utf-8")
+                export_payload = document_to_dict(
+                    job["title"],
+                    job["segments"],
+                    source_lang=job["source_lang"],
+                    target_lang=job["target_lang"],
+                    segmentation_mode=job.get("segmentation_mode", "sentence"),
+                )
+                export_payload["tags"] = job.get("tags", [])
+                export_payload["summary"] = job.get("paper_summary", "")
+                content = json.dumps(export_payload, ensure_ascii=False, indent=2).encode("utf-8")
                 content_type, ext = "application/json; charset=utf-8", "json"
             else:
                 content = bilingual_html(job["title"], job["segments"], asset_resolver=_inline_asset).encode("utf-8")
@@ -518,6 +547,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/jobs":
             self._create_job()
+            return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/summary", parsed.path)
+        if match:
+            job = _load_saved_job(match.group(1))
+            if not job:
+                self._error("ジョブが見つかりません。", 404)
+                return
+            try:
+                data = self._read_json()
+                with state_lock:
+                    tags, summary = _set_job_summary(job, data.get("tags", []), data.get("summary", ""))
+                    _save_job(job)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._error(str(exc) or "論文のまとめを保存できません。")
+                return
+            self._json({"ok": True, "tags": tags, "summary": summary})
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/notes", parsed.path)
         if match:
@@ -686,6 +731,8 @@ class Handler(BaseHTTPRequestHandler):
             "form": str(data.get("form", "plain")),
             "context": str(data.get("context", ""))[:4000],
             "glossary": parse_glossary(str(data.get("glossary", ""))),
+            "tags": [],
+            "paper_summary": "",
             "segments": selected_segments,
             "cancelled": False,
         }

@@ -6,7 +6,7 @@ const CLIP_PARTS = {
   note: {key:'M', label:'メモ'},
 };
 const REFERENCE_PATTERN = /\b(?:fig(?:ure)?s?\.?\s*\d+(?:\s*[-–]\s*\d+)?|eq(?:uation)?s?\.?\s*\(?\d+\)?|tables?\s+\d+)|(?:図|式|表)\s*\(?\d+\)?/gi;
-const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], tocObserver: null, referenceTargets: new Map(), referenceHistory: [] };
+const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], tocObserver: null, referenceTargets: new Map(), referenceHistory: [], resultsReady: false, paperTags: [], paperSummary: '', paperSummaryScrollY: 0 };
 const noteTimers = new Map();
 const $ = (id) => document.getElementById(id);
 
@@ -19,6 +19,7 @@ function showStep(number) {
   document.querySelectorAll('.panel').forEach((node, i) => node.classList.toggle('active', i === number - 1));
   document.querySelectorAll('.step').forEach((node, i) => node.classList.toggle('active', i === number - 1));
   document.querySelector('.workspace').classList.toggle('reading', number === 3);
+  updateReaderToolbar();
   window.scrollTo({top: document.querySelector('.workspace').offsetTop - 90, behavior: 'smooth'});
 }
 
@@ -47,7 +48,9 @@ async function upload(file) {
 async function startJob() {
   if (!state.documentId) return toast('先に論文を読み込んでください');
   const payload = {document_id: state.documentId, title: $('title').value, segmentation_mode: document.querySelector('input[name="segmentationMode"]:checked').value, source_lang: $('sourceLang').value, target_lang: $('targetLang').value, form: $('form').value, context: $('context').value, glossary: $('glossary').value};
-  showStep(3); $('progressBox').classList.remove('hidden'); $('resultActions').classList.add('hidden'); $('readerLayout').classList.add('hidden'); $('results').innerHTML = '';
+  state.resultsReady = false; state.segments = []; state.paperTags = []; state.paperSummary = '';
+  $('step3').classList.remove('results-ready');
+  showStep(3); $('progressBox').classList.remove('hidden'); $('readerLayout').classList.add('hidden'); $('results').innerHTML = '';
   try {
     const response = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
     const data = await response.json(); if (!response.ok) throw new Error(data.error || '翻訳を開始できませんでした');
@@ -83,17 +86,26 @@ async function pollJob() {
 }
 
 function showResults(data) {
-  $('progressBox').classList.add('hidden'); $('resultActions').classList.remove('hidden');
+  $('progressBox').classList.add('hidden');
   $('readerLayout').classList.remove('hidden');
   $('readerHeader').classList.remove('hidden');
+  $('step3').classList.add('results-ready');
   const mode = data.segmentation_mode || 'sentence';
   const loadedSegments = (data.segments || []).map((item) => ({...item, clips:itemClips(item)}));
   const referenceLayout = prepareReferenceLayout(loadedSegments);
   state.segments = referenceLayout.segments;
   state.referenceTargets = referenceLayout.targets;
   state.referenceHistory = [];
+  state.paperTags = Array.isArray(data.tags) ? data.tags.filter((tag) => typeof tag === 'string') : [];
+  state.paperSummary = String(data.paper_summary || '');
+  state.resultsReady = true;
   updateReferenceBackButton();
-  $('resultSubtitle').textContent = mode === 'paragraph' ? `${data.total}段落・構造ブロックの対訳が完成しました。` : `${data.total}行の対訳が完成しました。Pは段落、Sは段落内の文番号です。`;
+  const resultStatus = mode === 'paragraph' ? `${data.total}段落・構造ブロックの対訳が完成しました。` : `${data.total}行の対訳が完成しました。Pは段落、Sは段落内の文番号です。`;
+  $('resultSubtitle').textContent = resultStatus;
+  $('topbarResultStatus').textContent = mode === 'paragraph' ? `${data.total}段落` : `${data.total}行 · P/S`;
+  $('topbarResultStatus').title = resultStatus;
+  updatePaperSummaryButton();
+  updateReaderToolbar();
   ['Html','Md','Json'].forEach((format) => $(`export${format}`).href = `/api/jobs/${state.jobId}/export?format=${format.toLowerCase()}`);
   $('results').innerHTML = state.segments.map((item, position, list) => renderSegment(item, position, list, mode)).join('');
   document.querySelectorAll('.note-editor').forEach(resizeNote);
@@ -487,6 +499,94 @@ async function saveNote(index, note, status) {
   }
 }
 
+function updateReaderToolbar() {
+  const stepThreeActive = $('step3').classList.contains('active');
+  const visible = state.resultsReady && stepThreeActive;
+  $('resultActions').classList.toggle('hidden', !visible);
+  $('paperSummaryButton').classList.toggle('hidden', !visible);
+}
+
+function parsePaperTags(value) {
+  return [...new Set(String(value || '').split(/[,、\n]+/).map((tag) => tag.replace(/\s+/g, ' ').trim()).filter(Boolean))];
+}
+
+function renderPaperTagPreview() {
+  const tags = parsePaperTags($('paperTags').value);
+  $('paperTagPreview').innerHTML = tags.length
+    ? tags.slice(0, 20).map((tag) => `<span>${escapeHtml(tag)}</span>`).join('') + (tags.length > 20 ? `<small>ほか${tags.length - 20}件</small>` : '')
+    : '<small>タグはまだありません。</small>';
+}
+
+function updatePaperSummaryLength() {
+  $('paperSummaryLength').textContent = `${$('paperSummaryText').value.length.toLocaleString()} / 20,000`;
+}
+
+function updatePaperSummaryButton() {
+  const hasContent = state.paperTags.length > 0 || Boolean(state.paperSummary.trim());
+  $('paperSummaryButton').dataset.hasContent = String(hasContent);
+  $('paperSummaryCount').textContent = state.paperTags.length ? String(state.paperTags.length) : (hasContent ? '●' : '');
+  $('paperSummaryButton').setAttribute('aria-label', hasContent ? `論文のまとめを編集（タグ${state.paperTags.length}件）` : '論文のまとめを作成');
+}
+
+function openPaperSummaryDialog() {
+  if (!state.jobId || !state.resultsReady) return;
+  state.paperSummaryScrollY = window.scrollY;
+  document.body.style.top = `-${state.paperSummaryScrollY}px`;
+  document.body.classList.add('paper-summary-open');
+  $('paperTags').value = state.paperTags.join(', ');
+  $('paperSummaryText').value = state.paperSummary;
+  $('paperSummaryStatus').textContent = 'このPC内の翻訳ジョブに保存されます。';
+  $('paperSummaryStatus').className = 'dialog-status';
+  renderPaperTagPreview();
+  updatePaperSummaryLength();
+  $('paperSummaryDialog').showModal();
+  requestAnimationFrame(() => {
+    $('paperTags').focus({preventScroll: true});
+  });
+}
+
+function closePaperSummaryDialog() {
+  if ($('paperSummaryDialog').open) $('paperSummaryDialog').close();
+  document.body.classList.remove('paper-summary-open');
+  document.body.style.removeProperty('top');
+  window.scrollTo({top: state.paperSummaryScrollY, behavior: 'auto'});
+  requestAnimationFrame(() => window.scrollTo({top: state.paperSummaryScrollY, behavior: 'auto'}));
+}
+
+async function savePaperSummary(event) {
+  event.preventDefault();
+  const tags = parsePaperTags($('paperTags').value);
+  const summary = $('paperSummaryText').value;
+  if (tags.length > 20) {
+    $('paperSummaryStatus').textContent = 'タグは20件までです。';
+    $('paperSummaryStatus').className = 'dialog-status error';
+    return;
+  }
+  if (tags.some((tag) => tag.length > 40)) {
+    $('paperSummaryStatus').textContent = 'タグは1件40文字以内にしてください。';
+    $('paperSummaryStatus').className = 'dialog-status error';
+    return;
+  }
+  const button = $('paperSummarySave');
+  button.disabled = true;
+  $('paperSummaryStatus').textContent = '保存しています…';
+  $('paperSummaryStatus').className = 'dialog-status saving';
+  try {
+    const response = await fetch(`/api/jobs/${state.jobId}/summary`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tags, summary})});
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || '論文のまとめを保存できません');
+    state.paperTags = data.tags || [];
+    state.paperSummary = data.summary || '';
+    updatePaperSummaryButton();
+    closePaperSummaryDialog();
+    toast('論文のまとめを保存しました');
+  } catch (error) {
+    $('paperSummaryStatus').textContent = error.message || '論文のまとめを保存できません';
+    $('paperSummaryStatus').className = 'dialog-status error';
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function escapeHtml(value) { const node = document.createElement('div'); node.textContent = String(value ?? ''); return node.innerHTML; }
 
 const dropzone = $('dropzone');
@@ -502,6 +602,13 @@ $('startTranslation').addEventListener('click', startJob);
 $('cancelJob').addEventListener('click', async () => { if(state.jobId) await fetch(`/api/jobs/${state.jobId}/cancel`, {method:'POST'}); });
 $('newPaper').addEventListener('click', () => { localStorage.removeItem(JOB_STORAGE_KEY); location.href = '/'; });
 $('referenceBack').addEventListener('click', returnFromReference);
+$('paperSummaryButton').addEventListener('click', openPaperSummaryDialog);
+$('paperSummaryClose').addEventListener('click', closePaperSummaryDialog);
+$('paperSummaryCancel').addEventListener('click', closePaperSummaryDialog);
+$('paperSummaryForm').addEventListener('submit', savePaperSummary);
+$('paperTags').addEventListener('input', renderPaperTagPreview);
+$('paperSummaryText').addEventListener('input', updatePaperSummaryLength);
+$('paperSummaryDialog').addEventListener('click', (event) => { if (event.target === $('paperSummaryDialog')) closePaperSummaryDialog(); });
 $('results').addEventListener('input', (event) => {
   const editor = event.target.closest('.note-editor'); if (!editor) return;
   resizeNote(editor);
@@ -538,8 +645,9 @@ function resumeJob() {
   const requested = new URLSearchParams(location.search).get('job');
   const saved = requested || localStorage.getItem(JOB_STORAGE_KEY);
   if (!saved || !/^[a-f0-9]{32}$/.test(saved)) return;
-  state.jobId = saved; localStorage.setItem(JOB_STORAGE_KEY, saved);
-  showStep(3); $('progressBox').classList.remove('hidden'); $('resultActions').classList.add('hidden');
+  state.jobId = saved; state.resultsReady = false; localStorage.setItem(JOB_STORAGE_KEY, saved);
+  $('step3').classList.remove('results-ready');
+  showStep(3); $('progressBox').classList.remove('hidden');
   $('progressMessage').textContent = '保存済みの翻訳状態を確認しています…';
   pollJob();
 }

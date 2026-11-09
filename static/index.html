@@ -14,8 +14,17 @@
         <span><b>PLaMo Paper Translator</b><small>論文を、手元のPCで。</small></span>
       </a>
       <button id="referenceBack" class="reference-back hidden" type="button" aria-label="参照ジャンプ前の位置へ戻る"><span aria-hidden="true">←</span> 戻る</button>
+      <div id="resultActions" class="result-actions topbar-result-actions hidden" aria-label="対訳の操作">
+        <span id="topbarResultStatus" class="topbar-result-status"></span>
+        <a id="exportHtml" class="primary small" download>HTML</a><a id="exportMd" class="secondary small" download>MD</a><a id="exportJson" class="secondary small" download>JSON</a>
+        <label class="reader-search"><span>文中検索</span><input id="readerSearch" type="search" placeholder="原文・訳文・メモ"></label>
+        <button id="newPaper" class="text-button">別の論文</button>
+      </div>
     </div>
-    <div id="engineBadge" class="engine-badge waiting"><i></i><span>エンジン確認中</span></div>
+    <div class="topbar-right">
+      <button id="paperSummaryButton" class="paper-summary-button hidden" type="button"><span aria-hidden="true">✎</span> まとめ <small id="paperSummaryCount"></small></button>
+      <div id="engineBadge" class="engine-badge waiting"><i></i><span>エンジン確認中</span></div>
+    </div>
   </header>
 
   <main>
@@ -73,11 +82,6 @@
             <div class="progress-track"><i id="progressBar"></i></div>
             <button id="cancelJob" class="text-button">翻訳を中止</button>
           </div>
-          <div id="resultActions" class="result-actions hidden">
-            <a id="exportHtml" class="primary small" download>HTMLで保存</a><a id="exportMd" class="secondary small" download>Markdown</a><a id="exportJson" class="secondary small" download>JSON</a>
-            <label class="reader-search"><span>文中検索</span><input id="readerSearch" type="search" placeholder="原文・訳文・メモ"></label>
-            <button id="newPaper" class="text-button">別の論文を翻訳</button>
-          </div>
           <div id="readerLayout" class="reader-layout hidden">
             <aside id="paperNavigation" class="paper-navigation" aria-label="論文ナビゲーション">
               <section>
@@ -107,6 +111,19 @@
     <section class="privacy-note"><b>データの扱い</b><p>PDF本文と翻訳結果は <code>data/</code> に保存されます。PLaMo 3 Translate と llama.cpp はローカルで動作し、翻訳時のインターネット接続は不要です。</p></section>
   </main>
   <footer><span>PLaMo Paper Translator</span><span>Built with PLaMo · <a href="https://plamo.preferredai.jp/info/plamo-community-license-ja" target="_blank" rel="noreferrer">PLaMo Community License</a> · Local inference with llama.cpp</span></footer>
+  <dialog id="paperSummaryDialog" class="paper-summary-dialog" aria-labelledby="paperSummaryTitle">
+    <form id="paperSummaryForm">
+      <header>
+        <div><span>PAPER NOTES</span><h2 id="paperSummaryTitle">論文のまとめ</h2></div>
+        <button id="paperSummaryClose" class="dialog-close" type="button" aria-label="閉じる">×</button>
+      </header>
+      <label class="dialog-field"><span>タグ <small>カンマ・改行区切り／最大20件</small></span><input id="paperTags" type="text" maxlength="1000" placeholder="例：LLM, 機械翻訳, 評価手法"></label>
+      <div id="paperTagPreview" class="paper-tag-preview" aria-live="polite"></div>
+      <label class="dialog-field"><span>概要 <small id="paperSummaryLength">0 / 20,000</small></span><textarea id="paperSummaryText" rows="12" maxlength="20000" placeholder="論文の目的、提案手法、重要な結果、今後確認したい点などを記録します。"></textarea></label>
+      <p id="paperSummaryStatus" class="dialog-status">このPC内の翻訳ジョブに保存されます。</p>
+      <div class="dialog-actions"><button id="paperSummaryCancel" class="secondary small" type="button">キャンセル</button><button id="paperSummarySave" class="primary small" type="submit">保存</button></div>
+    </form>
+  </dialog>
   <div id="toast" class="toast"></div>
   <script src="/app.js"></script>
 </body>
