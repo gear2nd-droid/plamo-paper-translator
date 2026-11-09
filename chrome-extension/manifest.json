@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "PLaMo Paper Translator Launcher",
+  "version": "1.0.0",
+  "description": "PLaMo Paper Translatorを起動してローカル画面を開きます。",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzOQAcKYhQR/MZzpfNU8rkyKtKsNU9YHueOLZKUMvoNjY9UNJZ8XtvMF+6Q8PMUIf73aVpZIjsHBSHTibFqd2YR1oXZ8pxo8g/HeSTqoCIo45wU39HGgKu1SSrR7Lx+ldghSnCchpKtjf3asLCJLnIOezejibYQYrvBlrUXzT/A3dU7hKlHGw+Mf4Y2iZuynTCb26sCRskAj7tL6q2sTuKZ2vtfxYXD8D4Y7uIBgABWboudleO/uTWYLq3oMTV4+IJs9fkvfQxGc+l7cKiCej7gK1wblNvy9QzrJzZ3vJtaNWXNUx55rS1LThXYLyeHcRSRY0LzKjDKDoxs5V8ikrKQIDAQAB",
+  "minimum_chrome_version": "99",
+  "permissions": [
+    "nativeMessaging",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:7865/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "PLaMo Paper Translatorを開く"
+  },
+  "commands": {
+    "open-plamo": {
+      "suggested_key": {
+        "default": "Alt+Shift+P"
+      },
+      "description": "PLaMo Paper Translatorを起動して開く"
+    }
+  }
+}

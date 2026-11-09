@@ -12,6 +12,16 @@ try {
     New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
     Copy-Item -Force "dist\PLaMoPaperTranslator.exe" $PackageRoot
     Copy-Item -Force "Start-PLaMoPaperTranslator.cmd","start.ps1","setup.ps1","requirements.txt","README.md","DISTRIBUTION.md","THIRD_PARTY_NOTICES.md","LICENSE" $PackageRoot
+    $ChromeExtensionDestination = Join-Path $PackageRoot "chrome-extension"
+    $ResolvedPackageRoot = [IO.Path]::GetFullPath($PackageRoot) + [IO.Path]::DirectorySeparatorChar
+    $ResolvedChromeExtensionDestination = [IO.Path]::GetFullPath($ChromeExtensionDestination)
+    if (-not $ResolvedChromeExtensionDestination.StartsWith($ResolvedPackageRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Chrome拡張の出力先が配布フォルダー外です。"
+    }
+    if (Test-Path -LiteralPath $ResolvedChromeExtensionDestination) {
+        Remove-Item -Recurse -Force -LiteralPath $ResolvedChromeExtensionDestination
+    }
+    Copy-Item -Recurse -Force -LiteralPath "chrome-extension" -Destination $ChromeExtensionDestination
     $LicenseRoot = Join-Path $PackageRoot "licenses"
     New-Item -ItemType Directory -Force -Path $LicenseRoot | Out-Null
 

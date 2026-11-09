@@ -30,6 +30,18 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\start.ps1
 ```
 
+## Chromeからワンクリックで起動
+
+ポータブル版にはManifest V3のChromeランチャーを同梱しています。初回だけ次の設定を行うと、拡張アイコンまたは `Alt + Shift + P` で、停止中のアプリをバックグラウンド起動して画面を開けます。既に起動中なら重複起動せず、既存タブを前面へ移します。
+
+1. Chromeで `chrome://extensions` を開き、「デベロッパー モード」を有効にします。
+2. 「パッケージ化されていない拡張機能を読み込む」を押し、配布フォルダー内の `chrome-extension` を選びます。
+3. `chrome-extension\install-native-host.ps1` を右クリックして「PowerShellで実行」します。
+4. アドレスバーで `chrome://restart` を開き、Chromeを再起動します。
+5. `PLaMo Paper Translator Launcher` をツールバーへピン留めします。
+
+通常の登録に管理者権限は不要です。`Specified native messaging host not found.` が続く場合のPC全体登録、移動・更新後の再登録、解除方法は [`chrome-extension/README.md`](chrome-extension/README.md) を参照してください。エラー画面は自動更新されないため、登録後は古いエラータブを閉じて拡張アイコンをもう一度押します。
+
 ## モデルの取得
 
 ### 推奨: セットアップスクリプトで取得

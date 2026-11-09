@@ -21,6 +21,7 @@ PLaMoPaperTranslator/
 ├─ PLaMoPaperTranslator.exe     # Python同梱のアプリ本体
 ├─ Start-PLaMoPaperTranslator.cmd
 ├─ setup.ps1                    # 公式配布元からランタイムとモデルを取得
+├─ chrome-extension/            # ワンクリック起動用Chrome拡張と登録スクリプト
 ├─ LICENSE                      # アプリ独自コードのMIT License
 ├─ THIRD_PARTY_NOTICES.md
 ├─ licenses/                    # Python・PDF関連ライブラリ・PyInstallerのライセンス本文
@@ -30,6 +31,8 @@ PLaMoPaperTranslator/
 ```
 
 モデルをアプリ本体から分離することで、8Bから2Bへの切替、モデル更新、アプリ更新、利用終了時のモデル削除を独立して行えます。ZIP自体には論文、訳文、モデルを含めません。
+
+Chrome拡張は任意機能としてポータブルZIPへ同梱します。Chrome Web Storeには依存せず、利用者がデベロッパーモードで読み込みます。通常のNative Messaging登録はユーザー単位で行い、必要な環境だけ管理者権限によるPC全体登録を選択できます。拡張コードにはルートのMIT Licenseが適用されます。
 
 ## 組織内配布へ進む場合
 

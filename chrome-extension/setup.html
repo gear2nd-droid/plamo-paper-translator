@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PLaMo Launcher セットアップ</title>
+  <link rel="stylesheet" href="setup.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">PLAMO PAPER TRANSLATOR</p>
+    <h1>ランチャーの初期設定</h1>
+    <p class="lead">一度だけNative Messagingホストを登録すると、拡張アイコンまたは <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd> でアプリを起動できます。</p>
+    <div id="errorBox" class="error" hidden></div>
+    <ol>
+      <li><code>chrome-extension\install-native-host.ps1</code> を右クリックし、「PowerShellで実行」します。登録後も同じエラーになる場合は、<code>install-native-host-all-users.ps1</code> を実行し、管理者権限を許可します。</li>
+      <li>Chromeのアドレスバーへ <code>chrome://restart</code> と入力し、Chromeを再起動します。</li>
+      <li>Chromeのツールバーで拡張機能をピン留めします。</li>
+      <li>拡張アイコンを押します。起動済みなら既存タブへ移動し、停止中なら起動後に画面を開きます。</li>
+    </ol>
+    <section>
+      <b>拡張機能ID</b>
+      <code>cpiiadekehcofkocnlplcaolgioefcjd</code>
+    </section>
+    <p class="note">通常は現在のWindowsユーザー（HKCU）へ登録します。PC全体登録ではHKLMと、優先される現在ユーザーのHKCUを同じmanifestへ揃えます。登録後は古いエラータブを閉じ、拡張アイコンをもう一度押してください。</p>
+  </main>
+  <script src="setup.js"></script>
+</body>
+</html>

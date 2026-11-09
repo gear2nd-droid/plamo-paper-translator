@@ -1,4 +1,6 @@
 import json
+import io
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,6 +57,85 @@ class SavedJobTests(unittest.TestCase):
         self.assertEqual(loaded["status"], "failed")
         self.assertEqual(saved["status"], "failed")
         self.assertIn("再起動", loaded["message"])
+
+
+class NativeMessagingTests(unittest.TestCase):
+    def test_frozen_launcher_config_selects_matching_app_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "dist" / "PLaMoPaperTranslator.exe"
+            executable.parent.mkdir()
+            executable.touch()
+            app_home = root / "project"
+            app_home.mkdir()
+            config_root = root / "PLaMoPaperTranslator"
+            config_root.mkdir()
+            (config_root / "launcher-config.json").write_text(
+                json.dumps({"executable": str(executable), "app_home": str(app_home)}),
+                encoding="utf-8",
+            )
+            with patch.dict(app.os.environ, {"LOCALAPPDATA": str(root)}):
+                self.assertEqual(app._configured_frozen_user_dir(executable), app_home.resolve())
+                self.assertIsNone(app._configured_frozen_user_dir(root / "other.exe"))
+
+    def test_native_message_round_trip(self):
+        output = io.BytesIO()
+        app._write_native_message(output, {"action": "launch", "日本語": "起動"})
+        encoded = output.getvalue()
+        self.assertEqual(struct.unpack("=I", encoded[:4])[0], len(encoded) - 4)
+        self.assertEqual(app._read_native_message(io.BytesIO(encoded)), {"action": "launch", "日本語": "起動"})
+
+    def test_native_invocation_accepts_only_explicit_mode_or_fixed_origin(self):
+        self.assertTrue(app._is_native_messaging_invocation(["--native-messaging"]))
+        self.assertTrue(app._is_native_messaging_invocation([app.CHROME_EXTENSION_ORIGIN]))
+        self.assertFalse(app._is_native_messaging_invocation(["chrome-extension://wrong/"]))
+
+    def test_native_launch_does_not_spawn_duplicate_server(self):
+        request = io.BytesIO()
+        app._write_native_message(request, {"action": "launch"})
+        request.seek(0)
+        response = io.BytesIO()
+
+        class FakeInput:
+            buffer = request
+
+            @staticmethod
+            def fileno():
+                return 0
+
+        class FakeOutput:
+            buffer = response
+
+            @staticmethod
+            def fileno():
+                return 1
+
+        with (
+            patch.object(app.os, "name", "test"),
+            patch.object(app.sys, "stdin", FakeInput()),
+            patch.object(app.sys, "stdout", FakeOutput()),
+            patch.object(app, "_app_is_available", return_value=True),
+            patch.object(app, "_launch_detached_server") as launcher,
+        ):
+            app._native_messaging_main()
+
+        payload = app._read_native_message(io.BytesIO(response.getvalue()))
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["started"])
+        launcher.assert_not_called()
+
+    def test_frozen_detached_server_starts_as_independent_pyinstaller_instance(self):
+        with (
+            patch.object(app.sys, "frozen", True, create=True),
+            patch.object(app.sys, "executable", r"C:\App\PLaMoPaperTranslator.exe"),
+            patch.object(app.subprocess, "Popen") as popen,
+        ):
+            app._launch_detached_server()
+
+        command, = popen.call_args.args
+        options = popen.call_args.kwargs
+        self.assertEqual(command, [r"C:\App\PLaMoPaperTranslator.exe", "--no-browser"])
+        self.assertEqual(options["env"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
 
 
 if __name__ == "__main__":

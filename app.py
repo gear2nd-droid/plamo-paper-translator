@@ -9,11 +9,13 @@ import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 import webbrowser
 from http import HTTPStatus
@@ -34,8 +36,31 @@ from paper_core import (
 )
 
 
+def _configured_frozen_user_dir(executable: Path) -> Path | None:
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local_app_data:
+        return None
+    config_path = Path(local_app_data) / "PLaMoPaperTranslator" / "launcher-config.json"
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        configured_executable = Path(str(payload["executable"])).resolve()
+        app_home = Path(str(payload["app_home"])).resolve()
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return app_home if configured_executable == executable.resolve() and app_home.is_dir() else None
+
+
 APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-USER_DIR = Path(os.environ.get("PLAMO_PAPER_HOME", Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else APP_DIR))
+if os.environ.get("PLAMO_PAPER_HOME"):
+    USER_DIR = Path(os.environ["PLAMO_PAPER_HOME"])
+elif getattr(sys, "frozen", False):
+    USER_DIR = _configured_frozen_user_dir(Path(sys.executable)) or Path(sys.executable).resolve().parent
+else:
+    USER_DIR = APP_DIR
+APP_URL = "http://127.0.0.1:7865/"
+NATIVE_HOST_NAME = "jp.gear2.plamo_paper_translator"
+CHROME_EXTENSION_ID = "cpiiadekehcofkocnlplcaolgioefcjd"
+CHROME_EXTENSION_ORIGIN = f"chrome-extension://{CHROME_EXTENSION_ID}/"
 STATIC_DIR = APP_DIR / "static"
 DATA_DIR = USER_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -50,6 +75,98 @@ documents: dict[str, dict[str, Any]] = {}
 jobs: dict[str, dict[str, Any]] = {}
 state_lock = threading.RLock()
 translator = LlamaTranslator()
+
+
+def _read_native_message(stream: Any) -> dict[str, Any]:
+    header = stream.read(4)
+    if len(header) != 4:
+        raise ValueError("Native Messagingのヘッダーを読み取れませんでした。")
+    message_length = struct.unpack("=I", header)[0]
+    if message_length > 64 * 1024 * 1024:
+        raise ValueError("Native Messagingのメッセージが大きすぎます。")
+    payload = stream.read(message_length)
+    if len(payload) != message_length:
+        raise ValueError("Native Messagingのメッセージが途中で終了しました。")
+    value = json.loads(payload.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("Native Messagingのリクエスト形式が不正です。")
+    return value
+
+
+def _write_native_message(stream: Any, payload: dict[str, Any]) -> None:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    stream.write(struct.pack("=I", len(body)))
+    stream.write(body)
+    stream.flush()
+
+
+def _app_is_available(timeout: float = 0.7) -> bool:
+    try:
+        with urllib.request.urlopen(APP_URL + "api/status", timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return response.status == 200 and isinstance(payload, dict) and "engine" in payload
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _launch_detached_server() -> None:
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, "--no-browser"]
+    else:
+        command = [sys.executable, str(Path(__file__).resolve()), "--no-browser"]
+    options: dict[str, Any] = {
+        "cwd": str(USER_DIR),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if getattr(sys, "frozen", False):
+        options["env"] = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+    if os.name == "nt":
+        base_flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        breakaway_flag = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        try:
+            subprocess.Popen(command, creationflags=base_flags | breakaway_flag, **options)
+            return
+        except OSError:
+            subprocess.Popen(command, creationflags=base_flags, **options)
+            return
+    subprocess.Popen(command, start_new_session=True, **options)
+
+
+def _is_native_messaging_invocation(arguments: list[str]) -> bool:
+    return "--native-messaging" in arguments or CHROME_EXTENSION_ORIGIN in arguments
+
+
+def _native_messaging_main() -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+        msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+    response: dict[str, Any]
+    try:
+        request = _read_native_message(sys.stdin.buffer)
+        if request.get("action") != "launch":
+            raise ValueError("未対応の操作です。")
+        was_running = _app_is_available()
+        if not was_running:
+            _launch_detached_server()
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not _app_is_available():
+                time.sleep(0.25)
+        available = _app_is_available()
+        response = {
+            "ok": available,
+            "running": available,
+            "started": available and not was_running,
+            "url": APP_URL,
+            "error": "" if available else "アプリの起動を15秒以内に確認できませんでした。",
+        }
+    except Exception as exc:
+        response = {"ok": False, "running": False, "started": False, "url": APP_URL, "error": str(exc)}
+    _write_native_message(sys.stdout.buffer, response)
 
 
 def _safe_name(name: str) -> str:
@@ -502,6 +619,9 @@ def _port_available(port: int) -> bool:
 
 
 def main() -> None:
+    if _is_native_messaging_invocation(sys.argv[1:]):
+        _native_messaging_main()
+        return
     parser = argparse.ArgumentParser(description="PLaMo Paper Translator")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7865)
