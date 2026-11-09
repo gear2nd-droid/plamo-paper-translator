@@ -933,7 +933,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 self.send_header("Content-Length", str(size))
                 self.end_headers()
-                shutil.copyfileobj(archive, self.wfile, length=1024 * 1024)
+                try:
+                    shutil.copyfileobj(archive, self.wfile, length=1024 * 1024)
+                except (BrokenPipeError, ConnectionResetError):
+                    # A browser may cancel a large backup download after the
+                    # response has started. The archive itself is still valid,
+                    # so avoid printing an alarming server traceback.
+                    pass
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/quality", path)
         if match:
