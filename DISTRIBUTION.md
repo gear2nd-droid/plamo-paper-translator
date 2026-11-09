@@ -22,6 +22,7 @@ PLaMoPaperTranslator/
 ├─ Start-PLaMoPaperTranslator.cmd
 ├─ setup.ps1                    # 公式配布元からランタイムとモデルを取得
 ├─ chrome-extension/            # ワンクリック起動用Chrome拡張と登録スクリプト
+├─ docs/                        # 公開デモ候補・運用資料
 ├─ LICENSE                      # アプリ独自コードのMIT License
 ├─ THIRD_PARTY_NOTICES.md
 ├─ licenses/                    # Python・PDF関連ライブラリ・PyInstallerのライセンス本文
@@ -31,6 +32,8 @@ PLaMoPaperTranslator/
 ```
 
 モデルをアプリ本体から分離することで、8Bから2Bへの切替、モデル更新、アプリ更新、利用終了時のモデル削除を独立して行えます。ZIP自体には論文、訳文、モデルを含めません。
+
+`build-portable.ps1` は一時ステージでパッケージを組み立て、`dist/PLaMoPaperTranslator-Windows-portable.zip` だけを更新します。実行中のポータブル版フォルダーを上書きしないため、アプリを止めずに次回配布用ZIPを作成できます。
 
 Chrome拡張は任意機能としてポータブルZIPへ同梱します。Chrome Web Storeには依存せず、利用者がデベロッパーモードで読み込みます。通常のNative Messaging登録はユーザー単位で行い、必要な環境だけ管理者権限によるPC全体登録を選択できます。拡張コードにはルートのMIT Licenseが適用されます。
 
@@ -49,5 +52,5 @@ Chrome拡張は任意機能としてポータブルZIPへ同梱します。Chrom
 - DOCXエクスポート
 - PDFレイアウトを維持した見開き出力
 - 翻訳メモリと用語集のCSVインポート
-- 途中再開、段落ごとの再翻訳・手動修正
+- 翻訳メモリと用語集の共有ライブラリ
 - 研究室向け認証付きLANサーバ版

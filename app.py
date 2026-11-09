@@ -3,21 +3,26 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+import hashlib
 import json
 import mimetypes
 import os
 import re
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
+import zipfile
+from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -63,6 +68,12 @@ CLIP_PARTS = {"source", "translation", "note"}
 MAX_PAPER_TAGS = 20
 MAX_PAPER_TAG_LENGTH = 40
 MAX_PAPER_SUMMARY_LENGTH = 20_000
+MAX_TRANSLATION_LENGTH = 50_000
+MAX_TRANSLATION_REVISIONS = 20
+READING_STATUSES = {"unread", "reading", "completed", "archived"}
+MAX_BACKUP_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_BACKUP_EXPANDED_BYTES = 8 * 1024 * 1024 * 1024
+MAX_BACKUP_FILES = 100_000
 NATIVE_HOST_NAME = "jp.gear2.plamo_paper_translator"
 CHROME_EXTENSION_ID = "cpiiadekehcofkocnlplcaolgioefcjd"
 CHROME_EXTENSION_ORIGIN = f"chrome-extension://{CHROME_EXTENSION_ID}/"
@@ -78,6 +89,7 @@ for directory in (DATA_DIR, UPLOAD_DIR, JOB_DIR, ASSET_DIR):
 
 documents: dict[str, dict[str, Any]] = {}
 jobs: dict[str, dict[str, Any]] = {}
+active_retranslations: set[tuple[str, int]] = set()
 state_lock = threading.RLock()
 translator = LlamaTranslator()
 
@@ -180,6 +192,22 @@ def _safe_name(name: str) -> str:
     return name[:160] or "document.pdf"
 
 
+def _suggest_source_url(filename: str, segments: list[Segment]) -> str:
+    filename_arxiv = re.fullmatch(r"(?:arxiv[_-]?)?(\d{4}\.\d{4,5})(?:v\d+)?", Path(filename).stem, re.I)
+    sample = "\n".join(segment.source for segment in segments[:20])
+    arxiv = filename_arxiv or re.search(r"\barxiv\s*:\s*(\d{4}\.\d{4,5})(?:v\d+)?", sample, re.I)
+    if arxiv:
+        return f"https://arxiv.org/abs/{arxiv.group(1)}"
+    doi = re.search(r"(?:doi\s*:\s*|https?://doi\.org/)(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", sample, re.I)
+    if doi:
+        return f"https://doi.org/{doi.group(1).rstrip('.,;')}"
+    return ""
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
 def _find_one(root: Path, pattern: str) -> Path | None:
     candidates = sorted(root.rglob(pattern)) if root.exists() else []
     return candidates[0] if candidates else None
@@ -190,10 +218,29 @@ class LlamaProcess:
         self.process: subprocess.Popen[str] | None = None
         self.log_handle: Any = None
         self.error = ""
+        self.start_lock = threading.Lock()
 
     def start(self) -> None:
+        with self.start_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
         if translator.health():
             return
+        if self.process and self.process.poll() is None:
+            for _ in range(180):
+                if translator.health():
+                    self.error = ""
+                    return
+                if self.process.poll() is not None:
+                    self.error = "翻訳エンジンがモデル読込中に終了しました。data/llama-server.log を確認してください。"
+                    return
+                time.sleep(1)
+            self.error = "モデルの読み込みが3分以内に完了しませんでした。"
+            return
+        if self.log_handle:
+            self.log_handle.close()
+            self.log_handle = None
         executable = Path(os.environ.get("PLAMO_LLAMA_SERVER", "")) if os.environ.get("PLAMO_LLAMA_SERVER") else _find_one(RUNTIME_DIR, "llama-server.exe")
         model = Path(os.environ.get("PLAMO_MODEL", "")) if os.environ.get("PLAMO_MODEL") else _find_one(MODEL_DIR, "*.gguf")
         template = _find_one(MODEL_DIR, "chat_template.jinja")
@@ -257,9 +304,233 @@ def _job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def _save_job(job: dict[str, Any]) -> None:
+    job["updated_at"] = _utc_now()
     payload = dict(job)
     payload["segments"] = [segment.__dict__ if isinstance(segment, Segment) else segment for segment in job["segments"]]
     (JOB_DIR / f'{job["id"]}.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _normalize_library_metadata(job: dict[str, Any]) -> None:
+    job.setdefault("created_at", "")
+    job.setdefault("updated_at", job.get("created_at", ""))
+    job.setdefault("source_url", "")
+    job.setdefault("source_filename", "")
+    job.setdefault("file_sha256", "")
+    job.setdefault("reading_status", "unread")
+    job.setdefault("reading_index", 0)
+    job.setdefault("last_opened_at", "")
+    if job["reading_status"] not in READING_STATUSES:
+        job["reading_status"] = "unread"
+    try:
+        job["reading_index"] = max(0, int(job["reading_index"]))
+    except (TypeError, ValueError):
+        job["reading_index"] = 0
+
+
+def _set_library_metadata(
+    job: dict[str, Any],
+    *,
+    source_url: Any | None = None,
+    reading_status: Any | None = None,
+    reading_index: Any | None = None,
+    mark_opened: bool = False,
+) -> dict[str, Any]:
+    _normalize_library_metadata(job)
+    if source_url is not None:
+        if not isinstance(source_url, str):
+            raise ValueError("原文URLの形式が不正です。")
+        source_url = source_url.strip()
+        if len(source_url) > 2_000:
+            raise ValueError("原文URLは2,000文字以内にしてください。")
+        if source_url:
+            parsed = urllib.parse.urlparse(source_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("原文URLは http:// または https:// から始めてください。")
+        job["source_url"] = source_url
+    if reading_status is not None:
+        if reading_status not in READING_STATUSES:
+            raise ValueError("読書状態が不正です。")
+        job["reading_status"] = reading_status
+    if reading_index is not None:
+        try:
+            index = int(reading_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("読書位置が不正です。") from exc
+        total = max(1, len(job.get("segments", [])))
+        job["reading_index"] = min(max(index, 0), total - 1)
+        if job["reading_status"] == "unread" and index > 0:
+            job["reading_status"] = "reading"
+    if mark_opened:
+        job["last_opened_at"] = _utc_now()
+    return {
+        "source_url": job["source_url"],
+        "reading_status": job["reading_status"],
+        "reading_index": job["reading_index"],
+        "last_opened_at": job["last_opened_at"],
+    }
+
+
+def _library_item(job: dict[str, Any], query: str = "") -> dict[str, Any]:
+    _normalize_library_metadata(job)
+    segments = job.get("segments", [])
+    total = max(int(job.get("total", 0) or 0), len(segments))
+    reading_index = min(int(job.get("reading_index", 0) or 0), max(0, total - 1))
+    item = {
+        "id": job.get("id", ""),
+        "title": job.get("title", "Untitled"),
+        "status": job.get("status", "unknown"),
+        "reading_status": job.get("reading_status", "unread"),
+        "reading_index": reading_index,
+        "reading_progress": round(((reading_index + 1) / total) * 100) if total else 0,
+        "total": total,
+        "tags": job.get("tags", []),
+        "summary": job.get("paper_summary", ""),
+        "source_url": job.get("source_url", ""),
+        "source_filename": job.get("source_filename", ""),
+        "created_at": job.get("created_at", ""),
+        "updated_at": job.get("updated_at", ""),
+        "last_opened_at": job.get("last_opened_at", ""),
+        "match": "",
+    }
+    normalized_query = query.casefold().strip()
+    if normalized_query:
+        candidates = [
+            str(job.get("title", "")),
+            " ".join(str(tag) for tag in job.get("tags", [])),
+            str(job.get("paper_summary", "")),
+        ]
+        for segment in segments:
+            if isinstance(segment, Segment):
+                candidates.extend([segment.source, segment.translation, segment.note])
+            elif isinstance(segment, dict):
+                candidates.extend([str(segment.get(key, "")) for key in ("source", "translation", "note")])
+        for candidate in candidates:
+            compact = re.sub(r"\s+", " ", candidate).strip()
+            position = compact.casefold().find(normalized_query)
+            if position >= 0:
+                start = max(0, position - 55)
+                end = min(len(compact), position + len(query) + 95)
+                item["match"] = ("…" if start else "") + compact[start:end] + ("…" if end < len(compact) else "")
+                break
+    return item
+
+
+def _list_library(query: str = "", reading_status: str = "all") -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for path in JOB_DIR.glob("*.json"):
+        job = _load_saved_job(path.stem)
+        if not job:
+            continue
+        item = _library_item(job, query)
+        if not (item["created_at"] or item["updated_at"] or item["last_opened_at"]):
+            item["updated_at"] = datetime.fromtimestamp(path.stat().st_mtime, UTC).isoformat(timespec="seconds")
+        if reading_status != "all" and item["reading_status"] != reading_status:
+            continue
+        if query and not item["match"]:
+            continue
+        items.append(item)
+    items.sort(key=lambda item: item["last_opened_at"] or item["updated_at"] or item["created_at"], reverse=True)
+    return items
+
+
+def _duplicate_jobs(file_sha256: str) -> list[dict[str, str]]:
+    if not file_sha256:
+        return []
+    matches = []
+    for item in _list_library():
+        job = _load_saved_job(item["id"])
+        if job and job.get("file_sha256") == file_sha256:
+            matches.append({"id": str(job["id"]), "title": str(job.get("title", "Untitled"))})
+    return matches
+
+
+def _validated_backup_members(bundle: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, Path]]:
+    members: list[tuple[zipfile.ZipInfo, Path]] = []
+    infos = bundle.infolist()
+    if len(infos) > MAX_BACKUP_FILES:
+        raise ValueError("バックアップ内のファイル数が多すぎます。")
+    total_size = sum(info.file_size for info in infos)
+    if total_size > MAX_BACKUP_EXPANDED_BYTES:
+        raise ValueError("展開後のバックアップ容量が大きすぎます。")
+    try:
+        manifest_info = bundle.getinfo("backup-manifest.json")
+        if manifest_info.file_size > 1024 * 1024:
+            raise ValueError("バックアップのマニフェストが大きすぎます。")
+        manifest = json.loads(bundle.read(manifest_info).decode("utf-8"))
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("PLaMo Paper Translatorのバックアップではありません。") from exc
+    if manifest.get("format") != "plamo-paper-translator-library" or manifest.get("version") != 1:
+        raise ValueError("未対応のバックアップ形式です。")
+
+    for info in infos:
+        if info.is_dir() or info.filename in {"backup-manifest.json", "RESTORE.txt"}:
+            continue
+        if info.file_size > MAX_BACKUP_UPLOAD_BYTES:
+            raise ValueError("バックアップ内に大きすぎるファイルがあります。")
+        mode = (info.external_attr >> 16) & 0o170000
+        if mode == stat.S_IFLNK:
+            raise ValueError("シンボリックリンクを含むバックアップは復元できません。")
+        archive_path = Path(info.filename.replace("\\", "/"))
+        if archive_path.is_absolute() or ".." in archive_path.parts or len(archive_path.parts) < 3:
+            raise ValueError("バックアップ内に不正なパスがあります。")
+        if archive_path.parts[0] != "data" or archive_path.parts[1] not in {"jobs", "uploads", "assets"}:
+            raise ValueError("バックアップ内に未対応のファイルがあります。")
+        relative = Path(*archive_path.parts[1:])
+        category = relative.parts[0]
+        suffix = relative.suffix.lower()
+        if category == "jobs":
+            if len(relative.parts) != 2 or suffix != ".json" or not re.fullmatch(r"[a-f0-9]{32}", relative.stem):
+                raise ValueError("バックアップ内のジョブ名が不正です。")
+            try:
+                payload = json.loads(bundle.read(info).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("バックアップ内のジョブJSONが壊れています。") from exc
+            if payload.get("id") != relative.stem or not isinstance(payload.get("segments"), list):
+                raise ValueError("バックアップ内のジョブデータが不正です。")
+        elif category == "uploads":
+            if len(relative.parts) != 2 or suffix not in {".pdf", ".txt", ".md"}:
+                raise ValueError("バックアップ内の原文ファイル形式が不正です。")
+        else:
+            if len(relative.parts) != 3 or not re.fullmatch(r"[a-f0-9]{32}", relative.parts[1]):
+                raise ValueError("バックアップ内の画像パスが不正です。")
+            if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+                raise ValueError("バックアップ内の画像形式が不正です。")
+        members.append((info, relative))
+    return members
+
+
+def _restore_library_backup(stream: Any) -> dict[str, int]:
+    try:
+        with zipfile.ZipFile(stream) as bundle:
+            members = _validated_backup_members(bundle)
+            restored_files = 0
+            restored_jobs = 0
+            skipped_files = 0
+            data_root = DATA_DIR.resolve()
+            for info, relative in members:
+                target = (DATA_DIR / relative).resolve()
+                if data_root not in target.parents:
+                    raise ValueError("バックアップの復元先が不正です。")
+                if target.exists():
+                    skipped_files += 1
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                created = False
+                try:
+                    with target.open("xb") as destination:
+                        created = True
+                        with bundle.open(info) as source:
+                            shutil.copyfileobj(source, destination, length=1024 * 1024)
+                except Exception:
+                    if created:
+                        target.unlink(missing_ok=True)
+                    raise
+                restored_files += 1
+                if relative.parts[0] == "jobs":
+                    restored_jobs += 1
+            return {"restored_files": restored_files, "restored_jobs": restored_jobs, "skipped_files": skipped_files}
+    except zipfile.BadZipFile as exc:
+        raise ValueError("ZIPファイルが壊れているか、バックアップ形式ではありません。") from exc
 
 
 def _asset_path(url: str) -> Path | None:
@@ -300,6 +571,7 @@ def _load_saved_job(job_id: str) -> dict[str, Any] | None:
             payload.get("tags", []),
             payload.get("paper_summary", ""),
         )
+        _normalize_library_metadata(payload)
     except (OSError, ValueError, TypeError):
         return None
     if payload.get("status") in {"queued", "running"}:
@@ -347,6 +619,81 @@ def _set_segment_clip(job: dict[str, Any], index: int, part: str, clipped: bool)
     return segment
 
 
+def _replace_segment_translation(job: dict[str, Any], index: int, translation: Any, origin: str) -> Segment:
+    if not isinstance(translation, str):
+        raise ValueError("訳文の形式が不正です。")
+    translation = translation.strip()
+    if not translation:
+        raise ValueError("訳文を空にはできません。")
+    if len(translation) > MAX_TRANSLATION_LENGTH:
+        raise ValueError(f"訳文は{MAX_TRANSLATION_LENGTH:,}文字以内にしてください。")
+    if origin not in {"manual", "model"}:
+        raise ValueError("訳文の更新元が不正です。")
+    segments = job.get("segments", [])
+    if index < 0 or index >= len(segments):
+        raise IndexError("対訳位置が不正です。")
+    segment = segments[index]
+    if not isinstance(segment, Segment):
+        raise TypeError("対訳データが不正です。")
+    if segment.translation == translation:
+        return segment
+    if segment.translation:
+        segment.translation_revisions.append(
+            {
+                "translation": segment.translation,
+                "changed_at": segment.translation_edited_at or job.get("updated_at", "") or _utc_now(),
+                "origin": segment.translation_origin or "model",
+            }
+        )
+        segment.translation_revisions = segment.translation_revisions[-MAX_TRANSLATION_REVISIONS:]
+    segment.translation = translation
+    segment.translation_edited_at = _utc_now()
+    segment.translation_origin = origin
+    segment.error = ""
+    return segment
+
+
+def _retranslate_segment(job_id: str, job: dict[str, Any], index: int) -> Segment:
+    key = (job_id, index)
+    with state_lock:
+        if key in active_retranslations:
+            raise ValueError("このセグメントは再翻訳中です。")
+        if not str(job.get("status", "")).startswith("completed"):
+            raise ValueError("翻訳完了後に再翻訳できます。")
+        segments = job.get("segments", [])
+        if index < 0 or index >= len(segments):
+            raise IndexError("対訳位置が不正です。")
+        segment = segments[index]
+        if not isinstance(segment, Segment):
+            raise TypeError("対訳データが不正です。")
+        active_retranslations.add(key)
+    try:
+        if segment.kind == "equation" and segment.assets:
+            translated = segment.source
+        elif segment.label == "asset":
+            translated = segment.translation or segment.source
+        else:
+            if not translator.health():
+                llama_process.start()
+            if not translator.health():
+                raise RuntimeError(llama_process.error or "翻訳エンジンを起動できませんでした。")
+            translated = translator.translate(
+                segment.source,
+                target_lang=job["target_lang"],
+                source_lang=job["source_lang"],
+                form=job["form"],
+                context=neighboring_context(segments, index, job.get("context", "")),
+                glossary=job.get("glossary", []),
+            )
+        with state_lock:
+            updated = _replace_segment_translation(job, index, translated, "model")
+            _save_job(job)
+        return updated
+    finally:
+        with state_lock:
+            active_retranslations.discard(key)
+
+
 def _set_job_summary(job: dict[str, Any], tags: Any, summary: Any) -> tuple[list[str], str]:
     if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
         raise ValueError("タグの形式が不正です。")
@@ -367,6 +714,86 @@ def _set_job_summary(job: dict[str, Any], tags: Any, summary: Any) -> tuple[list
     job["tags"] = normalized_tags
     job["paper_summary"] = summary
     return normalized_tags, summary
+
+
+def _translation_quality_issues(job: dict[str, Any]) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    glossary = job.get("glossary", [])
+    target_lang = str(job.get("target_lang", ""))
+    source_lang = str(job.get("source_lang", ""))
+    for segment in job.get("segments", []):
+        if not isinstance(segment, Segment) or segment.label == "asset":
+            continue
+        if segment.kind == "equation" and segment.assets:
+            continue
+        source = segment.source.strip()
+        translation = segment.translation.strip()
+        index = int(segment.index)
+        if segment.error or not translation:
+            issues.append(
+                {
+                    "index": index,
+                    "type": "missing",
+                    "severity": "error",
+                    "message": "訳文がありません",
+                    "detail": segment.error or "未翻訳のセグメントです。",
+                }
+            )
+            continue
+        if (
+            target_lang != source_lang
+            and segment.kind not in {"citation"}
+            and source == translation
+            and len(re.findall(r"[A-Za-z]{3,}", source)) >= 3
+        ):
+            issues.append(
+                {
+                    "index": index,
+                    "type": "unchanged",
+                    "severity": "warning",
+                    "message": "原文と訳文が同一です",
+                    "detail": "固有名詞だけの行でなければ、未翻訳の可能性があります。",
+                }
+            )
+        number_pattern = r"(?<![\w])\d+(?:[.,]\d+)*(?:\s*[%％]|\s*°[CF])?"
+        normalize_number = lambda value: re.sub(r"\s+", "", value).replace("％", "%")
+        source_numbers = {normalize_number(value) for value in re.findall(number_pattern, source)}
+        translation_numbers = {normalize_number(value) for value in re.findall(number_pattern, translation)}
+        missing_numbers = sorted(source_numbers - translation_numbers)
+        if missing_numbers:
+            issues.append(
+                {
+                    "index": index,
+                    "type": "number",
+                    "severity": "warning",
+                    "message": "数値・単位が訳文に見つかりません",
+                    "detail": "、".join(missing_numbers[:8]) + (" ほか" if len(missing_numbers) > 8 else ""),
+                }
+            )
+        if len(source) >= 80 and len(translation) < max(8, int(len(source) * 0.12)):
+            issues.append(
+                {
+                    "index": index,
+                    "type": "short",
+                    "severity": "warning",
+                    "message": "訳文が極端に短い可能性があります",
+                    "detail": f"原文 {len(source)}文字 / 訳文 {len(translation)}文字",
+                }
+            )
+        for term in glossary:
+            source_term = str(term.get("source", "")).strip()
+            target_term = str(term.get("target", "")).strip()
+            if source_term and target_term and source_term.casefold() in source.casefold() and target_term not in translation:
+                issues.append(
+                    {
+                        "index": index,
+                        "type": "glossary",
+                        "severity": "info",
+                        "message": "用語集の訳語が見つかりません",
+                        "detail": f"{source_term} → {target_term}",
+                    }
+                )
+    return issues
 
 
 def _translate_job(job_id: str) -> None:
@@ -398,6 +825,7 @@ def _translate_job(job_id: str) -> None:
             # Preserve the source equation exactly. The bitmap is authoritative;
             # extracted text remains available only for search and copying.
             segment.translation = segment.source
+            segment.translation_origin = "source"
         elif segment.label != "asset":
             context = neighboring_context(segments, index, job.get("context", ""))
             try:
@@ -409,6 +837,7 @@ def _translate_job(job_id: str) -> None:
                     context=context,
                     glossary=glossary,
                 )
+                segment.translation_origin = "model"
             except Exception as exc:
                 segment.error = str(exc)
         with state_lock:
@@ -462,6 +891,67 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if path == "/api/library":
+            parameters = urllib.parse.parse_qs(parsed.query)
+            query = parameters.get("q", [""])[0].strip()[:300]
+            reading_status = parameters.get("status", ["all"])[0]
+            if reading_status not in READING_STATUSES | {"all"}:
+                self._error("読書状態が不正です。")
+                return
+            items = _list_library(query, reading_status)
+            self._json({"items": items, "count": len(items), "data_dir": str(DATA_DIR)})
+            return
+        if path == "/api/library/backup":
+            with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as archive:
+                with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
+                    manifest = {
+                        "format": "plamo-paper-translator-library",
+                        "version": 1,
+                        "created_at": _utc_now(),
+                        "job_count": len(list(JOB_DIR.glob("*.json"))),
+                        "contents": ["data/jobs", "data/uploads", "data/assets"],
+                    }
+                    bundle.writestr("backup-manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+                    bundle.writestr(
+                        "RESTORE.txt",
+                        "PLaMo Paper Translator library backup\n\n"
+                        "アプリを終了し、ZIP内のdataフォルダーをアプリのdataフォルダーへ統合してください。\n"
+                        "同名ファイルがある場合は、事前に現在のdataフォルダーもバックアップしてください。\n",
+                    )
+                    for root in (JOB_DIR, UPLOAD_DIR, ASSET_DIR):
+                        if not root.exists():
+                            continue
+                        for source in root.rglob("*"):
+                            if source.is_file():
+                                bundle.write(source, Path("data") / source.relative_to(DATA_DIR))
+                archive.seek(0, os.SEEK_END)
+                size = archive.tell()
+                archive.seek(0)
+                filename = f"plamo-paper-library-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+                shutil.copyfileobj(archive, self.wfile, length=1024 * 1024)
+            return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/quality", path)
+        if match:
+            job = _load_saved_job(match.group(1))
+            if not job:
+                self._error("ジョブが見つかりません。", 404)
+                return
+            issues = _translation_quality_issues(job)
+            self._json(
+                {
+                    "issues": issues,
+                    "count": len(issues),
+                    "checked": len(job.get("segments", [])),
+                    "errors": sum(issue["severity"] == "error" for issue in issues),
+                    "warnings": sum(issue["severity"] == "warning" for issue in issues),
+                }
+            )
+            return
         asset_match = re.fullmatch(r"/api/assets/([a-f0-9]{32})/([\w.-]+)", path)
         if asset_match:
             target = _asset_path(path)
@@ -508,6 +998,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 export_payload["tags"] = job.get("tags", [])
                 export_payload["summary"] = job.get("paper_summary", "")
+                export_payload["source_url"] = job.get("source_url", "")
+                export_payload["reading_status"] = job.get("reading_status", "unread")
                 content = json.dumps(export_payload, ensure_ascii=False, indent=2).encode("utf-8")
                 content_type, ext = "application/json; charset=utf-8", "json"
             else:
@@ -542,6 +1034,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/library/restore":
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= MAX_BACKUP_UPLOAD_BYTES:
+                self._error("バックアップZIPは2GB以下にしてください。")
+                return
+            try:
+                with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as archive:
+                    remaining = length
+                    while remaining:
+                        chunk = self.rfile.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise ValueError("バックアップの受信が途中で終了しました。")
+                        archive.write(chunk)
+                        remaining -= len(chunk)
+                    archive.seek(0)
+                    result = _restore_library_backup(archive)
+            except (OSError, ValueError) as exc:
+                self._error(str(exc) or "バックアップを復元できません。")
+                return
+            self._json({"ok": True, **result}, HTTPStatus.CREATED)
+            return
         if parsed.path == "/api/documents":
             self._upload_document()
             return
@@ -558,11 +1071,38 @@ class Handler(BaseHTTPRequestHandler):
                 data = self._read_json()
                 with state_lock:
                     tags, summary = _set_job_summary(job, data.get("tags", []), data.get("summary", ""))
+                    metadata = _set_library_metadata(
+                        job,
+                        source_url=data.get("source_url") if "source_url" in data else None,
+                        reading_status=data.get("reading_status") if "reading_status" in data else None,
+                    )
                     _save_job(job)
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 self._error(str(exc) or "論文のまとめを保存できません。")
                 return
-            self._json({"ok": True, "tags": tags, "summary": summary})
+            self._json({"ok": True, "tags": tags, "summary": summary, **metadata})
+            return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/metadata", parsed.path)
+        if match:
+            job = _load_saved_job(match.group(1))
+            if not job:
+                self._error("ジョブが見つかりません。", 404)
+                return
+            try:
+                data = self._read_json()
+                with state_lock:
+                    metadata = _set_library_metadata(
+                        job,
+                        source_url=data.get("source_url") if "source_url" in data else None,
+                        reading_status=data.get("reading_status") if "reading_status" in data else None,
+                        reading_index=data.get("reading_index") if "reading_index" in data else None,
+                        mark_opened=bool(data.get("mark_opened", False)),
+                    )
+                    _save_job(job)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._error(str(exc) or "論文情報を保存できません。")
+                return
+            self._json({"ok": True, **metadata})
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/notes", parsed.path)
         if match:
@@ -584,6 +1124,58 @@ class Handler(BaseHTTPRequestHandler):
                 job["segments"][index].note = note
                 _save_job(job)
             self._json({"ok": True, "index": index})
+            return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/translations", parsed.path)
+        if match:
+            job = _load_saved_job(match.group(1))
+            if not job:
+                self._error("ジョブが見つかりません。", 404)
+                return
+            try:
+                data = self._read_json()
+                index = int(data.get("index", -1))
+                with state_lock:
+                    if (match.group(1), index) in active_retranslations:
+                        raise ValueError("このセグメントは再翻訳中です。完了後に編集してください。")
+                    segment = _replace_segment_translation(job, index, data.get("translation"), "manual")
+                    _save_job(job)
+            except (IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._error(str(exc) or "訳文を保存できません。")
+                return
+            self._json(
+                {
+                    "ok": True,
+                    "index": index,
+                    "translation": segment.translation,
+                    "translation_origin": segment.translation_origin,
+                    "translation_edited_at": segment.translation_edited_at,
+                    "translation_revisions": segment.translation_revisions,
+                }
+            )
+            return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/retranslate", parsed.path)
+        if match:
+            job = _load_saved_job(match.group(1))
+            if not job:
+                self._error("ジョブが見つかりません。", 404)
+                return
+            try:
+                data = self._read_json()
+                index = int(data.get("index", -1))
+                segment = _retranslate_segment(match.group(1), job, index)
+            except (IndexError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._error(str(exc) or "再翻訳できません。")
+                return
+            self._json(
+                {
+                    "ok": True,
+                    "index": index,
+                    "translation": segment.translation,
+                    "translation_origin": segment.translation_origin,
+                    "translation_edited_at": segment.translation_edited_at,
+                    "translation_revisions": segment.translation_revisions,
+                }
+            )
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/bookmarks", parsed.path)
         if match:
@@ -656,6 +1248,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         document_id = uuid.uuid4().hex
         target = UPLOAD_DIR / f"{document_id}_{filename}"
+        digest = hashlib.sha256()
         with target.open("wb") as handle:
             remaining = length
             while remaining:
@@ -663,6 +1256,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 handle.write(chunk)
+                digest.update(chunk)
                 remaining -= len(chunk)
         try:
             document_assets = ASSET_DIR / document_id
@@ -677,7 +1271,10 @@ class Handler(BaseHTTPRequestHandler):
             self._error(str(exc))
             return
         title = Path(filename).stem
-        document = {"id": document_id, "title": title, "filename": filename, "path": str(target), "pages": pages, "segments": segments}
+        file_sha256 = digest.hexdigest()
+        duplicates = _duplicate_jobs(file_sha256)
+        suggested_source_url = _suggest_source_url(filename, segments)
+        document = {"id": document_id, "title": title, "filename": filename, "path": str(target), "pages": pages, "segments": segments, "file_sha256": file_sha256}
         with state_lock:
             documents[document_id] = document
         self._json(
@@ -688,6 +1285,8 @@ class Handler(BaseHTTPRequestHandler):
                 "pages": pages,
                 "segment_count": len(segments),
                 "characters": sum(len(segment.source) for segment in segments),
+                "duplicates": duplicates,
+                "suggested_source_url": suggested_source_url,
                 "preview": [segment.__dict__ for segment in segments[:3]],
             },
             HTTPStatus.CREATED,
@@ -716,6 +1315,7 @@ class Handler(BaseHTTPRequestHandler):
             self._error(str(exc))
             return
         job_id = uuid.uuid4().hex
+        created_at = _utc_now()
         job = {
             "id": job_id,
             "document_id": document["id"],
@@ -733,11 +1333,25 @@ class Handler(BaseHTTPRequestHandler):
             "glossary": parse_glossary(str(data.get("glossary", ""))),
             "tags": [],
             "paper_summary": "",
+            "source_url": str(data.get("source_url", "")).strip()[:2_000],
+            "source_filename": document["filename"],
+            "file_sha256": document.get("file_sha256", ""),
+            "reading_status": "unread",
+            "reading_index": 0,
+            "last_opened_at": "",
+            "created_at": created_at,
+            "updated_at": created_at,
             "segments": selected_segments,
             "cancelled": False,
         }
+        try:
+            _set_library_metadata(job, source_url=job["source_url"])
+        except ValueError as exc:
+            self._error(str(exc))
+            return
         with state_lock:
             jobs[job_id] = job
+            _save_job(job)
         threading.Thread(target=_translate_job, args=(job_id,), daemon=True).start()
         self._json(_job_snapshot(job), HTTPStatus.CREATED)
 

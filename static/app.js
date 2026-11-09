@@ -6,7 +6,8 @@ const CLIP_PARTS = {
   note: {key:'M', label:'メモ'},
 };
 const REFERENCE_PATTERN = /\b(?:fig(?:ure)?s?\.?\s*\d+(?:\s*[-–]\s*\d+)?|eq(?:uation)?s?\.?\s*\(?\d+\)?|tables?\s+\d+)|(?:図|式|表)\s*\(?\d+\)?/gi;
-const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], tocObserver: null, referenceTargets: new Map(), referenceHistory: [], resultsReady: false, paperTags: [], paperSummary: '', paperSummaryScrollY: 0 };
+const ACADEMIC_LINK_PATTERN = /https?:\/\/[^\s<>"']+|(?:doi:\s*)?10\.\d{4,9}\/[-._;()/:a-z0-9]+|arxiv:\s*\d{4}\.\d{4,5}(?:v\d+)?/gi;
+const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], segmentationMode: 'sentence', tocObserver: null, referenceTargets: new Map(), referenceHistory: [], resultsReady: false, paperTags: [], paperSummary: '', paperSourceUrl: '', paperReadingStatus: 'unread', readingIndex: 0, readingSaveTimer: null, lastSavedReadingIndex: null, paperSummaryScrollY: 0, librarySearchTimer: null, revisionSegmentIndex: null };
 const noteTimers = new Map();
 const $ = (id) => document.getElementById(id);
 
@@ -15,12 +16,13 @@ function toast(message) {
   setTimeout(() => node.classList.remove('show'), 3200);
 }
 
-function showStep(number) {
+function showStep(number, scrollBehavior = 'smooth') {
   document.querySelectorAll('.panel').forEach((node, i) => node.classList.toggle('active', i === number - 1));
   document.querySelectorAll('.step').forEach((node, i) => node.classList.toggle('active', i === number - 1));
   document.querySelector('.workspace').classList.toggle('reading', number === 3);
+  document.body.classList.toggle('reading-mode', number === 3);
   updateReaderToolbar();
-  window.scrollTo({top: document.querySelector('.workspace').offsetTop - 90, behavior: 'smooth'});
+  window.scrollTo({top: document.querySelector('.workspace').offsetTop - 90, behavior: scrollBehavior});
 }
 
 async function updateEngine() {
@@ -40,15 +42,18 @@ async function upload(file) {
     const response = await fetch('/api/documents', {method: 'POST', headers: {'X-Filename': encodeURIComponent(file.name), 'Content-Type': file.type || 'application/octet-stream'}, body: file});
     const data = await response.json(); if (!response.ok) throw new Error(data.error || '読み込みに失敗しました');
     state.documentId = data.id; $('title').value = data.title;
-    $('uploadState').innerHTML = `<div><b>${escapeHtml(data.filename)}</b><p>本文の抽出が完了しました</p></div><div class="document-stats"><span>${data.pages}ページ</span><span>${data.segment_count}行</span><span>${data.characters.toLocaleString()}文字</span></div>`;
+    if (!$('sourceUrl').value && data.suggested_source_url) $('sourceUrl').value = data.suggested_source_url;
+    const duplicate = Array.isArray(data.duplicates) ? data.duplicates[0] : null;
+    const duplicateNotice = duplicate ? `<p class="duplicate-warning">同じPDFの翻訳がライブラリにあります。<button type="button" class="duplicate-open" data-duplicate-job="${escapeHtml(duplicate.id)}">「${escapeHtml(duplicate.title)}」を開く</button></p>` : '';
+    $('uploadState').innerHTML = `<div><b>${escapeHtml(data.filename)}</b><p>本文の抽出が完了しました</p>${duplicateNotice}</div><div class="document-stats"><span>${data.pages}ページ</span><span>${data.segment_count}行</span><span>${data.characters.toLocaleString()}文字</span></div>`;
     $('toSettings').disabled = false; toast('論文を読み込みました');
   } catch (error) { $('uploadState').innerHTML = `<div><b>読み込めませんでした</b><p>${escapeHtml(error.message)}</p></div>`; toast(error.message); }
 }
 
 async function startJob() {
   if (!state.documentId) return toast('先に論文を読み込んでください');
-  const payload = {document_id: state.documentId, title: $('title').value, segmentation_mode: document.querySelector('input[name="segmentationMode"]:checked').value, source_lang: $('sourceLang').value, target_lang: $('targetLang').value, form: $('form').value, context: $('context').value, glossary: $('glossary').value};
-  state.resultsReady = false; state.segments = []; state.paperTags = []; state.paperSummary = '';
+  const payload = {document_id: state.documentId, title: $('title').value, source_url: $('sourceUrl').value, segmentation_mode: document.querySelector('input[name="segmentationMode"]:checked').value, source_lang: $('sourceLang').value, target_lang: $('targetLang').value, form: $('form').value, context: $('context').value, glossary: $('glossary').value};
+  state.resultsReady = false; state.segments = []; state.paperTags = []; state.paperSummary = ''; state.paperSourceUrl = ''; state.paperReadingStatus = 'unread'; state.readingIndex = 0;
   $('step3').classList.remove('results-ready');
   showStep(3); $('progressBox').classList.remove('hidden'); $('readerLayout').classList.add('hidden'); $('results').innerHTML = '';
   try {
@@ -91,6 +96,7 @@ function showResults(data) {
   $('readerHeader').classList.remove('hidden');
   $('step3').classList.add('results-ready');
   const mode = data.segmentation_mode || 'sentence';
+  state.segmentationMode = mode;
   const loadedSegments = (data.segments || []).map((item) => ({...item, clips:itemClips(item)}));
   const referenceLayout = prepareReferenceLayout(loadedSegments);
   state.segments = referenceLayout.segments;
@@ -98,6 +104,10 @@ function showResults(data) {
   state.referenceHistory = [];
   state.paperTags = Array.isArray(data.tags) ? data.tags.filter((tag) => typeof tag === 'string') : [];
   state.paperSummary = String(data.paper_summary || '');
+  state.paperSourceUrl = String(data.source_url || '');
+  state.paperReadingStatus = ['unread','reading','completed','archived'].includes(data.reading_status) ? data.reading_status : 'unread';
+  state.readingIndex = Math.max(0, Number(data.reading_index) || 0);
+  state.lastSavedReadingIndex = state.readingIndex;
   state.resultsReady = true;
   updateReferenceBackButton();
   const resultStatus = mode === 'paragraph' ? `${data.total}段落・構造ブロックの対訳が完成しました。` : `${data.total}行の対訳が完成しました。Pは段落、Sは段落内の文番号です。`;
@@ -111,6 +121,9 @@ function showResults(data) {
   document.querySelectorAll('.note-editor').forEach(resizeNote);
   renderPaperNavigation();
   renderClipShelf();
+  markPaperOpened();
+  refreshQualityCheck(false);
+  if (state.readingIndex > 0) requestAnimationFrame(() => requestAnimationFrame(() => restoreReadingPosition(state.readingIndex)));
   toast('翻訳が完了しました');
 }
 
@@ -124,7 +137,10 @@ function renderSegment(item, position, list, mode) {
   const sourceText = renderReferencedText(item.source, item.index);
   const translationText = renderReferencedText(translation, item.index);
   const sourceContent = equationImage ? `${images}<details class="equation-text"><summary>検索用テキスト</summary><p>${sourceText}</p></details>` : `${images}<p>${sourceText}</p>`;
-  const translationContent = equationImage ? `${images}<details class="equation-text"><summary>抽出テキスト</summary><p>${translationText}</p></details>` : `<p>${translationText}</p>`;
+  const revisions = Array.isArray(item.translation_revisions) ? item.translation_revisions : [];
+  const originLabel = item.translation_origin === 'manual' ? '編集済み' : (item.translation_origin === 'model' ? 'モデル訳' : '');
+  const translationActions = equationImage ? '' : `<div class="translation-actions"><span>${escapeHtml(originLabel)}</span><button type="button" data-translation-action="edit" data-translation-index="${item.index}">編集</button><button type="button" data-translation-action="retranslate" data-translation-index="${item.index}">再翻訳</button>${revisions.length ? `<button type="button" data-translation-action="history" data-translation-index="${item.index}">履歴 ${revisions.length}</button>` : ''}</div>`;
+  const translationContent = equationImage ? `${images}<details class="equation-text"><summary>抽出テキスト</summary><p>${translationText}</p></details>` : `${translationActions}<div class="translation-body"><p>${translationText}</p></div>`;
   const hasPosition = Number(item.paragraph) > 0;
   const isParagraphStart = hasPosition && (position === 0 || item.paragraph !== list[position - 1].paragraph);
   const unitPosition = hasPosition ? (Number(item.sentence) > 0 ? `P${item.paragraph} / S${item.sentence}` : `P${item.paragraph}`) : '旧形式';
@@ -295,14 +311,28 @@ function renderReferencedText(value, currentIndex) {
   const text = String(value ?? '');
   let rendered = '';
   let lastIndex = 0;
-  for (const match of text.matchAll(REFERENCE_PATTERN)) {
+  const matches = [
+    ...[...text.matchAll(REFERENCE_PATTERN)].map((match) => ({match, kind:'reference'})),
+    ...[...text.matchAll(ACADEMIC_LINK_PATTERN)].map((match) => ({match, kind:'academic'})),
+  ].sort((left, right) => left.match.index - right.match.index || (left.kind === 'academic' ? -1 : 1));
+  for (const entry of matches) {
+    const match = entry.match;
+    if (match.index < lastIndex) continue;
     rendered += escapeHtml(text.slice(lastIndex, match.index));
-    const identity = referenceIdentity(match[0]);
-    const target = identity ? state.referenceTargets.get(referenceKey(identity.type, identity.number)) : undefined;
-    if (Number.isInteger(target) && target !== Number(currentIndex)) {
-      rendered += `<button type="button" class="reference-link" data-reference-index="${target}" title="参照先へ移動">${escapeHtml(match[0])}</button>`;
+    if (entry.kind === 'academic') {
+      const visible = match[0].replace(/[.,;]+$/, '');
+      const doi = visible.match(/10\.\d{4,9}\/[-._;()/:a-z0-9]+/i)?.[0];
+      const arxiv = visible.match(/\d{4}\.\d{4,5}(?:v\d+)?/i)?.[0];
+      const href = /^https?:\/\//i.test(visible) ? visible : (doi ? `https://doi.org/${doi}` : `https://arxiv.org/abs/${arxiv}`);
+      rendered += `<a class="academic-link" href="${escapeHtml(href)}" target="_blank" rel="noreferrer" title="原文情報を開く">${escapeHtml(visible)}</a>${escapeHtml(match[0].slice(visible.length))}`;
     } else {
-      rendered += escapeHtml(match[0]);
+      const identity = referenceIdentity(match[0]);
+      const target = identity ? state.referenceTargets.get(referenceKey(identity.type, identity.number)) : undefined;
+      if (Number.isInteger(target) && target !== Number(currentIndex)) {
+        rendered += `<button type="button" class="reference-link" data-reference-index="${target}" title="参照先へ移動">${escapeHtml(match[0])}</button>`;
+      } else {
+        rendered += escapeHtml(match[0]);
+      }
     }
     lastIndex = match.index + match[0].length;
   }
@@ -317,6 +347,11 @@ function renderPaperNavigation() {
         return `<button type="button" class="toc-link level-${level}" data-nav-index="${item.index}"><span>${escapeHtml(navigationLabel(item))}</span><small>p.${Number(item.page) || 1}</small></button>`;
       }).join('')
     : '<p class="navigation-empty">見出しを検出できませんでした。</p>';
+  const visuals = state.segments.filter((item) => ['figure','equation','table'].includes(item.kind || '') || (Array.isArray(item.assets) && item.assets.length));
+  const visualLabels = {figure:'図', equation:'数式', table:'表'};
+  $('visualList').innerHTML = visuals.length
+    ? visuals.map((item) => `<button type="button" class="visual-link" data-nav-index="${item.index}"><b>${escapeHtml(visualLabels[item.kind] || '図')}</b><span>${escapeHtml(navigationLabel(item, 42) || `${Number(item.page) || 1}ページの画像`)}</span><small>${String(Number(item.index) + 1).padStart(3, '0')}</small></button>`).join('')
+    : '<p class="navigation-empty">図表・数式はありません。</p>';
   renderBookmarkList();
   observeTableOfContents(headings);
 }
@@ -404,6 +439,132 @@ function returnFromReference() {
   const top = state.referenceHistory.pop();
   updateReferenceBackButton();
   if (Number.isFinite(top)) window.scrollTo({top, behavior:'smooth'});
+}
+
+function restoreReadingPosition(index) {
+  const row = $(`segment-${index}`);
+  if (!row) return;
+  const stickyHeight = $('readerStickyStack')?.offsetHeight || 0;
+  const top = row.getBoundingClientRect().top + window.scrollY - stickyHeight - 86;
+  window.scrollTo({top: Math.max(0, top), behavior: 'auto'});
+}
+
+function currentReadingIndex() {
+  const rows = [...document.querySelectorAll('.reader-row:not(.filtered)')];
+  if (!rows.length) return 0;
+  const threshold = 130 + ($('readerStickyStack')?.offsetHeight || 0);
+  let current = rows[0];
+  for (const row of rows) {
+    if (row.getBoundingClientRect().top <= threshold) current = row;
+    else break;
+  }
+  return Math.max(0, Number(current.dataset.index) || 0);
+}
+
+async function saveReadingPosition(index, markOpened = false) {
+  if (!state.jobId || !state.resultsReady) return;
+  if (!markOpened && index === state.lastSavedReadingIndex) return;
+  try {
+    const response = await fetch(`/api/jobs/${state.jobId}/metadata`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({reading_index:index, mark_opened:markOpened})});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '読書位置を保存できません');
+    state.readingIndex = Number(data.reading_index) || 0;
+    state.lastSavedReadingIndex = state.readingIndex;
+    state.paperReadingStatus = data.reading_status || state.paperReadingStatus;
+  } catch (_) {
+    // Reading progress is best-effort; annotations and translations remain unaffected.
+  }
+}
+
+function markPaperOpened() {
+  saveReadingPosition(state.readingIndex, true);
+}
+
+function scheduleReadingPositionSave() {
+  if (!state.resultsReady) return;
+  clearTimeout(state.readingSaveTimer);
+  state.readingSaveTimer = setTimeout(() => saveReadingPosition(currentReadingIndex()), 1200);
+}
+
+const READING_STATUS_LABELS = {unread:'未読', reading:'読書中', completed:'読了', archived:'保留'};
+
+function formatLibraryDate(value) {
+  if (!value) return '日時不明';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '日時不明' : new Intl.DateTimeFormat('ja-JP', {year:'numeric', month:'short', day:'numeric'}).format(date);
+}
+
+function renderLibraryItem(item) {
+  const tags = Array.isArray(item.tags) ? item.tags.slice(0, 8).map((tag) => `<span>${escapeHtml(tag)}</span>`).join('') : '';
+  const summary = String(item.summary || '').trim();
+  const progress = Math.max(0, Math.min(100, Number(item.reading_progress) || 0));
+  const source = item.source_url ? `<a class="library-source" href="${escapeHtml(item.source_url)}" target="_blank" rel="noreferrer">原文を開く ↗</a>` : '';
+  return `<article class="library-card">
+    <div class="library-card-main"><h3>${escapeHtml(item.title || 'Untitled')}</h3>
+      <div class="library-card-meta"><span class="library-state">${escapeHtml(READING_STATUS_LABELS[item.reading_status] || item.reading_status)}</span><span>${Number(item.total) || 0}セグメント</span><span>更新 ${escapeHtml(formatLibraryDate(item.updated_at || item.created_at))}</span></div>
+      ${tags ? `<div class="library-tags">${tags}</div>` : ''}
+      ${summary ? `<p class="library-summary">${escapeHtml(summary)}</p>` : ''}
+      ${item.match ? `<p class="library-match">${escapeHtml(item.match)}</p>` : ''}
+      <div class="library-progress" title="読書位置 ${progress}%"><i style="width:${progress}%"></i></div>
+    </div>
+    <div class="library-card-actions"><button type="button" class="library-open" data-library-job="${escapeHtml(item.id)}">続きから読む</button>${source}</div>
+  </article>`;
+}
+
+async function loadLibrary() {
+  const query = $('librarySearch').value.trim();
+  const status = $('libraryStatus').value;
+  $('libraryItems').innerHTML = '<div class="library-empty">ライブラリを検索しています…</div>';
+  try {
+    const response = await fetch(`/api/library?q=${encodeURIComponent(query)}&status=${encodeURIComponent(status)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'ライブラリを読み込めません');
+    $('libraryCount').textContent = query ? `${data.count}件が一致しました` : `${data.count}件の論文`;
+    $('libraryDataDir').textContent = `保存先: ${data.data_dir || 'data/'}`;
+    $('libraryItems').innerHTML = data.items?.length ? data.items.map(renderLibraryItem).join('') : `<div class="library-empty">${query ? '一致する論文がありません。' : '翻訳した論文がここに並びます。'}</div>`;
+  } catch (error) {
+    $('libraryItems').innerHTML = `<div class="library-empty">${escapeHtml(error.message || 'ライブラリを読み込めません')}</div>`;
+  }
+}
+
+async function restoreLibrary(file) {
+  if (!file) return;
+  if (!file.name.toLocaleLowerCase().endsWith('.zip')) {
+    toast('PLaMo Paper TranslatorのバックアップZIPを選んでください');
+    return;
+  }
+  const input = $('libraryRestoreFile');
+  input.disabled = true;
+  $('libraryCount').textContent = 'バックアップを検査・復元しています…';
+  try {
+    const response = await fetch('/api/library/restore', {method:'POST', headers:{'Content-Type':'application/zip'}, body:file});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'バックアップを復元できません');
+    toast(`${data.restored_jobs}件の論文を復元しました（既存${data.skipped_files}ファイルは保持）`);
+    await loadLibrary();
+  } catch (error) {
+    $('libraryCount').textContent = '復元できませんでした';
+    toast(error.message || 'バックアップを復元できません');
+  } finally {
+    input.disabled = false;
+    input.value = '';
+  }
+}
+
+function openLibraryDialog() {
+  $('libraryDialog').showModal();
+  loadLibrary();
+  requestAnimationFrame(() => $('librarySearch').focus({preventScroll:true}));
+}
+
+function closeLibraryDialog() {
+  if ($('libraryDialog').open) $('libraryDialog').close();
+}
+
+function openLibraryJob(jobId) {
+  if (!/^[a-f0-9]{32}$/.test(jobId || '')) return;
+  localStorage.setItem(JOB_STORAGE_KEY, jobId);
+  location.href = `/?job=${encodeURIComponent(jobId)}`;
 }
 
 function applyBookmark(index, bookmarked) {
@@ -499,11 +660,155 @@ async function saveNote(index, note, status) {
   }
 }
 
+function rerenderSegment(index) {
+  const item = state.segments.find((segment) => Number(segment.index) === Number(index));
+  const position = state.segments.indexOf(item);
+  const row = $(`segment-${index}`);
+  if (!item || position < 0 || !row) return;
+  row.outerHTML = renderSegment(item, position, state.segments, state.segmentationMode);
+  const editor = document.querySelector(`.note-editor[data-note-index="${index}"]`);
+  if (editor) resizeNote(editor);
+  renderClipShelf();
+}
+
+function beginTranslationEdit(index) {
+  const item = state.segments.find((segment) => Number(segment.index) === Number(index));
+  const pane = $(`segment-${index}`)?.querySelector('.translation-pane');
+  const body = pane?.querySelector('.translation-body');
+  if (!item || !body) return;
+  pane.classList.add('editing');
+  body.innerHTML = `<textarea class="translation-editor" maxlength="50000" aria-label="${index + 1}番の訳文を編集">${escapeHtml(item.translation || '')}</textarea><div class="translation-edit-actions"><button type="button" class="secondary small" data-translation-action="cancel" data-translation-index="${index}">キャンセル</button><button type="button" class="primary small" data-translation-action="save" data-translation-index="${index}">保存</button></div>`;
+  const editor = body.querySelector('.translation-editor');
+  editor.style.height = `${Math.max(90, editor.scrollHeight)}px`;
+  editor.focus({preventScroll:true});
+}
+
+async function saveSegmentTranslation(index, translation) {
+  const response = await fetch(`/api/jobs/${state.jobId}/translations`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index, translation})});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || '訳文を保存できません');
+  const item = state.segments.find((segment) => Number(segment.index) === Number(index));
+  if (item) Object.assign(item, {
+    translation:data.translation,
+    translation_origin:data.translation_origin,
+    translation_edited_at:data.translation_edited_at,
+    translation_revisions:data.translation_revisions || [],
+    error:'',
+  });
+  rerenderSegment(index);
+  refreshQualityCheck(false);
+  return data;
+}
+
+async function submitTranslationEdit(index, button) {
+  const editor = $(`segment-${index}`)?.querySelector('.translation-editor');
+  if (!editor) return;
+  button.disabled = true;
+  try {
+    await saveSegmentTranslation(index, editor.value);
+    toast('訳文を保存しました');
+  } catch (error) {
+    button.disabled = false;
+    toast(error.message || '訳文を保存できません');
+  }
+}
+
+async function retranslateSegment(index, button) {
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = '再翻訳中…';
+  try {
+    const response = await fetch(`/api/jobs/${state.jobId}/retranslate`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index})});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '再翻訳できません');
+    const item = state.segments.find((segment) => Number(segment.index) === Number(index));
+    if (item) Object.assign(item, {
+      translation:data.translation,
+      translation_origin:data.translation_origin,
+      translation_edited_at:data.translation_edited_at,
+      translation_revisions:data.translation_revisions || [],
+      error:'',
+    });
+    rerenderSegment(index);
+    refreshQualityCheck(false);
+    toast('このセグメントを再翻訳しました');
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = original;
+    toast(error.message || '再翻訳できません');
+  }
+}
+
+function openTranslationHistory(index) {
+  const item = state.segments.find((segment) => Number(segment.index) === Number(index));
+  if (!item) return;
+  state.revisionSegmentIndex = Number(index);
+  const revisions = Array.isArray(item.translation_revisions) ? item.translation_revisions : [];
+  const cards = [...revisions].map((revision, position) => ({...revision, position})).reverse().map((revision) => `<article class="revision-card"><header><b>${revision.origin === 'manual' ? '手動編集' : 'モデル訳'}</b><time>${escapeHtml(formatLibraryDate(revision.changed_at))}</time><button type="button" data-revision-restore="${revision.position}">この版に戻す</button></header><p>${escapeHtml(revision.translation || '')}</p></article>`).join('');
+  $('revisionCurrent').textContent = item.translation || '';
+  $('revisionItems').innerHTML = cards || '<p class="navigation-empty">以前の訳文はありません。</p>';
+  $('revisionDialog').showModal();
+}
+
+function closeTranslationHistory() {
+  if ($('revisionDialog').open) $('revisionDialog').close();
+  state.revisionSegmentIndex = null;
+}
+
+async function restoreTranslationRevision(position, button) {
+  const item = state.segments.find((segment) => Number(segment.index) === state.revisionSegmentIndex);
+  const revision = item?.translation_revisions?.[position];
+  if (!item || !revision) return;
+  button.disabled = true;
+  try {
+    await saveSegmentTranslation(item.index, revision.translation);
+    closeTranslationHistory();
+    toast('以前の訳文を復元しました');
+  } catch (error) {
+    button.disabled = false;
+    toast(error.message || '訳文を復元できません');
+  }
+}
+
 function updateReaderToolbar() {
   const stepThreeActive = $('step3').classList.contains('active');
   const visible = state.resultsReady && stepThreeActive;
   $('resultActions').classList.toggle('hidden', !visible);
   $('paperSummaryButton').classList.toggle('hidden', !visible);
+  $('qualityButton').classList.toggle('hidden', !visible);
+}
+
+function renderQualityIssues(data) {
+  $('qualityCount').textContent = data.count ? String(data.count) : '';
+  $('qualityButton').dataset.hasIssues = String(Boolean(data.count));
+  $('qualitySummary').textContent = data.count ? `${data.checked}セグメントを検査し、${data.count}件の確認候補が見つかりました。` : `${data.checked}セグメントを検査し、機械的な問題候補は見つかりませんでした。`;
+  $('qualityItems').innerHTML = data.issues?.length ? data.issues.map((issue) => `<article class="quality-item" data-severity="${escapeHtml(issue.severity)}"><i class="quality-severity" aria-hidden="true"></i><div><b>${escapeHtml(issue.message)}</b><small>${escapeHtml(issue.detail || '')}</small></div><button type="button" class="quality-jump" data-quality-index="${Number(issue.index)}">${String(Number(issue.index) + 1).padStart(3, '0')}へ</button></article>`).join('') : '<div class="quality-ok">機械チェック上の問題候補はありません。<br>公開・投稿前には人による校正を行ってください。</div>';
+}
+
+async function refreshQualityCheck(renderDialog = true) {
+  if (!state.jobId || !state.resultsReady) return;
+  if (renderDialog) {
+    $('qualitySummary').textContent = '検査しています…';
+    $('qualityItems').innerHTML = '<div class="library-empty">原文と訳文を照合しています…</div>';
+  }
+  try {
+    const response = await fetch(`/api/jobs/${state.jobId}/quality`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '翻訳を検査できません');
+    renderQualityIssues(data);
+  } catch (error) {
+    if (renderDialog) $('qualityItems').innerHTML = `<div class="library-empty">${escapeHtml(error.message || '翻訳を検査できません')}</div>`;
+  }
+}
+
+function openQualityDialog() {
+  if (!state.resultsReady) return;
+  $('qualityDialog').showModal();
+  refreshQualityCheck(true);
+}
+
+function closeQualityDialog() {
+  if ($('qualityDialog').open) $('qualityDialog').close();
 }
 
 function parsePaperTags(value) {
@@ -521,6 +826,14 @@ function updatePaperSummaryLength() {
   $('paperSummaryLength').textContent = `${$('paperSummaryText').value.length.toLocaleString()} / 20,000`;
 }
 
+function insertPaperSummaryTemplate() {
+  const template = `研究課題\n- \n\n提案・手法\n- \n\nデータ／実験条件\n- \n\n主要な結果\n- \n\n新規性・貢献\n- \n\n限界・注意点\n- \n\n次に確認すること\n- `;
+  const editor = $('paperSummaryText');
+  editor.value = editor.value.trim() ? `${editor.value.trimEnd()}\n\n---\n\n${template}` : template;
+  updatePaperSummaryLength();
+  editor.focus({preventScroll:true});
+}
+
 function updatePaperSummaryButton() {
   const hasContent = state.paperTags.length > 0 || Boolean(state.paperSummary.trim());
   $('paperSummaryButton').dataset.hasContent = String(hasContent);
@@ -534,6 +847,8 @@ function openPaperSummaryDialog() {
   document.body.style.top = `-${state.paperSummaryScrollY}px`;
   document.body.classList.add('paper-summary-open');
   $('paperTags').value = state.paperTags.join(', ');
+  $('paperSourceUrl').value = state.paperSourceUrl;
+  $('paperReadingStatus').value = state.paperReadingStatus;
   $('paperSummaryText').value = state.paperSummary;
   $('paperSummaryStatus').textContent = 'このPC内の翻訳ジョブに保存されます。';
   $('paperSummaryStatus').className = 'dialog-status';
@@ -572,10 +887,12 @@ async function savePaperSummary(event) {
   $('paperSummaryStatus').textContent = '保存しています…';
   $('paperSummaryStatus').className = 'dialog-status saving';
   try {
-    const response = await fetch(`/api/jobs/${state.jobId}/summary`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tags, summary})});
+    const response = await fetch(`/api/jobs/${state.jobId}/summary`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tags, summary, source_url:$('paperSourceUrl').value, reading_status:$('paperReadingStatus').value})});
     const data = await response.json(); if (!response.ok) throw new Error(data.error || '論文のまとめを保存できません');
     state.paperTags = data.tags || [];
     state.paperSummary = data.summary || '';
+    state.paperSourceUrl = data.source_url || '';
+    state.paperReadingStatus = data.reading_status || 'unread';
     updatePaperSummaryButton();
     closePaperSummaryDialog();
     toast('論文のまとめを保存しました');
@@ -594,6 +911,10 @@ $('fileInput').addEventListener('change', (event) => upload(event.target.files[0
 ['dragenter','dragover'].forEach((name) => dropzone.addEventListener(name, (event) => {event.preventDefault(); dropzone.classList.add('drag');}));
 ['dragleave','drop'].forEach((name) => dropzone.addEventListener(name, (event) => {event.preventDefault(); dropzone.classList.remove('drag');}));
 dropzone.addEventListener('drop', (event) => upload(event.dataTransfer.files[0]));
+$('uploadState').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-duplicate-job]');
+  if (button) openLibraryJob(button.dataset.duplicateJob);
+});
 $('toSettings').addEventListener('click', () => showStep(2));
 document.querySelectorAll('.back').forEach((node) => node.addEventListener('click', () => showStep(Number(node.dataset.target))));
 document.querySelectorAll('.step').forEach((node) => node.addEventListener('click', () => { const n=Number(node.dataset.step); if(n===1 || (n===2 && state.documentId) || (n===3 && state.jobId)) showStep(n); }));
@@ -602,14 +923,50 @@ $('startTranslation').addEventListener('click', startJob);
 $('cancelJob').addEventListener('click', async () => { if(state.jobId) await fetch(`/api/jobs/${state.jobId}/cancel`, {method:'POST'}); });
 $('newPaper').addEventListener('click', () => { localStorage.removeItem(JOB_STORAGE_KEY); location.href = '/'; });
 $('referenceBack').addEventListener('click', returnFromReference);
+$('libraryButton').addEventListener('click', openLibraryDialog);
+$('libraryClose').addEventListener('click', closeLibraryDialog);
+$('libraryDialog').addEventListener('click', (event) => { if (event.target === $('libraryDialog')) closeLibraryDialog(); });
+$('libraryItems').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-library-job]');
+  if (button) openLibraryJob(button.dataset.libraryJob);
+});
+$('librarySearch').addEventListener('input', () => {
+  clearTimeout(state.librarySearchTimer);
+  state.librarySearchTimer = setTimeout(loadLibrary, 260);
+});
+$('libraryStatus').addEventListener('change', loadLibrary);
+$('libraryRestoreFile').addEventListener('change', (event) => restoreLibrary(event.target.files[0]));
+$('qualityButton').addEventListener('click', openQualityDialog);
+$('qualityClose').addEventListener('click', closeQualityDialog);
+$('qualityDialog').addEventListener('click', (event) => { if (event.target === $('qualityDialog')) closeQualityDialog(); });
+$('qualityItems').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-quality-index]');
+  if (!button) return;
+  const index = Number(button.dataset.qualityIndex);
+  closeQualityDialog();
+  jumpToSegment(index);
+});
 $('paperSummaryButton').addEventListener('click', openPaperSummaryDialog);
 $('paperSummaryClose').addEventListener('click', closePaperSummaryDialog);
 $('paperSummaryCancel').addEventListener('click', closePaperSummaryDialog);
 $('paperSummaryForm').addEventListener('submit', savePaperSummary);
 $('paperTags').addEventListener('input', renderPaperTagPreview);
 $('paperSummaryText').addEventListener('input', updatePaperSummaryLength);
+$('paperSummaryTemplate').addEventListener('click', insertPaperSummaryTemplate);
 $('paperSummaryDialog').addEventListener('click', (event) => { if (event.target === $('paperSummaryDialog')) closePaperSummaryDialog(); });
+$('revisionClose').addEventListener('click', closeTranslationHistory);
+$('revisionDialog').addEventListener('click', (event) => { if (event.target === $('revisionDialog')) closeTranslationHistory(); });
+$('revisionItems').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-revision-restore]');
+  if (button) restoreTranslationRevision(Number(button.dataset.revisionRestore), button);
+});
 $('results').addEventListener('input', (event) => {
+  const translationEditor = event.target.closest('.translation-editor');
+  if (translationEditor) {
+    translationEditor.style.height = 'auto';
+    translationEditor.style.height = `${Math.max(90, translationEditor.scrollHeight)}px`;
+    return;
+  }
   const editor = event.target.closest('.note-editor'); if (!editor) return;
   resizeNote(editor);
   const index = Number(editor.dataset.noteIndex); const status = editor.nextElementSibling;
@@ -625,6 +982,17 @@ $('results').addEventListener('click', (event) => {
   if (button) toggleBookmark(button);
 });
 $('readerLayout').addEventListener('click', (event) => {
+  const translationButton = event.target.closest('[data-translation-action]');
+  if (translationButton) {
+    const index = Number(translationButton.dataset.translationIndex);
+    const action = translationButton.dataset.translationAction;
+    if (action === 'edit') beginTranslationEdit(index);
+    else if (action === 'save') submitTranslationEdit(index, translationButton);
+    else if (action === 'cancel') rerenderSegment(index);
+    else if (action === 'retranslate') retranslateSegment(index, translationButton);
+    else if (action === 'history') openTranslationHistory(index);
+    return;
+  }
   const clipButton = event.target.closest('.clip-toggle');
   if (clipButton) { toggleClip(clipButton); return; }
   const reference = event.target.closest('.reference-link');
@@ -640,6 +1008,23 @@ $('readerSearch').addEventListener('input', (event) => {
     row.classList.toggle('filtered', Boolean(query) && !searchable.includes(query));
   });
 });
+window.addEventListener('scroll', scheduleReadingPositionSave, {passive:true});
+window.addEventListener('beforeunload', () => {
+  if (!state.jobId || !state.resultsReady) return;
+  const index = currentReadingIndex();
+  if (index === state.lastSavedReadingIndex) return;
+  navigator.sendBeacon(`/api/jobs/${state.jobId}/metadata`, new Blob([JSON.stringify({reading_index:index})], {type:'application/json'}));
+});
+document.addEventListener('keydown', (event) => {
+  if (event.altKey && !event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'l') {
+    event.preventDefault();
+    openLibraryDialog();
+  }
+  if (event.altKey && !event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 's' && state.resultsReady) {
+    event.preventDefault();
+    openPaperSummaryDialog();
+  }
+});
 
 function resumeJob() {
   const requested = new URLSearchParams(location.search).get('job');
@@ -647,9 +1032,10 @@ function resumeJob() {
   if (!saved || !/^[a-f0-9]{32}$/.test(saved)) return;
   state.jobId = saved; state.resultsReady = false; localStorage.setItem(JOB_STORAGE_KEY, saved);
   $('step3').classList.remove('results-ready');
-  showStep(3); $('progressBox').classList.remove('hidden');
+  showStep(3, 'auto'); $('progressBox').classList.remove('hidden');
   $('progressMessage').textContent = '保存済みの翻訳状態を確認しています…';
   pollJob();
 }
 
 updateEngine(); setInterval(updateEngine, 5000); resumeJob();
+if (new URLSearchParams(location.search).get('library') === '1') openLibraryDialog();

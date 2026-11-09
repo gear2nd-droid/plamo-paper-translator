@@ -3,19 +3,35 @@ Set-StrictMode -Version Latest
 $AppRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Python = Join-Path $AppRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path $Python)) { throw "先に setup.ps1 を実行してください。" }
+$DistRoot = Join-Path $AppRoot "dist"
+$PackageRoot = Join-Path $DistRoot (".package-staging-" + $PID)
+$ResolvedDistRoot = [IO.Path]::GetFullPath($DistRoot) + [IO.Path]::DirectorySeparatorChar
+$ResolvedPackageRoot = [IO.Path]::GetFullPath($PackageRoot)
+if (-not $ResolvedPackageRoot.StartsWith($ResolvedDistRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "一時パッケージの出力先がdistフォルダー外です。"
+}
+if (Test-Path -LiteralPath $ResolvedPackageRoot) {
+    Remove-Item -Recurse -Force -LiteralPath $ResolvedPackageRoot
+}
 
 & $Python -m pip install --disable-pip-version-check "pyinstaller>=6.16,<7"
 Push-Location $AppRoot
 try {
     & $Python -m PyInstaller --noconfirm --clean --onefile --name PLaMoPaperTranslator --hidden-import pypdf --add-data "static;static" app.py
-    $PackageRoot = Join-Path $AppRoot "dist\PLaMoPaperTranslator"
     New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
     Copy-Item -Force "dist\PLaMoPaperTranslator.exe" $PackageRoot
     Copy-Item -Force "Start-PLaMoPaperTranslator.cmd","start.ps1","setup.ps1","requirements.txt","README.md","DISTRIBUTION.md","THIRD_PARTY_NOTICES.md","LICENSE" $PackageRoot
+    $DocsDestination = Join-Path $PackageRoot "docs"
+    if (Test-Path -LiteralPath $DocsDestination) {
+        Remove-Item -Recurse -Force -LiteralPath $DocsDestination
+    }
+    if (Test-Path -LiteralPath "docs") {
+        Copy-Item -Recurse -Force -LiteralPath "docs" -Destination $DocsDestination
+    }
     $ChromeExtensionDestination = Join-Path $PackageRoot "chrome-extension"
-    $ResolvedPackageRoot = [IO.Path]::GetFullPath($PackageRoot) + [IO.Path]::DirectorySeparatorChar
+    $ResolvedPackageRootWithSeparator = [IO.Path]::GetFullPath($PackageRoot) + [IO.Path]::DirectorySeparatorChar
     $ResolvedChromeExtensionDestination = [IO.Path]::GetFullPath($ChromeExtensionDestination)
-    if (-not $ResolvedChromeExtensionDestination.StartsWith($ResolvedPackageRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $ResolvedChromeExtensionDestination.StartsWith($ResolvedPackageRootWithSeparator, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Chrome拡張の出力先が配布フォルダー外です。"
     }
     if (Test-Path -LiteralPath $ResolvedChromeExtensionDestination) {
@@ -66,4 +82,7 @@ try {
     Write-Host "作成完了: $Zip" -ForegroundColor Green
 } finally {
     Pop-Location
+    if (Test-Path -LiteralPath $ResolvedPackageRoot) {
+        Remove-Item -Recurse -Force -LiteralPath $ResolvedPackageRoot
+    }
 }

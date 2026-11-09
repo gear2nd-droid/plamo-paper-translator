@@ -3,8 +3,9 @@ import io
 import struct
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import app
 from paper_core import Segment
@@ -130,6 +131,162 @@ class SavedJobTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             app._set_job_summary(job, [], "x" * (app.MAX_PAPER_SUMMARY_LENGTH + 1))
 
+    def test_library_metadata_validates_and_tracks_reading_position(self):
+        job = {"segments": [Segment(0, 1, "A"), Segment(1, 1, "B"), Segment(2, 1, "C")]}
+        metadata = app._set_library_metadata(
+            job,
+            source_url="https://arxiv.org/abs/2302.14165",
+            reading_status="reading",
+            reading_index=2,
+            mark_opened=True,
+        )
+        self.assertEqual(metadata["reading_index"], 2)
+        self.assertEqual(metadata["reading_status"], "reading")
+        self.assertTrue(metadata["last_opened_at"])
+        with self.assertRaises(ValueError):
+            app._set_library_metadata(job, source_url="file:///private/paper.pdf")
+        with self.assertRaises(ValueError):
+            app._set_library_metadata(job, reading_status="unknown")
+
+    def test_library_search_includes_translation_and_notes(self):
+        job = dict(self.payload)
+        job["segments"] = [Segment(0, 1, "Original", "固有の訳語", note="確認メモ")]
+        job["reading_index"] = 0
+        translated = app._library_item(job, "訳語")
+        noted = app._library_item(job, "確認メモ")
+        self.assertIn("固有の訳語", translated["match"])
+        self.assertIn("確認メモ", noted["match"])
+
+    def test_library_lists_existing_jobs_without_migration(self):
+        second_id = "b" * 32
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "JOB_DIR", Path(directory)):
+            first = dict(self.payload)
+            first["segments"] = [Segment(0, 1, "Neural translation", "ニューラル翻訳").__dict__]
+            second = {**first, "id": second_id, "title": "Other", "segments": [Segment(0, 1, "Other").__dict__]}
+            (Path(directory) / f"{self.job_id}.json").write_text(json.dumps(first, ensure_ascii=False), encoding="utf-8")
+            (Path(directory) / f"{second_id}.json").write_text(json.dumps(second, ensure_ascii=False), encoding="utf-8")
+            app.jobs.pop(self.job_id, None)
+            app.jobs.pop(second_id, None)
+            items = app._list_library("ニューラル")
+
+        app.jobs.pop(second_id, None)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], self.job_id)
+        self.assertEqual(items[0]["reading_status"], "unread")
+
+    def test_library_backup_restore_adds_new_files_without_overwrite(self):
+        backup = io.BytesIO()
+        job_payload = {**self.payload, "segments": [Segment(0, 1, "Backup source", "復元").__dict__]}
+        with zipfile.ZipFile(backup, "w") as bundle:
+            bundle.writestr(
+                "backup-manifest.json",
+                json.dumps({"format": "plamo-paper-translator-library", "version": 1}),
+            )
+            bundle.writestr(f"data/jobs/{self.job_id}.json", json.dumps(job_payload, ensure_ascii=False))
+            bundle.writestr("data/uploads/document.md", "# Backup source")
+        backup.seek(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for child in ("jobs", "uploads", "assets"):
+                (root / child).mkdir()
+            with (
+                patch.object(app, "DATA_DIR", root),
+                patch.object(app, "JOB_DIR", root / "jobs"),
+                patch.object(app, "UPLOAD_DIR", root / "uploads"),
+                patch.object(app, "ASSET_DIR", root / "assets"),
+            ):
+                result = app._restore_library_backup(backup)
+                first_text = (root / "jobs" / f"{self.job_id}.json").read_text(encoding="utf-8")
+                backup.seek(0)
+                repeated = app._restore_library_backup(backup)
+                second_text = (root / "jobs" / f"{self.job_id}.json").read_text(encoding="utf-8")
+
+        self.assertEqual(result["restored_jobs"], 1)
+        self.assertEqual(result["restored_files"], 2)
+        self.assertEqual(repeated["restored_files"], 0)
+        self.assertEqual(repeated["skipped_files"], 2)
+        self.assertEqual(first_text, second_text)
+
+    def test_library_backup_restore_rejects_path_traversal(self):
+        backup = io.BytesIO()
+        with zipfile.ZipFile(backup, "w") as bundle:
+            bundle.writestr(
+                "backup-manifest.json",
+                json.dumps({"format": "plamo-paper-translator-library", "version": 1}),
+            )
+            bundle.writestr("data/jobs/../../escape.json", "{}")
+        backup.seek(0)
+        with self.assertRaises(ValueError):
+            app._validated_backup_members(zipfile.ZipFile(backup))
+
+    def test_manual_translation_keeps_revision_history(self):
+        job = dict(self.payload)
+        job["updated_at"] = "2026-11-09T00:00:00+00:00"
+        job["segments"] = [Segment(0, 1, "Source", "最初の訳", translation_origin="model")]
+        segment = app._replace_segment_translation(job, 0, "修正した訳", "manual")
+
+        self.assertEqual(segment.translation, "修正した訳")
+        self.assertEqual(segment.translation_origin, "manual")
+        self.assertEqual(segment.translation_revisions[0]["translation"], "最初の訳")
+        self.assertEqual(segment.translation_revisions[0]["origin"], "model")
+        with self.assertRaises(ValueError):
+            app._replace_segment_translation(job, 0, " ", "manual")
+
+    def test_single_segment_retranslation_reuses_job_options(self):
+        job = dict(self.payload)
+        job.update({"status": "completed", "context": "研究分野", "glossary": [{"source": "term", "target": "用語"}]})
+        job["segments"] = [Segment(0, 1, "Translate this term.", "旧訳", paragraph=1)]
+        fake_translator = Mock()
+        fake_translator.health.return_value = True
+        fake_translator.translate.return_value = "新しい訳"
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(app, "JOB_DIR", Path(directory)),
+            patch.object(app, "translator", fake_translator),
+        ):
+            segment = app._retranslate_segment(self.job_id, job, 0)
+
+        self.assertEqual(segment.translation, "新しい訳")
+        self.assertEqual(segment.translation_revisions[0]["translation"], "旧訳")
+        fake_translator.translate.assert_called_once()
+        options = fake_translator.translate.call_args.kwargs
+        self.assertEqual(options["target_lang"], "ja")
+        self.assertEqual(options["glossary"], [{"source": "term", "target": "用語"}])
+        self.assertIn("研究分野", options["context"])
+
+    def test_translation_quality_check_finds_common_issues(self):
+        job = dict(self.payload)
+        job["source_lang"] = "en"
+        job["target_lang"] = "ja"
+        job["glossary"] = [{"source": "term", "target": "用語"}]
+        job["segments"] = [
+            Segment(0, 1, "This sentence has no translation."),
+            Segment(1, 1, "Accuracy was 42.0% for this term.", "モデル精度を示した。"),
+            Segment(2, 1, "This sentence remains exactly the same after translation.", "This sentence remains exactly the same after translation."),
+            Segment(3, 1, "x = 42", "x = 42", kind="equation", assets=["/api/assets/a/equation.png"]),
+        ]
+
+        issues = app._translation_quality_issues(job)
+        issue_types = {(issue["index"], issue["type"]) for issue in issues}
+
+        self.assertIn((0, "missing"), issue_types)
+        self.assertIn((1, "number"), issue_types)
+        self.assertIn((1, "glossary"), issue_types)
+        self.assertIn((2, "unchanged"), issue_types)
+        self.assertFalse(any(issue["index"] == 3 for issue in issues))
+
+    def test_source_url_is_suggested_from_arxiv_or_doi(self):
+        self.assertEqual(
+            app._suggest_source_url("2302.14165v2.pdf", [Segment(0, 1, "Paper")]),
+            "https://arxiv.org/abs/2302.14165",
+        )
+        self.assertEqual(
+            app._suggest_source_url("paper.pdf", [Segment(0, 1, "DOI: 10.1145/3544548.3580816.")]),
+            "https://doi.org/10.1145/3544548.3580816",
+        )
+
 
 class NativeMessagingTests(unittest.TestCase):
     def test_frozen_launcher_config_selects_matching_app_home(self):
@@ -208,6 +365,23 @@ class NativeMessagingTests(unittest.TestCase):
         options = popen.call_args.kwargs
         self.assertEqual(command, [r"C:\App\PLaMoPaperTranslator.exe", "--no-browser"])
         self.assertEqual(options["env"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+
+
+class LlamaProcessTests(unittest.TestCase):
+    def test_start_waits_for_existing_loading_process(self):
+        process = app.LlamaProcess()
+        process.process = Mock()
+        process.process.poll.return_value = None
+        fake_translator = Mock()
+        fake_translator.health.side_effect = [False, True]
+        with (
+            patch.object(app, "translator", fake_translator),
+            patch.object(app.subprocess, "Popen") as popen,
+        ):
+            process.start()
+
+        popen.assert_not_called()
+        self.assertEqual(process.error, "")
 
 
 if __name__ == "__main__":

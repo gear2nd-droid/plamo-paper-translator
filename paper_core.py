@@ -93,10 +93,18 @@ class Segment:
     heading_level: int = 0
     paragraph: int = 0
     sentence: int = 0
+    translation_revisions: list[dict[str, str]] = field(default_factory=list)
+    translation_edited_at: str = ""
+    translation_origin: str = ""
 
     def __post_init__(self) -> None:
         allowed_clip_parts = {"source", "translation", "note"}
         self.clips = list(dict.fromkeys(part for part in self.clips if part in allowed_clip_parts))
+        self.translation_revisions = [
+            {str(key): str(value) for key, value in revision.items()}
+            for revision in self.translation_revisions[-20:]
+            if isinstance(revision, dict)
+        ]
         if self.clipped and not self.clips:
             self.clips = ["source"]
         self.clipped = bool(self.clips)

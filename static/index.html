@@ -22,6 +22,8 @@
       </div>
     </div>
     <div class="topbar-right">
+      <button id="libraryButton" class="library-button" type="button"><span aria-hidden="true">▤</span> ライブラリ</button>
+      <button id="qualityButton" class="quality-button hidden" type="button"><span aria-hidden="true">✓</span> 翻訳検査 <small id="qualityCount"></small></button>
       <button id="paperSummaryButton" class="paper-summary-button hidden" type="button"><span aria-hidden="true">✎</span> まとめ <small id="paperSummaryCount"></small></button>
       <div id="engineBadge" class="engine-badge waiting"><i></i><span>エンジン確認中</span></div>
     </div>
@@ -61,6 +63,7 @@
           <div class="panel-heading"><span>STEP 02</span><h2>訳し方を整える</h2><p>論文タイトルと専門用語を渡すと、一貫性が上がります。</p></div>
           <div class="form-grid">
             <label class="field full"><span>論文タイトル</span><input id="title" type="text" placeholder="Paper title"></label>
+            <label class="field full"><span>原文URL / DOI <i>任意・後から編集できます</i></span><input id="sourceUrl" type="url" maxlength="2000" placeholder="https://arxiv.org/abs/..."></label>
             <fieldset class="mode-switch full">
               <legend>分割モード</legend>
               <label><input type="radio" name="segmentationMode" value="sentence" checked><span><b>一文単位</b><small>一文ずつ対訳し、同じ段落の前後文を参考にします</small></span></label>
@@ -87,6 +90,10 @@
               <section>
                 <div class="navigation-heading"><span>OUTLINE</span><h3>目次</h3></div>
                 <nav id="tableOfContents" class="toc-list" aria-label="論文の目次"></nav>
+              </section>
+              <section>
+                <div class="navigation-heading"><span>VISUALS</span><h3>図表・数式</h3></div>
+                <nav id="visualList" class="visual-list" aria-label="図表と数式の一覧"></nav>
               </section>
             </aside>
             <div class="reader-content">
@@ -119,10 +126,44 @@
       </header>
       <label class="dialog-field"><span>タグ <small>カンマ・改行区切り／最大20件</small></span><input id="paperTags" type="text" maxlength="1000" placeholder="例：LLM, 機械翻訳, 評価手法"></label>
       <div id="paperTagPreview" class="paper-tag-preview" aria-live="polite"></div>
-      <label class="dialog-field"><span>概要 <small id="paperSummaryLength">0 / 20,000</small></span><textarea id="paperSummaryText" rows="12" maxlength="20000" placeholder="論文の目的、提案手法、重要な結果、今後確認したい点などを記録します。"></textarea></label>
+      <div class="dialog-field-grid">
+        <label class="dialog-field"><span>原文URL / DOI</span><input id="paperSourceUrl" type="url" maxlength="2000" placeholder="https://arxiv.org/abs/..."></label>
+        <label class="dialog-field"><span>読書状態</span><select id="paperReadingStatus"><option value="unread">未読</option><option value="reading">読書中</option><option value="completed">読了</option><option value="archived">保留</option></select></label>
+      </div>
+      <label class="dialog-field"><span>概要 <span class="summary-field-actions"><button id="paperSummaryTemplate" type="button">研究ノート雛形</button><small id="paperSummaryLength">0 / 20,000</small></span></span><textarea id="paperSummaryText" rows="12" maxlength="20000" placeholder="論文の目的、提案手法、重要な結果、今後確認したい点などを記録します。"></textarea></label>
       <p id="paperSummaryStatus" class="dialog-status">このPC内の翻訳ジョブに保存されます。</p>
       <div class="dialog-actions"><button id="paperSummaryCancel" class="secondary small" type="button">キャンセル</button><button id="paperSummarySave" class="primary small" type="submit">保存</button></div>
     </form>
+  </dialog>
+  <dialog id="libraryDialog" class="library-dialog" aria-labelledby="libraryTitle">
+    <section>
+      <header>
+        <div><span>PAPER LIBRARY</span><h2 id="libraryTitle">論文ライブラリ</h2><p id="libraryCount">保存済みの論文を読み込んでいます…</p></div>
+        <button id="libraryClose" class="dialog-close" type="button" aria-label="閉じる">×</button>
+      </header>
+      <div class="library-controls">
+        <label><span>横断検索</span><input id="librarySearch" type="search" placeholder="タイトル・タグ・概要・原文・訳文・メモ"></label>
+        <label><span>読書状態</span><select id="libraryStatus"><option value="all">すべて</option><option value="unread">未読</option><option value="reading">読書中</option><option value="completed">読了</option><option value="archived">保留</option></select></label>
+        <a id="libraryBackup" class="secondary small" href="/api/library/backup" download>ZIPバックアップ</a>
+        <label class="library-restore secondary small"><input id="libraryRestoreFile" type="file" accept=".zip,application/zip">ZIPから復元</label>
+      </div>
+      <p id="libraryDataDir" class="library-data-dir"></p>
+      <div id="libraryItems" class="library-items" aria-live="polite"></div>
+    </section>
+  </dialog>
+  <dialog id="revisionDialog" class="revision-dialog" aria-labelledby="revisionTitle">
+    <section>
+      <header><div><span>TRANSLATION HISTORY</span><h2 id="revisionTitle">訳文の変更履歴</h2></div><button id="revisionClose" class="dialog-close" type="button" aria-label="閉じる">×</button></header>
+      <article class="revision-current"><b>現在の訳文</b><p id="revisionCurrent"></p></article>
+      <div id="revisionItems" class="revision-items"></div>
+    </section>
+  </dialog>
+  <dialog id="qualityDialog" class="quality-dialog" aria-labelledby="qualityTitle">
+    <section>
+      <header><div><span>TRANSLATION CHECK</span><h2 id="qualityTitle">翻訳の機械チェック</h2><p id="qualitySummary">検査しています…</p></div><button id="qualityClose" class="dialog-close" type="button" aria-label="閉じる">×</button></header>
+      <p class="quality-note">投稿前の校正を置き換えるものではありません。数値・用語・未翻訳など、機械的に見つけられる候補を表示します。</p>
+      <div id="qualityItems" class="quality-items" aria-live="polite"></div>
+    </section>
   </dialog>
   <div id="toast" class="toast"></div>
   <script src="/app.js"></script>
