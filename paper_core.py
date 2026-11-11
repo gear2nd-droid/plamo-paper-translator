@@ -29,6 +29,9 @@ CAPTION_MARKER = "\uE100"
 BODY_MARKER = "\uE101"
 EQUATION_MARKER = "\uE102"
 EQUATION_MARKER_PATTERN = re.compile(rf"^{re.escape(EQUATION_MARKER)}(\d{{1,3}}):\s*")
+# Prefix for a heading verified by its font size in the PDF layout, such as an
+# appendix heading "A Proofs" that has no punctuation after the letter.
+HEADING_MARKER = "\uE103"
 PLAMO_LICENSE_URL = "https://plamo.preferredai.jp/info/plamo-community-license-ja"
 PLAMO_ATTRIBUTION = "Built with PLaMo"
 
@@ -43,15 +46,44 @@ SECTION_NAME_PATTERN = re.compile(
 NUMBERED_SECTION_PATTERN = re.compile(r"^(\d+(?:\.\d+){0,5})\.?\s+(.{1,110})$")
 ROMAN_SECTION_PATTERN = re.compile(r"^([IVXLC]+)[.)]\s+(.{1,110})$")
 LETTER_SECTION_PATTERN = re.compile(r"^([A-Z])[.)]\s+(.{1,110})$")
+LAYOUT_LETTER_HEADING_PATTERN = re.compile(r"^[A-Z]\s+[A-Z0-9][^.,;:!?]{0,100}$")
+APPENDIX_HEADING_PATTERN = re.compile(
+    r"^(?:(?i:appendix|appendices|supplementary)|[A-Z](?:\.\d+)*[.)]?\s+[A-Z0-9])"
+)
+HEADING_MATH_PATTERN =re.compile(r"[=<>≤≥≈≠∑∫√±×·∈∀∪∩⊂^_{}|]")
+
+
+def _numbered_title_is_heading(number: str, raw_number: str, title: str) -> bool:
+    """Reject numbered list items and display equations that look like headings."""
+    if not title or re.search(r"[.!?。！？]", title):
+        return False
+    if HEADING_MATH_PATTERN.search(title) or re.search(r"\(\d{1,3}\)$", title):
+        # "72 pt/in = 3 (4)": the denominator line of a numbered equation.
+        return False
+    if re.match(r"^[a-z]", title):
+        # "1. create a virtual environment": an enumerated step, not a section.
+        return False
+    if "." not in number and raw_number.endswith("."):
+        words = re.findall(r"[A-Za-z][A-Za-z'-]*", title)
+        lowercase = [word for word in words if len(word) > 3 and word[0].islower()]
+        if len(words) >= 6 and len(lowercase) * 2 > len([word for word in words if len(word) > 3]):
+            # A wrapped list item in sentence case, e.g. "2. Download the
+            # CUDA build of llama.cpp when an NVIDIA GPU is present".
+            return False
+    return True
 
 
 def heading_level(text: str) -> int:
     """Infer a section depth from a normalized academic-paper heading."""
     compact = text.strip().removeprefix(CAPTION_MARKER).removeprefix(BODY_MARKER)
     compact = EQUATION_MARKER_PATTERN.sub("", compact).strip()
+    layout_verified = compact.startswith(HEADING_MARKER)
+    compact = compact.removeprefix(HEADING_MARKER).strip()
     if not compact or len(compact) > 120:
         return 0
     if SECTION_NAME_PATTERN.fullmatch(compact):
+        return 1
+    if layout_verified and LAYOUT_LETTER_HEADING_PATTERN.fullmatch(compact):
         return 1
     japanese = re.match(r"^第\s*\d+\s*(章|節|項)\s*(.*)$", compact)
     if japanese:
@@ -59,7 +91,8 @@ def heading_level(text: str) -> int:
     numbered = NUMBERED_SECTION_PATTERN.fullmatch(compact)
     if numbered:
         title = numbered.group(2).strip().rstrip(".。")
-        if title and not re.search(r"[.!?。！？]", title):
+        raw_number = compact[: numbered.end(1) + 1].strip()
+        if _numbered_title_is_heading(numbered.group(1), raw_number, title):
             return min(6, numbered.group(1).count(".") + 1)
     roman = ROMAN_SECTION_PATTERN.fullmatch(compact)
     if roman:
@@ -321,6 +354,34 @@ def _mark_caption_boundaries(text: str, caption_source: str | list[str]) -> str:
     return text
 
 
+def _positioned_letter_headings(fragments: list[LayoutFragment]) -> list[str]:
+    """Find appendix headings such as "A HTTP Interface" set in a large font.
+
+    Without punctuation after the letter, the text alone cannot be told apart
+    from a wrapped line starting with "A", so the font size must confirm it.
+    """
+    weights: Counter[float] = Counter()
+    for fragment in fragments:
+        weights[round(fragment.size, 1)] += len(fragment.text.strip())
+    if not weights:
+        return []
+    body_size = weights.most_common(1)[0][0]
+    headings: list[str] = []
+    for fragment in fragments:
+        value = re.sub(r"\s+", " ", fragment.text).strip()
+        if fragment.size >= body_size * 1.15 and LAYOUT_LETTER_HEADING_PATTERN.fullmatch(value):
+            if len(value.split()) <= 10:
+                headings.append(value)
+    return headings
+
+
+def _mark_heading_boundaries(text: str, headings: list[str]) -> str:
+    for heading in headings:
+        pattern = r"(?m)^[ \t]*" + r"\s+".join(re.escape(token) for token in heading.split()) + r"[ \t]*$"
+        text = re.sub(pattern, lambda _match: f"\n\n{HEADING_MARKER}{heading}\n\n", text, count=1)
+    return text
+
+
 def _layout_line_is_prose(fragments: list[LayoutFragment]) -> bool:
     value = " ".join(fragment.text.strip() for fragment in fragments if fragment.text.strip())
     math_symbols = len(re.findall(r"[=∑∫√±≤≥≈≠∞∂∇α-ωΑ-Ω^_{}|×·∈∀∪∩⊂]", value))
@@ -332,6 +393,42 @@ def _layout_line_is_prose(fragments: list[LayoutFragment]) -> bool:
     )
     prose_lead_in = len(words) >= 2 and bool(re.search(r"(?:\b(?:as|and|by)|:)\s*$", value, re.I))
     return has_long_prose_fragment or prose_lead_in or (len(words) >= 5 and math_symbols < 2)
+
+
+def _equation_number_of(text: str) -> int | None:
+    """Return N for an equation-number fragment "(N)".
+
+    The number can share a fragment with the end of the equation, as in
+    " 3 (4)" after a fraction, so a short prefix is allowed.
+    """
+    match = re.fullmatch(r"(?:(.{1,12})\s+)?\((\d{1,3})\)", text.strip())
+    if not match or re.search(r"[A-Za-z]{3,}", match.group(1) or ""):
+        return None
+    return int(match.group(2))
+
+
+def _is_lead_in_fragment(fragment: LayoutFragment, line: list[LayoutFragment], text_left: float | None) -> bool:
+    """A prose word such as "shows" set flush-left, well apart from a display.
+
+    A wide equation can also start at the text edge ("max ..."), but its next
+    symbol follows immediately, whereas a lead-in is followed by a gap.
+    """
+    if text_left is None or abs(fragment.x - text_left) > 1.5:
+        return False
+    if not re.fullmatch(r"[A-Za-z]{2,}[A-Za-z ,'-]*", fragment.text.strip()):
+        return False
+    estimated_end = fragment.x + 0.5 * fragment.size * len(fragment.text.strip())
+    following = [item.x for item in line if item.x > fragment.x]
+    return not following or min(following) - estimated_end > 2 * fragment.size
+
+
+def _flush_left_prose(line: list[LayoutFragment], text_left: float | None) -> bool:
+    """A short prose line such as "ment i, the application enforces"."""
+    if text_left is None or min(fragment.x for fragment in line) > text_left + 1.5:
+        return False
+    value = " ".join(fragment.text.strip() for fragment in line)
+    words = re.findall(r"[A-Za-z]{2,}", value)
+    return len(words) >= 2 and not re.search(r"[=∑∫√±≤≥≈≠∈∀∪∩⊂^_{}|×·]", value)
 
 
 def _positioned_equations(
@@ -353,11 +450,14 @@ def _positioned_equations(
             else:
                 lines.append([fragment])
         line_y = [sum(fragment.y for fragment in line) / len(line) for line in lines]
+        # The left edge of running text in this column. Display equations are
+        # indented, so a word at this edge next to an equation is a lead-in.
+        prose_starts = Counter(round(min(item.x for item in line)) for line in lines if _layout_line_is_prose(line))
+        text_left = float(prose_starts.most_common(1)[0][0]) if prose_starts else None
         number_locations: list[tuple[int, LayoutFragment]] = []
         for line_index, line in enumerate(lines):
             for fragment in line:
-                match = re.fullmatch(r"\((\d{1,3})\)", fragment.text.strip())
-                if not match:
+                if _equation_number_of(fragment.text) is None:
                     continue
                 near_right = fragment.x >= column_left + (column_right - column_left) * 0.55
                 if near_right and not _layout_line_is_prose(line):
@@ -372,11 +472,11 @@ def _positioned_equations(
                     if abs(line_y[cursor] - previous_y) > 20.5:
                         break
                     if any(
-                        re.fullmatch(r"\(\d{1,3}\)", item.text.strip()) and item is not number_fragment
+                        _equation_number_of(item.text) is not None and item is not number_fragment
                         for item in lines[cursor]
                     ):
                         break
-                    if _layout_line_is_prose(lines[cursor]):
+                    if _layout_line_is_prose(lines[cursor]) or _flush_left_prose(lines[cursor], text_left):
                         break
                     compact_line = "".join(item.text.strip() for item in lines[cursor])
                     next_cursor = cursor + direction
@@ -389,6 +489,8 @@ def _positioned_equations(
                     )
                     if (
                         0 <= next_cursor < len(lines)
+                        and re.search(r"[A-Za-z]", compact_line)
+                        and abs(line_y[next_cursor] - line_y[cursor]) <= 8
                         and re.search(r"\bmodel\b", paired_value, re.I)
                         and _layout_line_is_prose(lines[cursor] + lines[next_cursor])
                     ):
@@ -410,6 +512,13 @@ def _positioned_equations(
                     cursor += direction
 
             block_fragments = [fragment for index in selected for fragment in lines[index]]
+            lead_ins = [
+                fragment
+                for index in selected
+                for fragment in lines[index]
+                if fragment is not number_fragment and _is_lead_in_fragment(fragment, lines[index], text_left)
+            ]
+            block_fragments = [fragment for fragment in block_fragments if fragment not in lead_ins]
             block_fragments.sort(key=lambda item: item.order)
             block_text = re.sub(r"\s+", " ", "".join(fragment.text for fragment in block_fragments)).strip()
             if not block_text:
@@ -417,17 +526,36 @@ def _positioned_equations(
             # The text matrix of a fragment can omit leading positioning
             # spaces. Use the full column width so the printed equation
             # number is never clipped; the rendered bitmap is trimmed later.
+            # A flush-left lead-in word ("shows") is cut off on the left.
+            # The crop starts at this column's text edge, so the end of a
+            # line in the other column never enters the image.
             x0 = max(0.0, column_left - 4)
+            if text_left is not None:
+                x0 = max(x0, min([text_left] + [fragment.x for fragment in block_fragments]) - 4)
+            if lead_ins:
+                x0 = max(x0, min(fragment.x for fragment in block_fragments) - 6)
             x1 = min(page_width, column_right + 4)
             y0 = max(0.0, min(fragment.y - fragment.size * 0.35 for fragment in block_fragments) - 0.5)
             y1 = max(fragment.y + fragment.size for fragment in block_fragments) + 1
             highest_selected_y = max(line_y[index] for index in selected)
+            lowest_selected_y = min(line_y[index] for index in selected)
+            # A text chunk reports the baseline where it starts, so a fraction
+            # numerator drawn later in the same chunk can sit higher than any
+            # reported position. Extend the crop, but stop short of the
+            # neighbouring lines; the bitmap is trimmed to its ink later.
+            font_size = max(fragment.size for fragment in block_fragments)
+            lines_above = [line_y[index] for index in range(len(lines)) if line_y[index] > highest_selected_y]
+            lines_below = [line_y[index] for index in range(len(lines)) if line_y[index] < lowest_selected_y]
+            top_limit = min(lines_above) - font_size * 0.3 if lines_above else highest_selected_y + font_size * 1.6
+            bottom_limit = max(lines_below) + font_size * 0.8 if lines_below else lowest_selected_y - font_size * 0.9
+            y1 = max(y1, min(highest_selected_y + font_size * 1.6, top_limit))
+            y0 = max(0.0, min(y0, max(lowest_selected_y - font_size * 0.9, bottom_limit)))
             trim_top_context = any(
                 index not in selected and highest_selected_y < line_y[index] <= y1 for index in range(len(lines))
             )
             equations.append(
                 PositionedEquation(
-                    number=int(number_fragment.text.strip()[1:-1]),
+                    number=_equation_number_of(number_fragment.text) or 0,
                     text=block_text,
                     x0=x0,
                     y0=y0,
@@ -451,6 +579,17 @@ def _mark_equation_boundaries(text: str, equations: list[PositionedEquation]) ->
                 rf"[\s\S]{{0,3000}}?"
                 rf"{r'\s*'.join(re.escape(character) for character in compact_equation[-12:])}"
             )
+        # Plain extraction can order a fraction or a superscript line
+        # differently from the layout ("σ = 216 dpi / 72 pt/in = 3 (4)"). Fall
+        # back to the start of the equation and its printed number, within
+        # one paragraph.
+        span = len(compact_equation) * 2 + 40
+        for anchor_size in (8, 5):
+            if len(compact_equation) > anchor_size + 4:
+                patterns.append(
+                    rf"{r'\s*'.join(re.escape(character) for character in compact_equation[:anchor_size])}"
+                    rf"(?:(?!\n\s*\n)[\s\S]){{0,{span}}}?\(\s*{equation.number}\s*\)"
+                )
         for pattern in patterns:
             text, replacements = re.subn(
                 pattern,
@@ -631,6 +770,11 @@ def _block_kind(text: str) -> str:
     letters = len(re.findall(r"[A-Za-z\u3040-\u30ff\u3400-\u9fff]", compact))
     if math_symbols >= 2 and (letters < 30 or math_symbols / max(len(compact), 1) > 0.08):
         return "equation"
+    if re.match(r"^\[\d{1,4}\]\s", compact):
+        # A numbered reference entry is prose even when it is full of years,
+        # volumes and page numbers. Sentence splitting then separates "[2]"
+        # from a preceding "[1]" entry in the same paragraph.
+        return "sentence"
     numeric_tokens = len(re.findall(r"(?<!\w)[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?!\w)", compact))
     if numeric_tokens >= 5 and numeric_tokens >= max(3, len(compact.split()) // 4):
         return "table"
@@ -680,7 +824,7 @@ def split_document_units(
         equation_match = EQUATION_MARKER_PATTERN.match(block)
         equation_number = int(equation_match.group(1)) if equation_match else 0
         force_sentence = block.startswith(BODY_MARKER)
-        clean_block = block.replace(CAPTION_MARKER, "").replace(BODY_MARKER, "")
+        clean_block = block.replace(CAPTION_MARKER, "").replace(BODY_MARKER, "").replace(HEADING_MARKER, "")
         clean_block = EQUATION_MARKER_PATTERN.sub("", clean_block)
         split_as_sentences = kind in {"sentence", "figure"} or (
             kind == "table" and re.match(r"^Table\s*\d+", clean_block, re.I)
@@ -982,6 +1126,32 @@ def _remove_fragment_once(text: str, value: str, *, from_end: bool) -> str:
     return text[: match.start()] + "\n" + text[match.end() :]
 
 
+def _page_number_candidates_at_edges(
+    candidates: list[tuple[str, str]],
+    fragments: list[LayoutFragment],
+) -> list[tuple[str, str]]:
+    """Keep a bare-number margin candidate only when it is the outermost text.
+
+    A small subscript digit, such as the "1" in a sum bound near the bottom
+    of a page, is not a page number. Removing it would also delete the same
+    digit elsewhere, for example turning "(11)" into "(1 )".
+    """
+    if not fragments:
+        return candidates
+    lowest = min(fragment.y for fragment in fragments)
+    highest = max(fragment.y for fragment in fragments)
+    edge_values = {
+        fragment.text
+        for fragment in fragments
+        if fragment.y <= lowest + 2 or fragment.y >= highest - 2
+    }
+    return [
+        (value, zone)
+        for value, zone in candidates
+        if _margin_key(value) != "__page_number__" or value in edge_values
+    ]
+
+
 def _strip_repeated_margin_fragments(
     text: str,
     candidates: list[tuple[str, str]],
@@ -1092,6 +1262,11 @@ def _merge_reference_entries(segments: list[Segment]) -> list[Segment]:
 
     for index, segment in enumerate(tail):
         next_is_year = index + 1 < len(tail) and bool(year_pattern.fullmatch(tail[index + 1].source.strip()))
+        if segment.kind == "heading" and APPENDIX_HEADING_PATTERN.match(segment.source.strip()):
+            # An appendix after the bibliography is body text again.
+            flush()
+            result.extend(tail[index:])
+            return result
         if segment.label == "asset":
             flush()
             result.append(segment)
@@ -1166,6 +1341,7 @@ def extract_document(
                         margin_candidates.append((value, "top"))
 
                 raw = page.extract_text(visitor_text=collect_fragment) or ""
+                margin_candidates = _page_number_candidates_at_edges(margin_candidates, layout_fragments)
             except TypeError:
                 fragments = []
                 layout_fragments = []
@@ -1188,6 +1364,7 @@ def extract_document(
             if layout_fragments:
                 positioned_equations = _positioned_equations(layout_fragments, float(page.mediabox.width))
                 raw = _mark_equation_boundaries(raw, positioned_equations)
+                raw = _mark_heading_boundaries(raw, _positioned_letter_headings(layout_fragments))
             normalized = _normalize_block(raw, captions_marked=bool(fragments))
             page_start = len(segments)
             units = split_document_units(
