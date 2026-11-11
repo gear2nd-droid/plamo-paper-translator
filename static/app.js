@@ -499,6 +499,8 @@ function renderLibraryItem(item) {
   const summary = String(item.summary || '').trim();
   const progress = Math.max(0, Math.min(100, Number(item.reading_progress) || 0));
   const source = item.source_url ? `<a class="library-source" href="${escapeHtml(item.source_url)}" target="_blank" rel="noreferrer">原文を開く ↗</a>` : '';
+  const busy = item.status === 'queued' || item.status === 'running';
+  const deleteButton = `<button type="button" class="library-delete" data-library-delete="${escapeHtml(item.id)}" data-library-title="${escapeHtml(item.title || 'Untitled')}"${busy ? ' disabled title="翻訳中は削除できません"' : ''}>削除</button>`;
   return `<article class="library-card">
     <div class="library-card-main"><h3>${escapeHtml(item.title || 'Untitled')}</h3>
       <div class="library-card-meta"><span class="library-state">${escapeHtml(READING_STATUS_LABELS[item.reading_status] || item.reading_status)}</span><span>${Number(item.total) || 0}セグメント</span><span>更新 ${escapeHtml(formatLibraryDate(item.updated_at || item.created_at))}</span></div>
@@ -507,7 +509,7 @@ function renderLibraryItem(item) {
       ${item.match ? `<p class="library-match">${escapeHtml(item.match)}</p>` : ''}
       <div class="library-progress" title="読書位置 ${progress}%"><i style="width:${progress}%"></i></div>
     </div>
-    <div class="library-card-actions"><button type="button" class="library-open" data-library-job="${escapeHtml(item.id)}">続きから読む</button>${source}</div>
+    <div class="library-card-actions"><button type="button" class="library-open" data-library-job="${escapeHtml(item.id)}">続きから読む</button>${source}${deleteButton}</div>
   </article>`;
 }
 
@@ -565,6 +567,54 @@ function openLibraryJob(jobId) {
   if (!/^[a-f0-9]{32}$/.test(jobId || '')) return;
   localStorage.setItem(JOB_STORAGE_KEY, jobId);
   location.href = `/?job=${encodeURIComponent(jobId)}`;
+}
+
+function openDeleteDialog(jobId, title) {
+  if (!/^[a-f0-9]{32}$/.test(jobId || '')) return;
+  state.deleteJobId = jobId;
+  $('deletePaperTitle').textContent = title || 'Untitled';
+  $('deleteStatus').textContent = '';
+  $('deleteStatus').className = 'dialog-status';
+  $('deleteConfirm').disabled = false;
+  $('deleteCancel').disabled = false;
+  $('deleteDialog').showModal();
+  $('deleteCancel').focus();
+}
+
+function closeDeleteDialog() {
+  if ($('deleteConfirm').disabled) return;
+  state.deleteJobId = null;
+  if ($('deleteDialog').open) $('deleteDialog').close();
+}
+
+async function deleteLibraryJob() {
+  const jobId = state.deleteJobId;
+  if (!jobId) return;
+  $('deleteConfirm').disabled = true;
+  $('deleteCancel').disabled = true;
+  $('deleteStatus').className = 'dialog-status saving';
+  $('deleteStatus').textContent = '削除しています…';
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {method:'DELETE'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '論文を削除できません');
+    if (localStorage.getItem(JOB_STORAGE_KEY) === jobId) localStorage.removeItem(JOB_STORAGE_KEY);
+    if (state.jobId === jobId) {
+      // The open paper no longer exists; start over with the library shown.
+      location.href = '/?library=1';
+      return;
+    }
+    $('deleteConfirm').disabled = false;
+    $('deleteCancel').disabled = false;
+    closeDeleteDialog();
+    toast('論文を削除しました');
+    await loadLibrary();
+  } catch (error) {
+    $('deleteConfirm').disabled = false;
+    $('deleteCancel').disabled = false;
+    $('deleteStatus').className = 'dialog-status error';
+    $('deleteStatus').textContent = error.message || '論文を削除できません';
+  }
 }
 
 function applyBookmark(index, bookmarked) {
@@ -927,6 +977,11 @@ $('libraryButton').addEventListener('click', openLibraryDialog);
 $('libraryClose').addEventListener('click', closeLibraryDialog);
 $('libraryDialog').addEventListener('click', (event) => { if (event.target === $('libraryDialog')) closeLibraryDialog(); });
 $('libraryItems').addEventListener('click', (event) => {
+  const deleteButton = event.target.closest('[data-library-delete]');
+  if (deleteButton) {
+    openDeleteDialog(deleteButton.dataset.libraryDelete, deleteButton.dataset.libraryTitle);
+    return;
+  }
   const button = event.target.closest('[data-library-job]');
   if (button) openLibraryJob(button.dataset.libraryJob);
 });
@@ -935,6 +990,10 @@ $('librarySearch').addEventListener('input', () => {
   state.librarySearchTimer = setTimeout(loadLibrary, 260);
 });
 $('libraryStatus').addEventListener('change', loadLibrary);
+$('deleteForm').addEventListener('submit', (event) => { event.preventDefault(); deleteLibraryJob(); });
+$('deleteCancel').addEventListener('click', closeDeleteDialog);
+$('deleteDialog').addEventListener('cancel', (event) => { event.preventDefault(); closeDeleteDialog(); });
+$('deleteDialog').addEventListener('click', (event) => { if (event.target === $('deleteDialog')) closeDeleteDialog(); });
 $('libraryRestoreFile').addEventListener('change', (event) => restoreLibrary(event.target.files[0]));
 $('qualityButton').addEventListener('click', openQualityDialog);
 $('qualityClose').addEventListener('click', closeQualityDialog);
@@ -1037,5 +1096,20 @@ function resumeJob() {
   pollJob();
 }
 
-updateEngine(); setInterval(updateEngine, 5000); resumeJob();
+function showLaunchNotice() {
+  const params = new URLSearchParams(location.search);
+  const notice = params.get('notice');
+  if (!notice) return;
+  const messages = {
+    restarted: 'アプリを再起動しました',
+    'restart-busy': '翻訳中のため再起動せずに開きました。翻訳の完了後にもう一度押すと再起動します',
+    'restart-failed': '再起動できなかったため、起動中のアプリを開きました。Chromeランチャーの登録を確認してください',
+  };
+  if (messages[notice]) toast(messages[notice]);
+  params.delete('notice');
+  const query = params.toString();
+  history.replaceState(null, '', `${location.pathname}${query ? `?${query}` : ''}${location.hash}`);
+}
+
+showLaunchNotice(); updateEngine(); setInterval(updateEngine, 5000); resumeJob();
 if (new URLSearchParams(location.search).get('library') === '1') openLibraryDialog();

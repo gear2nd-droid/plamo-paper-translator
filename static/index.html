@@ -4,13 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>PLaMo Paper Translator</title>
+  <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+  <link rel="icon" type="image/png" href="/icon.png" sizes="256x256">
+  <link rel="apple-touch-icon" href="/icon.png">
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
   <header class="topbar">
     <div class="topbar-left">
       <a class="brand" href="/">
-        <span class="brand-mark">P</span>
+        <img class="brand-mark" src="/icon.png" alt="" width="38" height="38">
         <span><b>PLaMo Paper Translator</b><small>論文を、手元のPCで。</small></span>
       </a>
       <button id="referenceBack" class="reference-back hidden" type="button" aria-label="参照ジャンプ前の位置へ戻る"><span aria-hidden="true">←</span> 戻る</button>
@@ -150,6 +153,19 @@
       <p id="libraryDataDir" class="library-data-dir"></p>
       <div id="libraryItems" class="library-items" aria-live="polite"></div>
     </section>
+  </dialog>
+  <dialog id="deleteDialog" class="confirm-dialog" aria-labelledby="deleteTitle" aria-describedby="deleteMessage">
+    <form id="deleteForm" method="dialog">
+      <header><div><span>DELETE PAPER</span><h2 id="deleteTitle">論文を削除しますか？</h2></div></header>
+      <p id="deleteMessage" class="confirm-message">「<b id="deletePaperTitle"></b>」をライブラリから削除します。</p>
+      <ul class="confirm-list">
+        <li>訳文・メモ・ブックマーク・クリップ・まとめ・訳文の変更履歴</li>
+        <li>読み込んだ元ファイルと抽出した図・数式画像（ほかの翻訳で使っていない場合）</li>
+      </ul>
+      <p class="confirm-warning">この操作は取り消せません。残しておきたい場合は、先に「ZIPバックアップ」を保存してください。</p>
+      <p id="deleteStatus" class="dialog-status" aria-live="polite"></p>
+      <div class="dialog-actions"><button id="deleteCancel" class="secondary small" type="button" autofocus>キャンセル</button><button id="deleteConfirm" class="danger small" type="submit">削除する</button></div>
+    </form>
   </dialog>
   <dialog id="revisionDialog" class="revision-dialog" aria-labelledby="revisionTitle">
     <section>

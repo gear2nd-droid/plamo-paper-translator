@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from paper_core import (
+    HEADING_MARKER,
     ExtractedPageImage,
     LayoutFragment,
     LlamaTranslator,
@@ -19,15 +21,19 @@ from paper_core import (
     _extract_page_images,
     _mark_caption_boundaries,
     _mark_equation_boundaries,
+    _mark_heading_boundaries,
     _merge_page_continuations,
     _merge_reference_entries,
     _normalize_block,
+    _page_number_candidates_at_edges,
     _positioned_equations,
+    _positioned_letter_headings,
     _sentence_parts,
     _strip_repeated_margin_fragments,
     bilingual_html,
     bilingual_markdown,
     document_to_dict,
+    extract_document,
     heading_level,
     neighboring_context,
     parse_glossary,
@@ -350,6 +356,110 @@ class CoreTests(unittest.TestCase):
         equation_unit = next(unit for unit in units if unit[4] == 7)
         self.assertEqual(equation_unit[1], "equation")
         self.assertEqual(equation_unit[0], "E = mc 2 (7)")
+
+    def test_enumerated_steps_and_equation_lines_are_not_headings(self):
+        self.assertEqual(heading_level("1. create a Python virtual environment and install"), 0)
+        self.assertEqual(heading_level("4. verify the GGUF header, the file size and the SHA-256"), 0)
+        self.assertEqual(heading_level("72 pt/in = 3 (4)"), 0)
+        self.assertEqual(heading_level("0 otherwise"), 0)
+        self.assertEqual(heading_level("1. Introduction"), 1)
+        self.assertEqual(heading_level("3.2 Chrome Launcher"), 2)
+        self.assertEqual(split_document_units("1. create a Python virtual environment;")[0][1], "list_item")
+
+    def test_letter_heading_needs_layout_confirmation(self):
+        self.assertEqual(heading_level("A HTTP Interface"), 0)
+        self.assertEqual(heading_level(HEADING_MARKER + "A HTTP Interface"), 1)
+        fragments = [
+            LayoutFragment(0, 54, 700, "Body text in the usual size.", 10),
+            LayoutFragment(1, 54, 680, "More body text that sets the common size.", 10),
+            LayoutFragment(2, 54, 650, "A HTTP Interface", 14.3),
+            LayoutFragment(3, 54, 630, "A wrapped line of body text", 10),
+        ]
+        self.assertEqual(_positioned_letter_headings(fragments), ["A HTTP Interface"])
+        marked = _mark_heading_boundaries("end of text.\nA HTTP Interface\nTable 7 lists", ["A HTTP Interface"])
+        units = split_document_units(_normalize_block(marked))
+        self.assertIn(("A HTTP Interface", "heading"), units)
+
+    def test_appendix_after_references_is_not_merged_into_citations(self):
+        segments = [
+            Segment(0, 1, "References", kind="heading", paragraph=1, sentence=1),
+            Segment(1, 1, "[1] A. Author. First title.", paragraph=2, sentence=1),
+            Segment(2, 1, "[2] B. Writer. Second title.", paragraph=3, sentence=1),
+            Segment(3, 2, "A HTTP Interface", kind="heading", heading_level=1, paragraph=4, sentence=1),
+            Segment(4, 2, "Table 7 lists the endpoints.", paragraph=5, sentence=1),
+        ]
+        grouped = _merge_reference_entries(segments)
+        self.assertEqual(
+            [segment.kind for segment in grouped],
+            ["heading", "citation", "citation", "heading", "sentence"],
+        )
+
+    def test_numeric_reference_entry_is_split_from_the_next_entry(self):
+        text = "[1] Preferred Networks, Inc. PLaMo 3 Translate 8B (GGUF). 2026. [2] Preferred Networks, Inc. License."
+        units = split_document_units(text)
+        self.assertEqual([unit[1] for unit in units][:1], ["sentence"])
+        self.assertTrue(any(unit[0].startswith("[2]") for unit in units))
+
+    def test_subscript_digit_is_not_treated_as_page_number(self):
+        fragments = [
+            LayoutFragment(0, 300, 100, "i=", 7),
+            LayoutFragment(1, 310, 70, "1", 7),
+            LayoutFragment(2, 300, 60, "ρ = round(...) (11)", 10),
+            LayoutFragment(3, 300, 30, "5", 8),
+        ]
+        candidates = [("1", "bottom"), ("5", "bottom")]
+        self.assertEqual(_page_number_candidates_at_edges(candidates, fragments), [("5", "bottom")])
+
+    def test_fraction_equation_number_shares_fragment_with_result(self):
+        fragments = [
+            LayoutFragment(0, 300, 640, "rendered with PDFium at a fixed scale of", 10),
+            LayoutFragment(1, 402, 609.6, "σ", 10),
+            LayoutFragment(2, 402, 609.6, " =", 10),
+            LayoutFragment(3, 411, 609.6, " 216 dpi", 10),
+            LayoutFragment(4, 422, 602.8, "72 pt/in", 10),
+            LayoutFragment(5, 422, 602.8, " =", 10),
+            LayoutFragment(6, 456, 609.6, " 3 (4)", 10),
+            LayoutFragment(7, 316, 580, "pixels per point in the rendered image.", 10),
+        ]
+        equations = _positioned_equations(fragments, 612)
+        self.assertEqual([equation.number for equation in equations], [4])
+        marked = _mark_equation_boundaries("at\nσ = 216 dpi\n72 pt/in = 3 (4)\npixels per point.", equations)
+        units = split_document_units(_normalize_block(marked), include_positions=True, include_equation_numbers=True)
+        equation_unit = next(unit for unit in units if unit[4] == 4)
+        self.assertEqual(equation_unit[0], "σ = 216 dpi 72 pt/in = 3 (4)")
+        self.assertFalse(any(unit[1] == "heading" for unit in units))
+
+    def test_flush_left_lead_in_word_is_left_out_of_equation(self):
+        fragments = [
+            LayoutFragment(0, 316, 95, "segment has index r, the progress bar", 10),
+            LayoutFragment(1, 316, 83.4, "shows", 10),
+            LayoutFragment(2, 423, 81.9, "(", 10),
+            LayoutFragment(3, 381, 67.8, "ρ = round 100 · r", 10),
+            LayoutFragment(4, 489, 67.8, " (11)", 10),
+            LayoutFragment(5, 316, 50, "where the result is a percentage of the total.", 10),
+        ]
+        equations = _positioned_equations(fragments, 612)
+        self.assertEqual(len(equations), 1)
+        self.assertNotIn("shows", equations[0].text)
+        self.assertGreater(equations[0].x0, 350)
+
+    def test_bundled_manual_extracts_every_numbered_element(self):
+        manual = Path(__file__).resolve().parents[1] / "docs" / "manual" / "manual.pdf"
+        if not manual.exists():
+            self.skipTest("docs/manual/manual.pdf is not present")
+        with tempfile.TemporaryDirectory() as directory:
+            segments, _pages = extract_document(manual, asset_dir=Path(directory), asset_url_prefix="/a")
+        equations = {segment.label for segment in segments if segment.label.startswith("equation:") and segment.assets}
+        self.assertEqual(equations, {f"equation:{number}" for number in range(1, 15)})
+        headings = [segment.source for segment in segments if segment.kind == "heading"]
+        self.assertIn("A HTTP Interface", headings)
+        self.assertIn("B Troubleshooting", headings)
+        self.assertFalse([heading for heading in headings if re.match(r"^\d\. ", heading)])
+        self.assertFalse([heading for heading in headings if "=" in heading])
+        citations = [segment.source for segment in segments if segment.kind == "citation"]
+        self.assertEqual([citation[:3] for citation in citations], [f"[{number}]" for number in range(1, 10)])
+        figures = {segment.source.split(":")[0] for segment in segments if segment.kind == "figure" and segment.assets}
+        self.assertEqual(figures, {f"Figure {number}" for number in range(1, 8)})
 
     def test_equation_image_only_attaches_to_matching_identity(self):
         equation = Segment(0, 1, "x = 1 (7)", kind="equation", label="equation:7")
