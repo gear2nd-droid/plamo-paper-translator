@@ -17,7 +17,7 @@ if (Test-Path -LiteralPath $ResolvedPackageRoot) {
 & $Python -m pip install --disable-pip-version-check "pyinstaller>=6.16,<7"
 Push-Location $AppRoot
 try {
-    & $Python -m PyInstaller --noconfirm --clean --onefile --name PLaMoPaperTranslator --hidden-import pypdf --add-data "static;static" app.py
+    & $Python -m PyInstaller --noconfirm --clean --onefile --name PLaMoPaperTranslator --icon "assets\app.ico" --hidden-import pypdf --add-data "static;static" app.py
     New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
     Copy-Item -Force "dist\PLaMoPaperTranslator.exe" $PackageRoot
     Copy-Item -Force "Start-PLaMoPaperTranslator.cmd","start.ps1","setup.ps1","requirements.txt","README.md","DISTRIBUTION.md","THIRD_PARTY_NOTICES.md","LICENSE" $PackageRoot

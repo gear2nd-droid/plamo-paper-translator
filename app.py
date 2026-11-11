@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import socket
 import stat
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -82,6 +84,8 @@ DATA_DIR = USER_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 JOB_DIR = DATA_DIR / "jobs"
 ASSET_DIR = DATA_DIR / "assets"
+CONTROL_FILE = DATA_DIR / "server-control.json"
+CONTROL_TOKEN_HEADER = "X-PLaMo-Control-Token"
 RUNTIME_DIR = USER_DIR / "runtime"
 MODEL_DIR = USER_DIR / "models"
 for directory in (DATA_DIR, UPLOAD_DIR, JOB_DIR, ASSET_DIR):
@@ -90,6 +94,7 @@ for directory in (DATA_DIR, UPLOAD_DIR, JOB_DIR, ASSET_DIR):
 documents: dict[str, dict[str, Any]] = {}
 jobs: dict[str, dict[str, Any]] = {}
 active_retranslations: set[tuple[str, int]] = set()
+control_token = ""
 state_lock = threading.RLock()
 translator = LlamaTranslator()
 
@@ -117,11 +122,14 @@ def _write_native_message(stream: Any, payload: dict[str, Any]) -> None:
     stream.flush()
 
 
-def _app_is_available(timeout: float = 0.7) -> bool:
+def _app_is_available(timeout: float = 1.5) -> bool:
+    # /api/ping never touches the translation engine. /api/status does, and on
+    # Windows a refused localhost connection takes ~2 s, which made a running
+    # app look stopped whenever llama-server was down.
     try:
-        with urllib.request.urlopen(APP_URL + "api/status", timeout=timeout) as response:
+        with urllib.request.urlopen(APP_URL + "api/ping", timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        return response.status == 200 and isinstance(payload, dict) and "engine" in payload
+        return response.status == 200 and isinstance(payload, dict) and payload.get("app") == "plamo-paper-translator"
     except (OSError, ValueError, json.JSONDecodeError):
         return False
 
@@ -152,6 +160,97 @@ def _launch_detached_server() -> None:
     subprocess.Popen(command, start_new_session=True, **options)
 
 
+def _server_is_busy() -> bool:
+    with state_lock:
+        if active_retranslations:
+            return True
+        return any(job.get("status") in {"queued", "running"} for job in jobs.values())
+
+
+def _write_control_file(port: int) -> str:
+    """Record how the native host may ask this server instance to stop."""
+    token = secrets.token_urlsafe(32)
+    payload = {"pid": os.getpid(), "port": port, "token": token}
+    CONTROL_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    return token
+
+
+def _remove_control_file(token: str) -> None:
+    try:
+        payload = json.loads(CONTROL_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    # A newer instance may already have replaced the file; leave it alone.
+    if isinstance(payload, dict) and payload.get("token") == token:
+        CONTROL_FILE.unlink(missing_ok=True)
+
+
+def _read_control_file() -> dict[str, Any] | None:
+    try:
+        payload = json.loads(CONTROL_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("token"), str) or not isinstance(payload.get("pid"), int):
+        return None
+    return payload
+
+
+def _wait_for_process_exit(pid: int, timeout: float) -> bool:
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        synchronize = 0x00100000
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if not handle:
+            return True
+        try:
+            return kernel32.WaitForSingleObject(handle, int(timeout * 1000)) == 0
+        finally:
+            kernel32.CloseHandle(handle)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _request_server_shutdown() -> str:
+    """Ask the running server to stop. Returns "stopped" or "busy"."""
+    control = _read_control_file()
+    if not control:
+        raise ValueError("起動中のアプリに再起動を依頼できません。アプリを一度終了してから、もう一度拡張アイコンを押してください。")
+    request = urllib.request.Request(
+        APP_URL + "api/control/shutdown",
+        data=b"",
+        headers={CONTROL_TOKEN_HEADER: control["token"]},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5):
+            pass
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTPStatus.CONFLICT:
+            return "busy"
+        raise ValueError(f"アプリの終了を依頼できませんでした（HTTP {exc.code}）。") from exc
+    if not _wait_for_process_exit(control["pid"], 30):
+        raise ValueError("アプリが30秒以内に終了しませんでした。")
+    return "stopped"
+
+
+def _start_server_and_wait() -> bool:
+    _launch_detached_server()
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if _app_is_available():
+            return True
+        time.sleep(0.25)
+    return _app_is_available()
+
+
 def _is_native_messaging_invocation(arguments: list[str]) -> bool:
     return "--native-messaging" in arguments or CHROME_EXTENSION_ORIGIN in arguments
 
@@ -165,19 +264,26 @@ def _native_messaging_main() -> None:
     response: dict[str, Any]
     try:
         request = _read_native_message(sys.stdin.buffer)
-        if request.get("action") != "launch":
+        action = request.get("action")
+        if action not in {"launch", "restart"}:
             raise ValueError("未対応の操作です。")
         was_running = _app_is_available()
-        if not was_running:
-            _launch_detached_server()
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline and not _app_is_available():
-                time.sleep(0.25)
-        available = _app_is_available()
+        busy = False
+        if was_running and action == "restart":
+            busy = _request_server_shutdown() == "busy"
+        if busy:
+            available = True
+        elif was_running and action == "launch":
+            available = _app_is_available()
+        else:
+            available = _start_server_and_wait()
+        started = available and not busy and (action == "restart" or not was_running)
         response = {
             "ok": available,
             "running": available,
-            "started": available and not was_running,
+            "started": started,
+            "restarted": started and was_running,
+            "busy": busy,
             "url": APP_URL,
             "error": "" if available else "アプリの起動を15秒以内に確認できませんでした。",
         }
@@ -533,6 +639,52 @@ def _restore_library_backup(stream: Any) -> dict[str, int]:
         raise ValueError("ZIPファイルが壊れているか、バックアップ形式ではありません。") from exc
 
 
+def _document_is_referenced(document_id: str, *, excluding_job: str) -> bool:
+    if any(job.get("document_id") == document_id for job_id, job in jobs.items() if job_id != excluding_job):
+        return True
+    for path in JOB_DIR.glob("*.json"):
+        if path.stem == excluding_job:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            # An unreadable job might still point at the files; keep them.
+            return True
+        if isinstance(payload, dict) and payload.get("document_id") == document_id:
+            return True
+    return False
+
+
+def _delete_library_job(job_id: str) -> dict[str, Any]:
+    """Delete a saved translation, plus its source file and images when no other job uses them."""
+    with state_lock:
+        job = _load_saved_job(job_id)
+        if not job:
+            raise LookupError("ジョブが見つかりません。")
+        if job.get("status") in {"queued", "running"}:
+            raise ValueError("翻訳中の論文は削除できません。先に翻訳をキャンセルしてください。")
+        if any(key[0] == job_id for key in active_retranslations):
+            raise ValueError("再翻訳中の論文は削除できません。完了後にもう一度お試しください。")
+        (JOB_DIR / f"{job_id}.json").unlink(missing_ok=True)
+        jobs.pop(job_id, None)
+        removed_files = 1
+        document_id = str(job.get("document_id", ""))
+        source_removed = False
+        if re.fullmatch(r"[a-f0-9]{32}", document_id) and not _document_is_referenced(document_id, excluding_job=job_id):
+            documents.pop(document_id, None)
+            for upload in UPLOAD_DIR.glob(f"{document_id}_*"):
+                if upload.is_file():
+                    upload.unlink(missing_ok=True)
+                    removed_files += 1
+                    source_removed = True
+            asset_root = ASSET_DIR / document_id
+            if asset_root.is_dir() and ASSET_DIR.resolve() in asset_root.resolve().parents:
+                removed_files += sum(1 for item in asset_root.rglob("*") if item.is_file())
+                shutil.rmtree(asset_root)
+                source_removed = True
+    return {"id": job_id, "removed_files": removed_files, "source_removed": source_removed}
+
+
 def _asset_path(url: str) -> Path | None:
     match = re.fullmatch(r"/api/assets/([a-f0-9]{32})/([\w.-]+)", urllib.parse.urlparse(url).path)
     if not match:
@@ -880,6 +1032,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path == "/api/ping":
+            self._json({"app": "plamo-paper-translator", "pid": os.getpid()})
+            return
         if path == "/api/status":
             model = _find_one(MODEL_DIR, "*.gguf")
             self._json(
@@ -1040,6 +1195,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/control/shutdown":
+            self._shutdown_for_restart()
+            return
         if parsed.path == "/api/library/restore":
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= MAX_BACKUP_UPLOAD_BYTES:
@@ -1243,6 +1401,39 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._error("Not found", 404)
 
+    def _shutdown_for_restart(self) -> None:
+        # Only the native launcher can read the per-start token from data/,
+        # and the custom header forces a CORS preflight for web pages.
+        supplied = self.headers.get(CONTROL_TOKEN_HEADER, "")
+        if not control_token or not secrets.compare_digest(supplied, control_token):
+            self._error("Forbidden", 403)
+            return
+        if _server_is_busy():
+            self._error("翻訳中のため再起動しませんでした。", HTTPStatus.CONFLICT)
+            return
+        self._json({"ok": True, "stopping": True}, HTTPStatus.ACCEPTED)
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+    def do_DELETE(self) -> None:
+        # DELETE is never a CORS "simple request", so other web pages cannot
+        # trigger it against this local server without a failing preflight.
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})", urllib.parse.urlparse(self.path).path)
+        if not match:
+            self._error("Not found", 404)
+            return
+        try:
+            result = _delete_library_job(match.group(1))
+        except LookupError as exc:
+            self._error(str(exc), 404)
+            return
+        except ValueError as exc:
+            self._error(str(exc), 409)
+            return
+        except OSError as exc:
+            self._error(f"論文を削除できません: {exc}", 500)
+            return
+        self._json({"ok": True, **result})
+
     def _upload_document(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         if not 0 < length <= 80 * 1024 * 1024:
@@ -1389,6 +1580,8 @@ def main() -> None:
     if not args.no_engine:
         threading.Thread(target=llama_process.start, daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    global control_token
+    control_token = _write_control_file(args.port)
     url = f"http://{args.host}:{args.port}"
     print(f"PLaMo Paper Translator: {url}")
     if not args.no_browser:
@@ -1399,6 +1592,7 @@ def main() -> None:
         pass
     finally:
         server.server_close()
+        _remove_control_file(control_token)
         llama_process.stop()
 
 

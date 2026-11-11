@@ -220,6 +220,79 @@ class SavedJobTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             app._validated_backup_members(zipfile.ZipFile(backup))
 
+    def _library_root(self, directory):
+        root = Path(directory)
+        for child in ("jobs", "uploads", "assets"):
+            (root / child).mkdir()
+        patches = [
+            patch.object(app, "DATA_DIR", root),
+            patch.object(app, "JOB_DIR", root / "jobs"),
+            patch.object(app, "UPLOAD_DIR", root / "uploads"),
+            patch.object(app, "ASSET_DIR", root / "assets"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        return root
+
+    def _write_job(self, root, job_id, document_id):
+        payload = {**self.payload, "id": job_id, "document_id": document_id}
+        (root / "jobs" / f"{job_id}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def test_delete_job_removes_job_source_and_assets(self):
+        document_id = "d" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._library_root(directory)
+            self._write_job(root, self.job_id, document_id)
+            (root / "uploads" / f"{document_id}_paper.pdf").write_bytes(b"%PDF")
+            (root / "uploads" / f"{'e' * 32}_other.pdf").write_bytes(b"%PDF")
+            (root / "assets" / document_id).mkdir()
+            (root / "assets" / document_id / "page-001.png").write_bytes(b"png")
+            app.documents[document_id] = {"id": document_id}
+            self.addCleanup(app.documents.pop, document_id, None)
+
+            result = app._delete_library_job(self.job_id)
+
+            self.assertFalse((root / "jobs" / f"{self.job_id}.json").exists())
+            self.assertFalse((root / "uploads" / f"{document_id}_paper.pdf").exists())
+            self.assertFalse((root / "assets" / document_id).exists())
+            self.assertTrue((root / "uploads" / f"{'e' * 32}_other.pdf").exists())
+            self.assertNotIn(self.job_id, app.jobs)
+            self.assertNotIn(document_id, app.documents)
+            self.assertEqual(result["removed_files"], 3)
+            self.assertTrue(result["source_removed"])
+
+    def test_delete_job_keeps_source_shared_with_another_job(self):
+        document_id = "d" * 32
+        other_job = "b" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._library_root(directory)
+            self._write_job(root, self.job_id, document_id)
+            self._write_job(root, other_job, document_id)
+            (root / "uploads" / f"{document_id}_paper.pdf").write_bytes(b"%PDF")
+            (root / "assets" / document_id).mkdir()
+            (root / "assets" / document_id / "page-001.png").write_bytes(b"png")
+            self.addCleanup(app.jobs.pop, other_job, None)
+
+            result = app._delete_library_job(self.job_id)
+
+            self.assertFalse((root / "jobs" / f"{self.job_id}.json").exists())
+            self.assertTrue((root / "jobs" / f"{other_job}.json").exists())
+            self.assertTrue((root / "uploads" / f"{document_id}_paper.pdf").exists())
+            self.assertTrue((root / "assets" / document_id / "page-001.png").exists())
+            self.assertFalse(result["source_removed"])
+
+    def test_delete_job_rejects_running_and_missing_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._library_root(directory)
+            self._write_job(root, self.job_id, "d" * 32)
+            app.jobs[self.job_id] = {**self.payload, "status": "running", "segments": []}
+            with self.assertRaises(ValueError):
+                app._delete_library_job(self.job_id)
+            self.assertTrue((root / "jobs" / f"{self.job_id}.json").exists())
+            with self.assertRaises(LookupError):
+                app._delete_library_job("c" * 32)
+
     def test_manual_translation_keeps_revision_history(self):
         job = dict(self.payload)
         job["updated_at"] = "2026-11-09T00:00:00+00:00"
@@ -352,6 +425,117 @@ class NativeMessagingTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertFalse(payload["started"])
         launcher.assert_not_called()
+
+    def _native_call(self, message, **patches):
+        request = io.BytesIO()
+        app._write_native_message(request, message)
+        request.seek(0)
+        response = io.BytesIO()
+
+        class FakeStream:
+            def __init__(self, buffer, number):
+                self.buffer = buffer
+                self.number = number
+
+            def fileno(self):
+                return self.number
+
+        with (
+            patch.object(app.os, "name", "test"),
+            patch.object(app.sys, "stdin", FakeStream(request, 0)),
+            patch.object(app.sys, "stdout", FakeStream(response, 1)),
+        ):
+            mocks = {}
+            stack = [patch.object(app, name, value) for name, value in patches.items()]
+            for item in stack:
+                mocks[item.attribute] = item.start()
+            try:
+                app._native_messaging_main()
+            finally:
+                for item in stack:
+                    item.stop()
+        return app._read_native_message(io.BytesIO(response.getvalue()))
+
+    def test_native_restart_stops_running_server_then_starts_it(self):
+        shutdown = Mock(return_value="stopped")
+        start = Mock(return_value=True)
+        payload = self._native_call(
+            {"action": "restart"},
+            _app_is_available=Mock(return_value=True),
+            _request_server_shutdown=shutdown,
+            _start_server_and_wait=start,
+        )
+        shutdown.assert_called_once()
+        start.assert_called_once()
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["restarted"])
+        self.assertFalse(payload["busy"])
+
+    def test_native_restart_keeps_busy_server_running(self):
+        start = Mock(return_value=True)
+        payload = self._native_call(
+            {"action": "restart"},
+            _app_is_available=Mock(return_value=True),
+            _request_server_shutdown=Mock(return_value="busy"),
+            _start_server_and_wait=start,
+        )
+        start.assert_not_called()
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["busy"])
+        self.assertFalse(payload["restarted"])
+
+    def test_native_restart_starts_stopped_server(self):
+        shutdown = Mock()
+        payload = self._native_call(
+            {"action": "restart"},
+            _app_is_available=Mock(return_value=False),
+            _request_server_shutdown=shutdown,
+            _start_server_and_wait=Mock(return_value=True),
+        )
+        shutdown.assert_not_called()
+        self.assertTrue(payload["started"])
+        self.assertFalse(payload["restarted"])
+
+    def test_control_file_is_removed_only_by_its_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory) / "server-control.json"
+            with patch.object(app, "CONTROL_FILE", control):
+                token = app._write_control_file(7865)
+                self.assertEqual(app._read_control_file()["token"], token)
+                app._remove_control_file("someone-else")
+                self.assertTrue(control.exists())
+                app._remove_control_file(token)
+                self.assertFalse(control.exists())
+
+    def test_shutdown_endpoint_requires_token_and_idle_server(self):
+        import http.client
+        import threading
+
+        server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        busy_job = "f" * 32
+        self.addCleanup(app.jobs.pop, busy_job, None)
+
+        def post(token):
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+            headers = {app.CONTROL_TOKEN_HEADER: token} if token is not None else {}
+            connection.request("POST", "/api/control/shutdown", body=b"", headers=headers)
+            status = connection.getresponse().status
+            connection.close()
+            return status
+
+        with patch.object(app, "control_token", "secret-token"):
+            self.assertEqual(post(None), 403)
+            self.assertEqual(post("wrong"), 403)
+            app.jobs[busy_job] = {"id": busy_job, "status": "running"}
+            self.assertEqual(post("secret-token"), 409)
+            app.jobs.pop(busy_job)
+            self.assertEqual(post("secret-token"), 202)
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
 
     def test_frozen_detached_server_starts_as_independent_pyinstaller_instance(self):
         with (
