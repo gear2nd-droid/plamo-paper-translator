@@ -4,6 +4,10 @@
 
 CC BY 4.0は、適切なクレジット、ライセンスへのリンク、変更の明示を条件に、共有と翻案を認めています。論文に第三者著作物の個別表示がある場合、その部分は別条件の可能性があります。
 
+## 最優先: 同梱の論文形式マニュアル（CC0）
+
+[`docs/manual/manual.pdf`](manual/manual.pdf) は、このアプリのマニュアルを英語の論文形式で書いたもので、CC0（パブリックドメイン）です。原文側にはクレジット表示もライセンス確認も不要なので、動画や記事のデモに最も安全に使えます。図7点、表7点、番号付き数式14本、アルゴリズム、参考文献、付録を含みます。翻訳結果を公開する場合は、PLaMoの生成物としての表示（`Built with PLaMo`）だけが必要です。詳細は [`docs/manual/README.md`](manual/README.md) を参照してください。
+
 ## 第一候補: 画面デモ向け
 
 ### GAM Coach: Towards Interactive and User-centered Algorithmic Recourse

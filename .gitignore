@@ -25,3 +25,8 @@ dist/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# LaTeX build files for docs/manual
+docs/manual/*.aux
+docs/manual/*.log
+docs/manual/*.out
