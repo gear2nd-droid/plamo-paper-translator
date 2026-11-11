@@ -7,6 +7,7 @@
   <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
   <link rel="icon" type="image/png" href="/icon.png" sizes="256x256">
   <link rel="apple-touch-icon" href="/icon.png">
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
@@ -98,6 +99,10 @@
                 <div class="navigation-heading"><span>VISUALS</span><h3>図表・数式</h3></div>
                 <nav id="visualList" class="visual-list" aria-label="図表と数式の一覧"></nav>
               </section>
+              <section class="compact-bookmarks">
+                <div class="navigation-heading"><span>SAVED</span><h3>ブックマーク</h3></div>
+                <nav id="bookmarkListCompact" class="bookmark-list" aria-label="ブックマーク一覧"></nav>
+              </section>
             </aside>
             <div class="reader-content">
               <div id="readerStickyStack" class="reader-sticky-stack">
@@ -121,23 +126,48 @@
     <section class="privacy-note"><b>データの扱い</b><p>PDF本文と翻訳結果は <code>data/</code> に保存されます。PLaMo 3 Translate と llama.cpp はローカルで動作し、翻訳時のインターネット接続は不要です。</p></section>
   </main>
   <footer><span>PLaMo Paper Translator</span><span>Built with PLaMo · <a href="https://plamo.preferredai.jp/info/plamo-community-license-ja" target="_blank" rel="noreferrer">PLaMo Community License</a> · Local inference with llama.cpp</span></footer>
-  <dialog id="paperSummaryDialog" class="paper-summary-dialog" aria-labelledby="paperSummaryTitle">
-    <form id="paperSummaryForm">
-      <header>
-        <div><span>PAPER NOTES</span><h2 id="paperSummaryTitle">論文のまとめ</h2></div>
-        <button id="paperSummaryClose" class="dialog-close" type="button" aria-label="閉じる">×</button>
-      </header>
-      <label class="dialog-field"><span>タグ <small>カンマ・改行区切り／最大20件</small></span><input id="paperTags" type="text" maxlength="1000" placeholder="例：LLM, 機械翻訳, 評価手法"></label>
-      <div id="paperTagPreview" class="paper-tag-preview" aria-live="polite"></div>
-      <div class="dialog-field-grid">
+  <aside id="summaryPanel" class="summary-panel" aria-labelledby="paperSummaryTitle" hidden>
+    <div id="summaryResizer" class="summary-resizer" role="separator" aria-orientation="vertical" aria-label="まとめパネルの幅を変更（左右の矢印キーでも変更できます）" tabindex="0"></div>
+    <header class="summary-panel-header">
+      <div><span>PAPER NOTES</span><h2 id="paperSummaryTitle">論文のまとめ</h2></div>
+      <div class="summary-mode" role="group" aria-label="表示方法">
+        <button id="summaryModeEdit" type="button" aria-pressed="true">編集</button><button id="summaryModePreview" type="button" aria-pressed="false">表示</button>
+      </div>
+      <button id="paperSummaryClose" class="dialog-close" type="button" aria-label="まとめパネルを閉じる">×</button>
+    </header>
+    <div class="summary-panel-body">
+      <details id="summaryMeta" class="summary-meta">
+        <summary>タグ・原文URL・読書状態 <small id="summaryMetaHint"></small></summary>
+        <label class="dialog-field"><span>タグ <small>カンマ・改行区切り／最大20件</small></span><input id="paperTags" type="text" maxlength="1000" placeholder="例：LLM, 機械翻訳, 評価手法"></label>
+        <div id="paperTagPreview" class="paper-tag-preview" aria-live="polite"></div>
         <label class="dialog-field"><span>原文URL / DOI</span><input id="paperSourceUrl" type="url" maxlength="2000" placeholder="https://arxiv.org/abs/..."></label>
         <label class="dialog-field"><span>読書状態</span><select id="paperReadingStatus"><option value="unread">未読</option><option value="reading">読書中</option><option value="completed">読了</option><option value="archived">保留</option></select></label>
+      </details>
+      <div id="summaryEditPane" class="summary-edit-pane">
+        <div class="summary-toolbar">
+          <button id="paperSummaryTemplate" type="button">研究ノート雛形</button>
+          <button id="summaryHelpToggle" type="button" aria-expanded="false" aria-controls="summaryHelp">書き方</button>
+          <small id="paperSummaryLength">0 / 20,000</small>
+        </div>
+        <div id="summaryHelp" class="summary-help" hidden>
+          <dl>
+            <dt><code>## 見出し</code></dt><dd>見出し</dd>
+            <dt><code>- 項目</code> <code>1. 項目</code></dt><dd>箇条書き（字下げで入れ子）</dd>
+            <dt><code>**太字**</code> <code>&gt; 引用</code></dt><dd>強調・引用</dd>
+            <dt><code>$\sigma = 216/72$</code></dt><dd>文中の数式（TeX）</dd>
+            <dt><code>$$ … $$</code></dt><dd>独立した数式</dd>
+            <dt><code>図2</code> <code>式(4)</code> <code>表1</code></dt><dd>論文の図表・数式へのリンク（自動）</dd>
+            <dt><code>![[図2]]</code> <code>![[式4]]</code></dt><dd>図・数式の画像を埋め込む</dd>
+            <dt><code>[[#123]]</code></dt><dd>123番の行へのリンク（各行の「まとめへ」で挿入）</dd>
+          </dl>
+        </div>
+        <textarea id="paperSummaryText" maxlength="20000" aria-label="まとめ（Markdown）" placeholder="論文の目的、提案手法、重要な結果などを記録します。Markdownと $数式$ が使えます。"></textarea>
+        <div id="summaryCaretPreview" class="summary-caret-preview markdown-body" aria-live="polite" hidden></div>
       </div>
-      <label class="dialog-field"><span>概要 <span class="summary-field-actions"><button id="paperSummaryTemplate" type="button">研究ノート雛形</button><small id="paperSummaryLength">0 / 20,000</small></span></span><textarea id="paperSummaryText" rows="12" maxlength="20000" placeholder="論文の目的、提案手法、重要な結果、今後確認したい点などを記録します。"></textarea></label>
-      <p id="paperSummaryStatus" class="dialog-status">このPC内の翻訳ジョブに保存されます。</p>
-      <div class="dialog-actions"><button id="paperSummaryCancel" class="secondary small" type="button">キャンセル</button><button id="paperSummarySave" class="primary small" type="submit">保存</button></div>
-    </form>
-  </dialog>
+      <div id="summaryPreviewPane" class="summary-preview markdown-body" hidden></div>
+    </div>
+    <div class="summary-panel-footer"><p id="paperSummaryStatus" class="dialog-status">入力すると自動保存します。</p></div>
+  </aside>
   <dialog id="libraryDialog" class="library-dialog" aria-labelledby="libraryTitle">
     <section>
       <header>
@@ -182,6 +212,8 @@
     </section>
   </dialog>
   <div id="toast" class="toast"></div>
+  <script src="/vendor/katex/katex.min.js"></script>
+  <script src="/markdown.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

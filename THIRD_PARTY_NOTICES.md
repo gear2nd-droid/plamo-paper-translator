@@ -38,6 +38,14 @@
 
 PDFiumは独立表示数式をPDFから画像として切り出すために使用します。バイナリ配布時はwheelに収録された `BUILD_LICENSES/` を含むライセンス一式を同梱します。
 
+## KaTeX
+
+- Project: https://katex.org/ （同梱バージョン 0.16.11）
+- License: MIT
+- Included license: `licenses/KaTeX-LICENSE.txt`（ソースでは `static/vendor/katex/LICENSE`）
+
+論文のまとめに書いた `$…$` の数式を表示するために使用します。外部サーバーから読み込まず、`static/vendor/katex/` の同梱ファイル（JavaScript、CSS、フォント）だけを使います。
+
 ## Python
 
 - Project: https://www.python.org/
