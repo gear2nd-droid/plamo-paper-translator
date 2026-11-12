@@ -1690,13 +1690,129 @@ def script_html(text: str) -> str:
     return SCRIPT_MARKUP_PATTERN.sub(lambda match: f"<{'sub' if match.group(1) == '_' else 'sup'}>{match.group(2)}</{'sub' if match.group(1) == '_' else 'sup'}>", text)
 
 
-def bilingual_markdown(title: str, segments: Iterable[Segment]) -> str:
+READING_STATUS_LABELS = {"unread": "未読", "reading": "読書中", "completed": "読了", "archived": "保留"}
+SUMMARY_REFERENCE_PATTERN = re.compile(r"(!?)\[\[([^\[\]\n]{1,60})\]\]")
+SUMMARY_PROTECTED_PATTERN = re.compile(r"\$\$[\s\S]*?\$\$|\$[^$\n]+\$|`[^`\n]+`")
+
+
+def _reference_key(label: str) -> str | None:
+    """'図2' / 'Fig. 2' -> 'figure:2', '式(4)' -> 'equation:4', 'Table 1' -> 'table:1'."""
+    match = re.match(r"^\s*(fig(?:ure)?s?\.?|図|eq(?:uation)?s?\.?|式|tables?|表)\s*\(?\s*(\d+)", label, re.I)
+    if not match:
+        return None
+    word = match.group(1).lower()
+    kind = "figure" if word.startswith(("fig", "図")) else "equation" if word.startswith(("eq", "式")) else "table"
+    return f"{kind}:{int(match.group(2))}"
+
+
+def summary_reference_targets(segments: Iterable[Segment]) -> dict[str, int]:
+    """Map 'figure:2', 'equation:4' and 'table:1' to the segment that shows them."""
+    targets: dict[str, int] = {}
+    scores: dict[str, int] = {}
+    for segment in segments:
+        keys: list[str] = []
+        label = re.fullmatch(r"equation:(\d+)", segment.label or "")
+        if label:
+            keys.append(f"equation:{int(label.group(1))}")
+        caption = re.match(r"^(?:(?:figure|fig\.?)\s*(\d+)\s*[.:]|図\s*(\d+))", segment.source.strip(), re.I)
+        if caption:
+            keys.append(f"figure:{int(caption.group(1) or caption.group(2))}")
+        table = re.match(r"^(?:table\s*(\d+)\s*[.:]|表\s*(\d+))", segment.source.strip(), re.I)
+        if table:
+            keys.append(f"table:{int(table.group(1) or table.group(2))}")
+        for key in keys:
+            score = 2 if segment.assets else 1
+            if score > scores.get(key, 0):
+                targets[key] = segment.index
+                scores[key] = score
+    return targets
+
+
+def _outside_protected(text: str, convert: Callable[[str], str]) -> str:
+    """Apply convert to text outside math ($...$) and inline code spans."""
+    pieces: list[str] = []
+    last = 0
+    for match in SUMMARY_PROTECTED_PATTERN.finditer(text):
+        pieces.append(convert(text[last : match.start()]))
+        pieces.append(match.group(0))
+        last = match.end()
+    pieces.append(convert(text[last:]))
+    return "".join(pieces)
+
+
+def summary_markdown(summary: str, segments: list[Segment]) -> str:
+    """Turn the app's summary syntax into portable Markdown.
+
+    ![[図2]] becomes the figure image(s), [[式4]] plain text, [[#12]] "#012",
+    and headings move one level down to sit under the export's own heading.
+    """
+    targets = summary_reference_targets(segments)
+    by_index = {segment.index: segment for segment in segments}
+
+    def resolve(label: str) -> Segment | None:
+        row = re.fullmatch(r"#\s*(\d{1,5})", label)
+        if row:
+            return by_index.get(int(row.group(1)) - 1)
+        key = _reference_key(label)
+        return by_index.get(targets[key]) if key and key in targets else None
+
+    def replace(match: re.Match[str]) -> str:
+        label = match.group(2).strip()
+        segment = resolve(label)
+        shown = f"#{segment.index + 1:03d}" if segment and label.startswith("#") else label
+        if not match.group(1) or segment is None:
+            return shown
+        if segment.assets:
+            return "\n\n" + "\n\n".join(f"![{shown}]({asset})" for asset in segment.assets) + "\n\n"
+        quoted = (segment.translation or segment.source).replace("\n", " ")
+        return f"\n\n> {quoted}（{shown}）\n\n"
+
+    def convert(text: str) -> str:
+        text = re.sub(r"(?m)^(#{1,5})(?=\s)", r"#\1", text)
+        return script_html(SUMMARY_REFERENCE_PATTERN.sub(replace, text))
+
+    return re.sub(r"\n{3,}", "\n\n", _outside_protected(summary, convert)).strip()
+
+
+def _summary_meta_lines(tags: Iterable[str], source_url: str, reading_status: str) -> list[str]:
+    lines = []
+    tag_list = [str(tag) for tag in tags if str(tag).strip()]
+    if tag_list:
+        lines.append(f"タグ: {', '.join(tag_list)}")
+    if source_url:
+        lines.append(f"原文: {source_url}")
+    if reading_status in READING_STATUS_LABELS:
+        lines.append(f"読書状態: {READING_STATUS_LABELS[reading_status]}")
+    return lines
+
+
+def bilingual_markdown(
+    title: str,
+    segments: Iterable[Segment],
+    *,
+    summary: str = "",
+    tags: Iterable[str] = (),
+    source_url: str = "",
+    reading_status: str = "",
+) -> str:
+    segments = list(segments)
+    meta = _summary_meta_lines(tags, source_url, reading_status)
+    summary_lines: list[str] = []
+    if summary.strip() or meta:
+        summary_lines = ["## まとめ", ""]
+        summary_lines.extend(f"- {line}" for line in meta)
+        if meta:
+            summary_lines.append("")
+        if summary.strip():
+            summary_lines.extend([summary_markdown(summary, segments), ""])
+        summary_lines.extend(["---", ""])
     lines = [
         f"# {title}",
         "",
         "> Built with PLaMo — PLaMo 3 Translate による機械翻訳です。",
         f"> [PLaMo Community License]({PLAMO_LICENSE_URL})",
         "",
+        *summary_lines,
     ]
     for segment in segments:
         if segment.kind == "heading":
@@ -1726,11 +1842,156 @@ def bilingual_markdown(title: str, segments: Iterable[Segment]) -> str:
     return "\n".join(lines)
 
 
+SUMMARY_EXPORT_STYLE = (
+    ".paper-summary{max-width:1100px;margin:22px auto;padding:22px 28px;background:#fff;border:1px solid #cad0d8}"
+    ".paper-summary h2{margin:0 0 6px;font:600 1.15rem Georgia,'Yu Mincho',serif}"
+    ".summary-meta{margin:0 0 14px;color:#676c72;font-size:.78rem}.summary-meta span+span:before{content:' · '}"
+    ".summary-body{font-size:.9rem;line-height:1.8}.summary-body p{white-space:normal;margin:0 0 .8em}"
+    ".summary-body pre{white-space:pre-wrap;background:#f3f5f8;padding:10px;font:inherit}"
+    ".summary-body h3,.summary-body h4,.summary-body h5,.summary-body h6{margin:1.1em 0 .4em;font-size:.98rem}"
+    ".summary-body blockquote{margin:0 0 .8em;padding-left:10px;border-left:3px solid #9fb3cc;color:#3d4550}"
+    ".summary-body ul,.summary-body ol{margin:0 0 .8em;padding-left:1.5em}"
+    ".summary-body .math-display{overflow-x:auto;margin:.2em 0 .9em}.summary-body a{color:#1a56b8}"
+    ".summary-embed{display:block;margin:.5em 0 .9em;border:1px solid #d5dae1;padding:8px}"
+    ".summary-embed img{max-height:340px;object-fit:contain;margin:0 auto 6px}"
+    ".summary-embed-caption{display:block;color:#676c72;font-size:.75rem}.summary-missing{color:#a04435}"
+)
+
+# Renders the summary inside an exported HTML file with the app's own
+# Markdown renderer. References resolve to rows of the same file, and an
+# embedded figure reuses the image already inlined in that row.
+SUMMARY_EXPORT_SCRIPT = r"""(function () {
+  var data = JSON.parse(document.getElementById('paper-summary-data').textContent);
+  var markdown = window.PaperMarkdown;
+  if (!markdown) return;
+  var esc = markdown.escapeText;
+  var pattern = /\b(?:fig(?:ure)?s?\.?\s*\d+|eq(?:uation)?s?\.?\s*\(?\d+\)?|tables?\s+\d+)|(?:図|式|表)\s*\(?\d+\)?/gi;
+  function scripts(html) {
+    return html.replace(/([_^])\{([^{}\n]{1,80})\}/g, function (_, kind, content) { return kind === '_' ? '<sub>' + content + '</sub>' : '<sup>' + content + '</sup>'; });
+  }
+  function key(label) {
+    var number = (label.match(/\d+/) || [])[0];
+    if (!number) return null;
+    if (/^(fig|図)/i.test(label)) return 'figure:' + Number(number);
+    if (/^(eq|式)/i.test(label)) return 'equation:' + Number(number);
+    if (/^(table|表)/i.test(label)) return 'table:' + Number(number);
+    return null;
+  }
+  function target(label) {
+    var row = label.match(/^#\s*(\d{1,5})$/);
+    var index = row ? Number(row[1]) - 1 : data.targets[key(label)];
+    return index !== undefined && document.getElementById('segment-' + index) ? index : null;
+  }
+  function link(index, text) { return '<a class="summary-ref" href="#segment-' + index + '">' + esc(text) + '</a>'; }
+  function text(value) {
+    var output = '', last = 0, match;
+    pattern.lastIndex = 0;
+    while ((match = pattern.exec(value))) {
+      var index = data.targets[key(match[0])];
+      output += esc(value.slice(last, match.index)) + (index !== undefined && document.getElementById('segment-' + index) ? link(index, match[0]) : esc(match[0]));
+      last = match.index + match[0].length;
+    }
+    return scripts(output + esc(value.slice(last)));
+  }
+  function reference(label, embed) {
+    var index = target(label);
+    if (index === null) return '<span class="summary-missing">' + esc((embed ? '!' : '') + '[[' + label + ']]') + '</span>';
+    var shown = label.charAt(0) === '#' ? '#' + String(index + 1).padStart(3, '0') : label;
+    if (!embed) return link(index, shown);
+    var images = Array.prototype.map.call(document.querySelectorAll('#segment-' + index + ' .source img'), function (image) {
+      return '<img src="' + esc(image.getAttribute('src')) + '" alt="' + esc(shown) + '">';
+    }).join('');
+    var quoted = document.querySelector('#segment-' + index + ' .translation p');
+    var body = images || '<span>' + (quoted ? quoted.innerHTML : '') + '</span>';
+    return '<span class="summary-embed">' + body + '<span class="summary-embed-caption">' + link(index, shown) + '</span></span>';
+  }
+  document.getElementById('paper-summary-body').innerHTML = markdown.renderMarkdown(data.summary, {text: text, reference: reference});
+})();"""
+
+
+def _inline_script(source: str) -> str:
+    return "<script>" + source.replace("</script", "<\\/script") + "</script>"
+
+
+def _katex_assets(static_dir: Path) -> str:
+    """KaTeX for an exported file: the script plus CSS with fonts inlined."""
+    import base64
+
+    katex_dir = static_dir / "vendor" / "katex"
+    css = (katex_dir / "katex.min.css").read_text(encoding="utf-8")
+
+    def font(match: re.Match[str]) -> str:
+        path = katex_dir / "fonts" / match.group(1)
+        if not path.is_file():
+            return match.group(0)
+        return f"url(data:font/woff2;base64,{base64.b64encode(path.read_bytes()).decode('ascii')})"
+
+    css = re.sub(r"url\(fonts/([\w.-]+\.woff2)\)", font, css)
+    # Only the WOFF2 files are bundled; drop the WOFF and TTF fallbacks.
+    css = re.sub(r",url\(fonts/[\w.-]+\.(?:woff|ttf)\) format\(\"(?:woff|truetype)\"\)", "", css)
+    return f"<style>{css}</style>" + _inline_script((katex_dir / "katex.min.js").read_text(encoding="utf-8"))
+
+
+def _summary_html_section(
+    summary: str,
+    segments: list[Segment],
+    tags: Iterable[str],
+    source_url: str,
+    reading_status: str,
+    static_dir: Path | None,
+) -> tuple[str, str]:
+    """Return the summary section and the scripts that render it.
+
+    The scripts go at the end of the body so the rows they link to exist.
+    """
+    tag_list = [str(tag) for tag in tags if str(tag).strip()]
+    if not summary.strip() and not tag_list and not source_url:
+        return "", ""
+    meta: list[str] = []
+    if tag_list:
+        meta.append(f"<span>タグ: {html.escape(', '.join(tag_list))}</span>")
+    if source_url:
+        safe_url = html.escape(source_url)
+        meta.append(
+            f'<span>原文: <a href="{safe_url}">{safe_url}</a></span>'
+            if re.match(r"^https?://", source_url, re.I)
+            else f"<span>原文: {safe_url}</span>"
+        )
+    if reading_status in READING_STATUS_LABELS:
+        meta.append(f"<span>読書状態: {READING_STATUS_LABELS[reading_status]}</span>")
+    body = f'<pre>{html.escape(summary)}</pre>' if summary.strip() else ""
+    scripts = ""
+    markdown_js = static_dir / "markdown.js" if static_dir else None
+    if summary.strip() and markdown_js and markdown_js.is_file():
+        data = json.dumps({"summary": summary, "targets": summary_reference_targets(segments)}, ensure_ascii=False)
+        data = data.replace("<", "\\u003c")
+        katex = _katex_assets(static_dir) if "$" in summary and (static_dir / "vendor" / "katex" / "katex.min.js").is_file() else ""
+        scripts = (
+            f'<script type="application/json" id="paper-summary-data">{data}</script>'
+            f"{katex}{_inline_script(markdown_js.read_text(encoding='utf-8'))}{_inline_script(SUMMARY_EXPORT_SCRIPT)}"
+        )
+    section = (
+        f"<style>{SUMMARY_EXPORT_STYLE}</style>"
+        f'<section class="paper-summary" aria-labelledby="paper-summary-title"><h2 id="paper-summary-title">まとめ</h2>'
+        f'{f"<p class=summary-meta>{''.join(meta)}</p>" if meta else ""}'
+        f'<div id="paper-summary-body" class="summary-body">{body}</div></section>'
+    )
+    return section, scripts
+
+
 def bilingual_html(
     title: str,
     segments: Iterable[Segment],
     asset_resolver: Callable[[str], str] | None = None,
+    *,
+    summary: str = "",
+    tags: Iterable[str] = (),
+    source_url: str = "",
+    reading_status: str = "",
+    static_dir: Path | None = None,
 ) -> str:
+    segments = list(segments)
+    summary_section, summary_scripts = _summary_html_section(summary, segments, tags, source_url, reading_status, static_dir)
     rows = []
     previous_paragraph = None
     for segment in segments:
@@ -1761,7 +2022,7 @@ def bilingual_html(
             position = "旧形式"
         bookmark = '<b class="bookmark">★ ブックマーク</b>' if segment.bookmarked else ""
         rows.append(
-            f'<section class="reader-row kind-{html.escape(segment.kind)}{" paragraph-start" if paragraph_start else ""}{" bookmarked" if segment.bookmarked else ""}">'
+            f'<section id="segment-{segment.index}" class="reader-row kind-{html.escape(segment.kind)}{" paragraph-start" if paragraph_start else ""}{" bookmarked" if segment.bookmarked else ""}">'
             f'<div class="number"><b>{segment.index + 1}</b><span>{position}</span></div>'
             f'<article class="source">{source_content}</article>'
             f'<article class="translation">{translation_content}</article>'
@@ -1787,4 +2048,4 @@ header{{padding:28px 32px;border-bottom:1px solid #cad0d8;background:#fff;positi
 footer{{padding:24px 32px;text-align:center;font-size:.78rem;color:#676c72}}
 @media(max-width:900px){{.labels,.reader-row{{grid-template-columns:36px minmax(260px,1fr) minmax(260px,1fr)}}.labels .memo-label{{display:none}}.note{{grid-column:2/4;border-top:1px dashed #cad0d8}}}}
 @media(max-width:620px){{header{{padding:20px 16px}}.labels{{display:none}}.reader-row{{grid-template-columns:32px 1fr}}.reader-row>*{{grid-column:2}}.number{{grid-column:1!important;grid-row:1/4}}}}
-</style></head><body><header><h1>{safe_title}</h1><p>Built with PLaMo — PLaMo 3 Translate による機械翻訳です。 <a href="{PLAMO_LICENSE_URL}">PLaMo Community License</a></p></header><div class="labels"><span></span><b>ORIGINAL</b><b>TRANSLATION</b><b class="memo-label">MEMO</b></div><main>{''.join(rows)}</main><footer>Built with PLaMo · <a href="{PLAMO_LICENSE_URL}">PLaMo Community License</a></footer></body></html>"""
+</style></head><body><header><h1>{safe_title}</h1><p>Built with PLaMo — PLaMo 3 Translate による機械翻訳です。 <a href="{PLAMO_LICENSE_URL}">PLaMo Community License</a></p></header>{summary_section}<div class="labels"><span></span><b>ORIGINAL</b><b>TRANSLATION</b><b class="memo-label">MEMO</b></div><main>{''.join(rows)}</main><footer>Built with PLaMo · <a href="{PLAMO_LICENSE_URL}">PLaMo Community License</a></footer>{summary_scripts}</body></html>"""
