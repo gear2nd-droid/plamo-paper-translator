@@ -165,7 +165,7 @@ function renderSegment(item, position, list, mode) {
 }
 
 function navigationLabel(item, limit = 68) {
-  const compact = String(item.source || '').replace(/\s+/g, ' ').trim();
+  const compact = stripScripts(item.source || '').replace(/\s+/g, ' ').trim();
   return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
 }
 
@@ -310,7 +310,23 @@ function referenceIdentity(text) {
   return null;
 }
 
+// Subscripts and superscripts recognised from the PDF layout: E_{algo}, b^{⋆}.
+const SCRIPT_MARKUP_PATTERN = /([_^])\{([^{}\n]{1,80})\}/g;
+
+/** Turn script markup in already-escaped HTML into <sub>/<sup>. */
+function renderScripts(html) {
+  return String(html).replace(SCRIPT_MARKUP_PATTERN, (_, kind, content) => (kind === '_' ? `<sub>${content}</sub>` : `<sup>${content}</sup>`));
+}
+
+function stripScripts(value) {
+  return String(value ?? '').replace(SCRIPT_MARKUP_PATTERN, '$2');
+}
+
 function renderReferencedText(value, currentIndex) {
+  return renderScripts(renderLinkedText(value, currentIndex));
+}
+
+function renderLinkedText(value, currentIndex) {
   const text = String(value ?? '');
   let rendered = '';
   let lastIndex = 0;
@@ -504,7 +520,7 @@ function formatLibraryDate(value) {
 function renderLibraryItem(item) {
   const tags = Array.isArray(item.tags) ? item.tags.slice(0, 8).map((tag) => `<span>${escapeHtml(tag)}</span>`).join('') : '';
   const rawSummary = String(item.summary || '');
-  const summary = (window.PaperMarkdown ? window.PaperMarkdown.markdownToPlainText(rawSummary) : rawSummary).trim();
+  const summary = stripScripts(window.PaperMarkdown ? window.PaperMarkdown.markdownToPlainText(rawSummary) : rawSummary).trim();
   const progress = Math.max(0, Math.min(100, Number(item.reading_progress) || 0));
   const source = item.source_url ? `<a class="library-source" href="${escapeHtml(item.source_url)}" target="_blank" rel="noreferrer">原文を開く ↗</a>` : '';
   const busy = item.status === 'queued' || item.status === 'running';
@@ -802,8 +818,8 @@ function openTranslationHistory(index) {
   if (!item) return;
   state.revisionSegmentIndex = Number(index);
   const revisions = Array.isArray(item.translation_revisions) ? item.translation_revisions : [];
-  const cards = [...revisions].map((revision, position) => ({...revision, position})).reverse().map((revision) => `<article class="revision-card"><header><b>${revision.origin === 'manual' ? '手動編集' : 'モデル訳'}</b><time>${escapeHtml(formatLibraryDate(revision.changed_at))}</time><button type="button" data-revision-restore="${revision.position}">この版に戻す</button></header><p>${escapeHtml(revision.translation || '')}</p></article>`).join('');
-  $('revisionCurrent').textContent = item.translation || '';
+  const cards = [...revisions].map((revision, position) => ({...revision, position})).reverse().map((revision) => `<article class="revision-card"><header><b>${revision.origin === 'manual' ? '手動編集' : 'モデル訳'}</b><time>${escapeHtml(formatLibraryDate(revision.changed_at))}</time><button type="button" data-revision-restore="${revision.position}">この版に戻す</button></header><p>${renderScripts(escapeHtml(revision.translation || ''))}</p></article>`).join('');
+  $('revisionCurrent').innerHTML = renderScripts(escapeHtml(item.translation || ''));
   $('revisionItems').innerHTML = cards || '<p class="navigation-empty">以前の訳文はありません。</p>';
   $('revisionDialog').showModal();
 }

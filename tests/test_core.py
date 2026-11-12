@@ -28,8 +28,13 @@ from paper_core import (
     _page_number_candidates_at_edges,
     _positioned_equations,
     _positioned_letter_headings,
+    _apply_script_markup,
+    _block_kind,
+    _mark_equation_boundaries,
+    _script_roles,
     _sentence_parts,
     _strip_repeated_margin_fragments,
+    PositionedEquation,
     bilingual_html,
     bilingual_markdown,
     document_to_dict,
@@ -40,6 +45,8 @@ from paper_core import (
     segments_for_mode,
     split_document_units,
     split_text,
+    restore_script_markup,
+    strip_script_markup,
 )
 
 
@@ -443,6 +450,59 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("shows", equations[0].text)
         self.assertGreater(equations[0].x0, 350)
 
+    def test_lowered_and_raised_small_fragments_become_scripts(self):
+        fragments = [
+            LayoutFragment(0, 316, 367.4, "where", 9),
+            LayoutFragment(1, 346, 367.4, " E", 9),
+            LayoutFragment(2, 426, 365.7, "algo", 7),
+            LayoutFragment(3, 439, 367.4, "(M) and b", 9),
+            LayoutFragment(4, 470, 371.5, "⋆", 6.5),
+            LayoutFragment(5, 480, 367.4, " in small caps", 9),
+            LayoutFragment(6, 520, 367.4, "TEXT", 7),
+        ]
+        self.assertEqual(_script_roles(fragments, 612), {2: "sub", 4: "sup"})
+
+    def test_script_parts_of_one_subscript_are_merged(self):
+        fragments = [
+            LayoutFragment(0, 316, 400, "For segment s", 10),
+            LayoutFragment(1, 380, 398.5, "p", 7),
+            LayoutFragment(2, 384, 398.5, ",", 7),
+            LayoutFragment(3, 386, 398.5, "k", 7),
+            LayoutFragment(4, 390, 400, " the context is", 10),
+        ]
+        parts = [fragment.text for fragment in fragments]
+        raw = "".join(parts)
+        marked = _apply_script_markup(raw, parts, list(range(len(parts))), _script_roles(fragments, 612))
+        self.assertEqual(marked, "For segment s_{p,k} the context is")
+        self.assertEqual(strip_script_markup(marked), raw)
+
+    def test_script_markup_skips_fragments_missing_from_page_text(self):
+        parts = ["Energy E", "(a) ", "algo", " is low"]
+        raw = "Energy Ealgo is low"
+        self.assertEqual(_apply_script_markup(raw, parts, [0, 1, 2, 3], {2: "sub"}), "Energy E_{algo} is low")
+        self.assertEqual(_apply_script_markup("unrelated text", parts, [0, 1, 2, 3], {2: "sub"}), "unrelated text")
+
+    def test_script_markup_does_not_change_structure_detection(self):
+        self.assertEqual(heading_level("1 Introduction^{1}"), 1)
+        self.assertEqual(_block_kind("where E_{algo}(M) is the printing error of M caused by the method algo."), "sentence")
+        equation = PositionedEquation(1, "size(f) = b⋆, (1)", 0, 0, 1, 1)
+        marked = _mark_equation_boundaries("only when\nsize( f ) = b^{⋆}, (1)\nwhere", [equation])
+        self.assertIn("1:size( f ) = b^{⋆}, (1)", marked)
+
+    def test_flattened_scripts_are_restored_in_translation(self):
+        source = "where E_{algo}(M) is the error and b^{⋆} is published."
+        self.assertEqual(
+            restore_script_markup(source, "ここで Ealgo(M) は誤差、b⋆ は公開値。"),
+            "ここで E_{algo}(M) は誤差、b^{⋆} は公開値。",
+        )
+        self.assertEqual(restore_script_markup(source, "E_{algo}(M) と b^{⋆}"), "E_{algo}(M) と b^{⋆}")
+
+    def test_exports_render_scripts(self):
+        segment = Segment(0, 1, "where E_{algo}(M) <is>", translation="ここで E_{algo}(M)")
+        html_export = bilingual_html("T", [segment])
+        self.assertIn("E<sub>algo</sub>(M) &lt;is&gt;", html_export)
+        self.assertIn("E<sub>algo</sub>(M)", bilingual_markdown("T", [segment]))
+
     def test_bundled_manual_extracts_every_numbered_element(self):
         manual = Path(__file__).resolve().parents[1] / "docs" / "manual" / "manual.pdf"
         if not manual.exists():
@@ -460,6 +520,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual([citation[:3] for citation in citations], [f"[{number}]" for number in range(1, 10)])
         figures = {segment.source.split(":")[0] for segment in segments if segment.kind == "figure" and segment.assets}
         self.assertEqual(figures, {f"Figure {number}" for number in range(1, 8)})
+        body = " ".join(segment.source for segment in segments if segment.kind == "sentence")
+        for marked in ("where b^{⋆} and h^{⋆}", "B_{p,k} = s_{p,1}", "If C_{i}⊆"):
+            self.assertIn(marked, body)
 
     def test_equation_image_only_attaches_to_matching_identity(self):
         equation = Segment(0, 1, "x = 1 (7)", kind="equation", label="equation:7")
