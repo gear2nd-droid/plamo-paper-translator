@@ -401,6 +401,12 @@ class CoreTests(unittest.TestCase):
             ["heading", "citation", "citation", "heading", "sentence"],
         )
 
+    def test_reference_block_starting_inside_a_wrapped_url_is_prose(self):
+        text = "com/docs/concepts/ native-messaging . [9] Creative Commons. Attribution 4.0 International (CC BY 4.0). [10] Creative Commons. CC0 1.0."
+        units = split_document_units(text)
+        self.assertTrue(any(unit[0].startswith("[9]") for unit in units))
+        self.assertTrue(any(unit[0].startswith("[10]") for unit in units))
+
     def test_numeric_reference_entry_is_split_from_the_next_entry(self):
         text = "[1] Preferred Networks, Inc. PLaMo 3 Translate 8B (GGUF). 2026. [2] Preferred Networks, Inc. License."
         units = split_document_units(text)
@@ -554,16 +560,16 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             segments, _pages = extract_document(manual, asset_dir=Path(directory), asset_url_prefix="/a")
         equations = {segment.label for segment in segments if segment.label.startswith("equation:") and segment.assets}
-        self.assertEqual(equations, {f"equation:{number}" for number in range(1, 15)})
+        self.assertEqual(equations, {f"equation:{number}" for number in range(1, 16)})
         headings = [segment.source for segment in segments if segment.kind == "heading"]
         self.assertIn("A HTTP Interface", headings)
         self.assertIn("B Troubleshooting", headings)
         self.assertFalse([heading for heading in headings if re.match(r"^\d\. ", heading)])
         self.assertFalse([heading for heading in headings if "=" in heading])
         citations = [segment.source for segment in segments if segment.kind == "citation"]
-        self.assertEqual([citation[:3] for citation in citations], [f"[{number}]" for number in range(1, 10)])
+        self.assertEqual([citation.split(" ")[0] for citation in citations], [f"[{number}]" for number in range(1, 11)])
         figures = {segment.source.split(":")[0] for segment in segments if segment.kind == "figure" and segment.assets}
-        self.assertEqual(figures, {f"Figure {number}" for number in range(1, 8)})
+        self.assertEqual(figures, {f"Figure {number}" for number in range(1, 9)})
         body = " ".join(segment.source for segment in segments if segment.kind == "sentence")
         for marked in ("where b^{⋆} and h^{⋆}", "B_{p,k} = s_{p,1}", "If C_{i}⊆"):
             self.assertIn(marked, body)

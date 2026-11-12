@@ -14,7 +14,7 @@
 \graphicspath{{figures/}}
 
 \title{\textbf{PLaMo Paper Translator: Local, Sentence-Aligned\\Bilingual Reading of Academic PDFs}\\[4pt]
-\large User Manual, Version 1.1}
+\large User Manual, Version 1.2}
 \author{The PLaMo Paper Translator Project}
 \date{November 2026}
 
@@ -22,7 +22,7 @@
 \maketitle
 
 \begin{abstract}
-PLaMo Paper Translator is a desktop application that turns an academic PDF into a sentence-aligned bilingual document and keeps everything on the reader's own computer. The application extracts text, figures and numbered equations from the PDF, translates each sentence with PLaMo 3 Translate running locally through llama.cpp, and presents the result in a three-pane reader with a table of contents, cross-reference links, bookmarks, notes and pinned clips. This manual is written in the form of a research paper so that it can double as a realistic test document: it contains numbered sections, figures, tables, display equations, an algorithm and a reference list. We describe installation (Section~\ref{sec:install}), the document pipeline (Section~\ref{sec:pipeline}), translation (Section~\ref{sec:translation}), the reading interface (Section~\ref{sec:reader}), quality checks (Section~\ref{sec:quality}) and the paper library (Section~\ref{sec:library}).
+PLaMo Paper Translator is a desktop application that turns an academic PDF into a sentence-aligned bilingual document and keeps everything on the reader's own computer. The application extracts text, figures and numbered equations from the PDF, translates each sentence with PLaMo 3 Translate running locally through llama.cpp, and presents the result in a three-pane reader with a table of contents, cross-reference links, bookmarks, notes, pinned clips and a side panel for a Markdown summary of the paper. This manual is written in the form of a research paper so that it can double as a realistic test document: it contains numbered sections, figures, tables, display equations, an algorithm and a reference list. We describe installation (Section~\ref{sec:install}), the document pipeline (Section~\ref{sec:pipeline}), translation (Section~\ref{sec:translation}), the reading interface (Section~\ref{sec:reader}), quality checks (Section~\ref{sec:quality}) and the paper library (Section~\ref{sec:library}).
 \end{abstract}
 
 \noindent\textbf{Keywords:} machine translation, PDF processing, local inference, reading interface, PLaMo
@@ -45,7 +45,7 @@ The main contributions of the application are as follows.
   \item A fully local pipeline that needs no network connection after the first setup.
   \item Structure-aware extraction that keeps headings, captions, numbered equations and reference entries intact.
   \item Context-aware translation that sends neighbouring sentences from the same paragraph to the model.
-  \item A research-oriented reader with cross-reference jumps, notes, bookmarks, clips, a quality check and a searchable library.
+  \item A research-oriented reader with cross-reference jumps, notes, bookmarks, clips, a summary panel with mathematics and figure references, a quality check and a searchable library.
 \end{itemize}
 
 \section{System Overview}
@@ -163,6 +163,20 @@ Figures are cropped from the rendered page rather than taken from the embedded i
 \end{equation}
 pixels per point. The extracted text of the equation is kept for search and copying, but the image is treated as the authoritative form and is never translated.
 
+\subsection{Subscripts and Superscripts}
+\label{sec:scripts}
+Plain text extraction loses the difference between $E_\text{algo}$ and ``Ealgo''. The application therefore compares each text fragment $f$ with the fragment $b$ before it. Let $z$ denote the font size and $\Delta y = y_f - y_b$ the shift of the baseline. When $z_b \ge 1.15\, z_f$, the fragment is classified as
+\begin{equation}
+  \operatorname{role}(f) =
+  \begin{cases}
+    \text{superscript} & \text{if } \Delta y \ge 0.2\, z_b,\\
+    \text{subscript} & \text{if } \Delta y \le -0.08\, z_b,\\
+    \text{normal} & \text{otherwise,}
+  \end{cases}
+  \label{eq:scripts}
+\end{equation}
+so small capitals on the same baseline stay normal text. A script is stored in the text as \verb|E_{algo}| or \verb|b^{*}| and shown as a real subscript or superscript in the reader and in exports. Pieces of one script, such as $p$, a comma and $k$ in $s_{p,k}$, are joined. In a test with 60 sentences, PLaMo 3 Translate kept all 126 marked scripts unchanged; a flattened script would be restored automatically.
+
 \section{Translation}
 \label{sec:translation}
 
@@ -239,7 +253,7 @@ that is, a percentage rounded to one decimal place.
 \label{sec:reader}
 
 \subsection{Layout}
-The reader is not tied to the page size of the PDF. On a wide screen the outline is fixed on the left and the bookmark list on the right, as in Figure~\ref{fig:reader}. On a tablet both lists move above the text, and on a narrow screen the note field moves below each pair.
+The reader is not tied to the page size of the PDF. On a wide screen the outline is fixed on the left and the bookmark list on the right, as in Figure~\ref{fig:reader}; while the summary panel is open, the bookmark list moves below the outline. On a tablet both lists move above the text, and on a narrow screen the note field moves below each pair.
 
 \subsection{Navigation and Cross-References}
 References such as ``Fig.~3'', ``Eq.~(2)'' and ``Table~1'' become links. When several segments carry the same number, the one with an image is preferred. Each jump is recorded, and the \emph{Back} button returns to the previous position; the last 20 positions are kept. A figure that appears in the PDF far from its first mention is moved to just after that mention.
@@ -270,6 +284,36 @@ Figure~\ref{fig:panels} shows the outline and the clip shelf.
   \label{fig:panels}
 \end{figure}
 
+\subsection{Paper Summary}
+\label{sec:summary}
+The \emph{Summary} button, or \textsc{Alt+S}, opens a panel at the right edge of the window (Figure~\ref{fig:summary}). The page becomes narrower instead of being covered, so the paper can be read while the summary is written. The panel holds tags, the source URL, the reading status and free notes, and saves them automatically. Its width can be changed by dragging the left edge.
+
+The notes are written in Markdown with the additions in Table~\ref{tab:summary}. Mathematics uses TeX notation and is rendered with KaTeX~\cite{katex}, which is bundled with the application, so no network access is needed. The \emph{To summary} button on every row inserts that row: a sentence becomes a quotation with a link back to the row, and a figure or equation becomes an embedded image. \emph{Edit} and \emph{View} switch between the text and the rendered notes; while editing, a paragraph that contains mathematics or references is previewed below the text.
+
+\begin{table}[t]
+  \centering
+  \caption{Additions to Markdown in the summary.}
+  \label{tab:summary}
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    Notation & Result \\
+    \midrule
+    \verb|$\sigma = 216/72$| & inline mathematics \\
+    \verb|$$ ... $$| & display mathematics \\
+    \verb|Fig. 2|, \verb|Eq. (4)| & link to the figure or equation \\
+    \verb|![[Fig. 2]]| & embedded figure image \\
+    \verb|[[#123]]| & link to row 123 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.82\columnwidth]{fig-summary.png}
+  \caption{The summary panel showing rendered notes: headings, a display equation, an embedded figure and a quoted row with a link back to the text.}
+  \label{fig:summary}
+\end{figure}
+
 \subsection{Editing and Retranslation}
 The \emph{Edit} button corrects a single translation. \emph{Retranslate} sends one segment to the model again with the same context and glossary. The previous text is kept as a revision; up to 20 revisions per segment can be viewed and restored. Equation images cannot be edited.
 
@@ -285,9 +329,9 @@ Table~\ref{tab:shortcuts} lists the shortcuts.
     Keys & Action \\
     \midrule
     \textsc{Alt+L} & open the library \\
-    \textsc{Alt+S} & open the paper summary \\
+    \textsc{Alt+S} & open or close the summary panel \\
     \textsc{Alt+Shift+P} & restart and open (Chrome) \\
-    \textsc{Esc} & close the current dialog \\
+    \textsc{Esc} & close the current dialog or panel \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -352,7 +396,7 @@ and every path must lie inside \texttt{data/jobs}, \texttt{data/uploads} or \tex
 
 \section{Export and Licensing}
 \label{sec:export}
-Table~\ref{tab:export} lists the export formats. Every export carries the attribution ``Built with PLaMo'' and names the model, as required by the PLaMo Community License~\cite{plamolicense}. Use within an organisation can count as commercial use under that license; check its conditions before deploying the application at work.
+Table~\ref{tab:export} lists the export formats. The summary is placed at the top of the HTML and Markdown exports. In HTML, references link to the rows of the same file, and KaTeX is embedded only when the summary contains mathematics. Every export carries the attribution ``Built with PLaMo'' and names the model, as required by the PLaMo Community License~\cite{plamolicense}. Use within an organisation can count as commercial use under that license; check its conditions before deploying the application at work.
 
 \begin{table}[t]
   \centering
@@ -362,8 +406,8 @@ Table~\ref{tab:export} lists the export formats. Every export carries the attrib
     \toprule
     Format & Contents \\
     \midrule
-    HTML & single file with embedded figures and notes \\
-    Markdown & source and translation, one pair per entry \\
+    HTML & single file with embedded figures, notes and the rendered summary \\
+    Markdown & summary, then source and translation, one pair per entry \\
     JSON & all segments, tags, summary and reading status \\
     \bottomrule
   \end{tabular}
@@ -373,16 +417,16 @@ When publishing translations of other people's papers, check the license of each
 
 \section{Limitations}
 \label{sec:limitations}
-The application needs a PDF that contains text; scanned pages must be processed with OCR first. Two-column layouts are read in the order stored in the PDF, which is usually but not always the reading order. Figures drawn only with vector graphics are not cropped, and their text is kept as ordinary segments. Inline mathematics is translated as text. Finally, machine translation can be wrong: results used for submissions, contracts or medical decisions must be checked by an expert.
+The application needs a PDF that contains text; scanned pages must be processed with OCR first. Two-column layouts are read in the order stored in the PDF, which is usually but not always the reading order. Figures drawn only with vector graphics are not cropped, and their text is kept as ordinary segments. Inline mathematics is translated as text; subscripts and superscripts are kept (Section~\ref{sec:scripts}), but fractions and stacked limits inside a sentence become flat scripts. Finally, machine translation can be wrong: results used for submissions, contracts or medical decisions must be checked by an expert.
 
 \section{Conclusion}
 \label{sec:conclusion}
 PLaMo Paper Translator brings structure-aware, sentence-level translation of academic papers to an ordinary laptop without sending any text to the cloud. We hope this manual is useful both as a guide and as a test document. Because it is dedicated to the public domain, it can be translated, shown in videos and redistributed without restriction.
 
 \section*{Acknowledgments}
-The application is built with PLaMo. It relies on llama.cpp, pypdf, Pillow and PDFium, and we thank their developers.
+The application is built with PLaMo. It relies on llama.cpp, pypdf, Pillow, PDFium and KaTeX, and we thank their developers.
 
-\begin{thebibliography}{9}
+\begin{thebibliography}{10}
 \bibitem{plamo3}
 Preferred Networks, Inc.
 \newblock PLaMo 3 Translate 8B (GGUF).
@@ -413,6 +457,11 @@ J.~A.~Clark and contributors.
 \newblock Pillow: the friendly PIL fork.
 \newblock \url{https://python-pillow.org/}.
 
+\bibitem{katex}
+KaTeX contributors.
+\newblock KaTeX: the fastest math typesetting library for the web.
+\newblock \url{https://katex.org/}.
+
 \bibitem{nativemessaging}
 Google.
 \newblock Native messaging.
@@ -434,7 +483,7 @@ Creative Commons.
 \label{app:api}
 Table~\ref{tab:api} lists the main endpoints of \texttt{app.py}. They are intended for the bundled reader and the Chrome launcher~\cite{nativemessaging}; they are not a stable public interface.
 
-\begin{table}[h]
+\begin{table}[ht]
   \centering
   \caption{Main HTTP endpoints.}
   \label{tab:api}

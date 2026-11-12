@@ -30,3 +30,6 @@ desktop.ini
 docs/manual/*.aux
 docs/manual/*.log
 docs/manual/*.out
+
+# Temporary page written by docs/manual/capture_screens.py
+static/_manual_capture.html

@@ -775,7 +775,7 @@ def _block_kind(text: str) -> str:
     letters = len(re.findall(r"[A-Za-z\u3040-\u30ff\u3400-\u9fff]", compact))
     if math_symbols >= 2 and (letters < 30 or math_symbols / max(len(compact), 1) > 0.08):
         return "equation"
-    if re.match(r"^\[\d{1,4}\]\s", compact):
+    if re.match(r"^\[\d{1,4}\]\s", compact) or re.search(r"\.\s+\[\d{1,4}\]\s+[A-Z]", compact):
         # A numbered reference entry is prose even when it is full of years,
         # volumes and page numbers. Sentence splitting then separates "[2]"
         # from a preceding "[1]" entry in the same paragraph.
