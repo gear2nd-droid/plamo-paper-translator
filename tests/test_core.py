@@ -401,6 +401,11 @@ class CoreTests(unittest.TestCase):
             ["heading", "citation", "citation", "heading", "sentence"],
         )
 
+    def test_section_numbers_do_not_make_prose_a_table(self):
+        text = "We describe installation (Section 3), the document pipeline (Section 4), translation (Section 5), the reading interface (Section 6), quality checks (Section 7) and the paper library (Section 8)."
+        self.assertEqual(split_document_units(text)[0][1], "sentence")
+        self.assertEqual(split_document_units("1.2 3.4 5.6 7.8 9.0 2.1")[0][1], "table")
+
     def test_reference_block_starting_inside_a_wrapped_url_is_prose(self):
         text = "com/docs/concepts/ native-messaging . [9] Creative Commons. Attribution 4.0 International (CC BY 4.0). [10] Creative Commons. CC0 1.0."
         units = split_document_units(text)

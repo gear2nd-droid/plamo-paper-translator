@@ -780,7 +780,10 @@ def _block_kind(text: str) -> str:
         # volumes and page numbers. Sentence splitting then separates "[2]"
         # from a preceding "[1]" entry in the same paragraph.
         return "sentence"
-    numeric_tokens = len(re.findall(r"(?<!\w)[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?!\w)", compact))
+    # "(Section 3) ... (Section 8)" is prose: numbers that only name a
+    # section, figure, table or equation do not make a line a table row.
+    countable = re.sub(r"\b(?:sections?|sec\.|chapters?|figures?|figs?\.|tables?|equations?|eqs?\.|§)\s*\(?\d+(?:\.\d+)*\)?", " ", compact, flags=re.I)
+    numeric_tokens = len(re.findall(r"(?<!\w)[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?!\w)", countable))
     if numeric_tokens >= 5 and numeric_tokens >= max(3, len(compact.split()) // 4):
         return "table"
     return "sentence"
