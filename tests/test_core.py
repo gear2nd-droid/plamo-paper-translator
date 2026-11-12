@@ -503,6 +503,50 @@ class CoreTests(unittest.TestCase):
         self.assertIn("E<sub>algo</sub>(M) &lt;is&gt;", html_export)
         self.assertIn("E<sub>algo</sub>(M)", bilingual_markdown("T", [segment]))
 
+    def _summary_segments(self):
+        return [
+            Segment(0, 1, "1 Introduction", translation="1 はじめに", kind="heading"),
+            Segment(1, 1, "Figure 2: Architecture.", translation="図2：構成。", kind="figure", assets=["/api/assets/d/fig.png"]),
+            Segment(2, 1, "x = 1 (4)", kind="equation", label="equation:4", assets=["/api/assets/d/eq4.png"]),
+            Segment(3, 1, "Translation runs locally.", translation="翻訳はローカルで動く。"),
+        ]
+
+    def test_markdown_export_includes_portable_summary(self):
+        summary = "## 結果\n図2を見る。$x_{i}$ と E_{algo}\n\n![[図2]]\n\n> 引用 [[#4]]\n\n[[表9]] ![[#4]]"
+        exported = bilingual_markdown(
+            "T", self._summary_segments(), summary=summary, tags=["LLM"], source_url="https://arxiv.org/abs/1", reading_status="reading",
+        )
+        head = exported.split("## 1 Introduction")[0]
+        self.assertIn("## まとめ\n\n- タグ: LLM\n- 原文: https://arxiv.org/abs/1\n- 読書状態: 読書中", head)
+        self.assertIn("### 結果", head)
+        self.assertIn("$x_{i}$ と E<sub>algo</sub>", head)
+        self.assertIn("![図2](/api/assets/d/fig.png)", head)
+        self.assertIn("> 引用 #004", head)
+        self.assertIn("表9", head)
+        self.assertNotIn("[[", head)
+        self.assertIn("> 翻訳はローカルで動く。（#004）", head)
+
+    def test_markdown_export_without_summary_is_unchanged(self):
+        self.assertNotIn("## まとめ", bilingual_markdown("T", self._summary_segments()))
+
+    def test_html_export_includes_summary_renderer(self):
+        static_dir = Path(__file__).resolve().parents[1] / "static"
+        segments = self._summary_segments()
+        exported = bilingual_html("T", segments, summary="図2と ![[式4]] </script><b>", static_dir=static_dir)
+        self.assertIn('id="segment-1"', exported)
+        self.assertIn('<section class="paper-summary"', exported)
+        self.assertLess(exported.index("paper-summary"), exported.index('class="labels"'))
+        self.assertIn("&lt;/script&gt;&lt;b&gt;", exported)
+        self.assertIn('"figure:2": 1', exported)
+        self.assertIn('"equation:4": 2', exported)
+        self.assertIn("\\u003c/script>", exported)
+        self.assertNotIn("data:font/woff2", exported)
+        self.assertLess(exported.index('id="segment-3"'), exported.index("paper-summary-data"))
+        with_math = bilingual_html("T", segments, summary="$x^2$", static_dir=static_dir)
+        self.assertIn("data:font/woff2;base64,", with_math)
+        self.assertNotIn("url(fonts/", with_math)
+        self.assertNotIn("paper-summary", bilingual_html("T", segments, static_dir=static_dir))
+
     def test_bundled_manual_extracts_every_numbered_element(self):
         manual = Path(__file__).resolve().parents[1] / "docs" / "manual" / "manual.pdf"
         if not manual.exists():

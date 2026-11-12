@@ -950,6 +950,16 @@ def _translation_quality_issues(job: dict[str, Any]) -> list[dict[str, Any]]:
     return issues
 
 
+def _export_summary_fields(job: dict[str, Any]) -> dict[str, Any]:
+    """The paper notes included at the top of HTML and Markdown exports."""
+    return {
+        "summary": str(job.get("paper_summary", "") or ""),
+        "tags": [str(tag) for tag in job.get("tags", []) if isinstance(tag, str)],
+        "source_url": str(job.get("source_url", "") or ""),
+        "reading_status": str(job.get("reading_status", "") or ""),
+    }
+
+
 def _translate_job(job_id: str) -> None:
     with state_lock:
         job = jobs[job_id]
@@ -1149,7 +1159,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             fmt = urllib.parse.parse_qs(parsed.query).get("format", ["html"])[0]
             if fmt == "md":
-                content = bilingual_markdown(job["title"], job["segments"]).encode("utf-8")
+                content = bilingual_markdown(job["title"], job["segments"], **_export_summary_fields(job)).encode("utf-8")
                 content_type, ext = "text/markdown; charset=utf-8", "md"
             elif fmt == "json":
                 export_payload = document_to_dict(
@@ -1166,7 +1176,13 @@ class Handler(BaseHTTPRequestHandler):
                 content = json.dumps(export_payload, ensure_ascii=False, indent=2).encode("utf-8")
                 content_type, ext = "application/json; charset=utf-8", "json"
             else:
-                content = bilingual_html(job["title"], job["segments"], asset_resolver=_inline_asset).encode("utf-8")
+                content = bilingual_html(
+                    job["title"],
+                    job["segments"],
+                    asset_resolver=_inline_asset,
+                    static_dir=STATIC_DIR,
+                    **_export_summary_fields(job),
+                ).encode("utf-8")
                 content_type, ext = "text/html; charset=utf-8", "html"
             filename = re.sub(r"[^\w\-]+", "_", job["title"])[:60] or "translation"
             self.send_response(200)
