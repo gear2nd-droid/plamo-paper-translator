@@ -1,8 +1,32 @@
 # PLaMo Paper Translator
 
-PLaMo 3 Translate をこのPC上で動かし、PDF論文を一文単位の対訳にするローカルアプリです。原文・訳文・箇所別メモを3ペインで確認でき、小節構造から生成した目次、セグメント別ブックマーク、固定クリップを使いながら読み進められます。結果はHTML / Markdown / JSON へ保存できます。
+PLaMo 3 Translate をこのPC上で動かし、PDF論文を一文単位の対訳にするローカルアプリです。論文の内容を外部へ送らずに翻訳できます。
+
+- 原文・訳文・箇所別メモを一文ずつ並べて表示。番号付き数式は画像のまま、本文中の下付き・上付き文字も保持します。
+- 小節構造から生成した目次、「Figure 2」などの参照リンク、ブックマーク、固定クリップで論文の中を行き来できます。
+- 読みながら書けるまとめパネル（Markdown・数式・図の埋め込み）と、翻訳の機械チェック、横断検索できる論文ライブラリ。
+- 結果はHTML / Markdown / JSON へ保存。Chrome拡張のボタン（`Alt + Shift + P`）からも起動できます。
 
 > Built with PLaMo. モデル本体はリポジトリに同梱せず、初回セットアップ時にPFNの公式配布元から取得します。
+
+![閲覧画面：左に目次、中央に原文と訳文、右にメモとブックマーク](docs/manual/figures/fig-reader.png)
+
+## まず試す
+
+デモ動画（約70秒）：[論文PDFを手元のPCだけで対訳に｜PLaMo Paper Translator デモ](https://www.youtube.com/watch?v=pXtkL5Bdif4)
+
+インストール後、同梱の [`docs/manual/manual.pdf`](docs/manual/manual.pdf) を読み込んでみてください。このアプリのマニュアルを英語の論文形式で書いたPDFで、図・表・番号付き数式・参考文献・付録を含みます。CC0（パブリックドメイン）なので、翻訳結果を動画や記事に載せる場合も原文側のクレジットは不要です（翻訳結果には `Built with PLaMo` の表示が必要です）。
+
+## English
+
+PLaMo Paper Translator turns an academic PDF into a sentence-aligned bilingual document on your own PC. Translation runs locally with PLaMo 3 Translate and llama.cpp, so the paper never leaves your machine. Figures and numbered equations are kept as images, subscripts and superscripts are preserved, and the reader offers an outline, cross-reference links, bookmarks, pinned clips, a Markdown summary panel with math, a quality check and a searchable library. Results can be exported to HTML, Markdown or JSON.
+
+- **Demo video (about 70 s):** [Read Academic PDFs Side by Side, Fully Offline](https://www.youtube.com/watch?v=3HeDeQIU8pc)
+- **Requirements:** Windows. An NVIDIA GPU is recommended (developed on an RTX 2000 Ada laptop GPU with 16 GB); without one, the Vulkan build of llama.cpp is used. The default 8B model file is about 5.3 GB; a 2B model (1.8 GB) is available for smaller GPUs.
+- **Quick start:** run `Start-PLaMoPaperTranslator.cmd`, read and accept the PLaMo Community License summary, and the setup script downloads llama.cpp and the model from the official sources. The reader opens at `http://127.0.0.1:7865`.
+- **Try it:** load [`docs/manual/manual.pdf`](docs/manual/manual.pdf), the app's own user manual written as a paper (CC0).
+- **Languages:** the user interface is in Japanese. Source and target languages include English, Japanese, Chinese, Korean, German and French.
+- **License:** the app's code is MIT. The model is under the [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-ja); translations you publish must show "Built with PLaMo". Commercial use, including use inside an organisation, has its own conditions.
 
 ## このPC向けの構成
 
