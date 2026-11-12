@@ -40,6 +40,7 @@ from paper_core import (
     neighboring_context,
     parse_glossary,
     segments_for_mode,
+    strip_script_markup,
 )
 
 
@@ -511,7 +512,8 @@ def _library_item(job: dict[str, Any], query: str = "") -> dict[str, Any]:
             elif isinstance(segment, dict):
                 candidates.extend([str(segment.get(key, "")) for key in ("source", "translation", "note")])
         for candidate in candidates:
-            compact = re.sub(r"\s+", " ", candidate).strip()
+            # Search the visible text: "Ealgo" finds "E_{algo}".
+            compact = re.sub(r"\s+", " ", strip_script_markup(candidate)).strip()
             position = compact.casefold().find(normalized_query)
             if position >= 0:
                 start = max(0, position - 55)

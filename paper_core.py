@@ -32,6 +32,8 @@ EQUATION_MARKER_PATTERN = re.compile(rf"^{re.escape(EQUATION_MARKER)}(\d{{1,3}})
 # Prefix for a heading verified by its font size in the PDF layout, such as an
 # appendix heading "A Proofs" that has no punctuation after the letter.
 HEADING_MARKER = "\uE103"
+# Subscripts and superscripts recognised from the PDF layout: E_{algo}, b^{\u22C6}.
+SCRIPT_MARKUP_PATTERN = re.compile(r"([_^])\{([^{}\n]{1,80})\}")
 PLAMO_LICENSE_URL = "https://plamo.preferredai.jp/info/plamo-community-license-ja"
 PLAMO_ATTRIBUTION = "Built with PLaMo"
 
@@ -75,7 +77,7 @@ def _numbered_title_is_heading(number: str, raw_number: str, title: str) -> bool
 
 def heading_level(text: str) -> int:
     """Infer a section depth from a normalized academic-paper heading."""
-    compact = text.strip().removeprefix(CAPTION_MARKER).removeprefix(BODY_MARKER)
+    compact = strip_script_markup(text).strip().removeprefix(CAPTION_MARKER).removeprefix(BODY_MARKER)
     compact = EQUATION_MARKER_PATTERN.sub("", compact).strip()
     layout_verified = compact.startswith(HEADING_MARKER)
     compact = compact.removeprefix(HEADING_MARKER).strip()
@@ -188,7 +190,7 @@ class ExtractedPageImage:
 
 
 def _mostly_nonlinguistic(text: str) -> bool:
-    compact = re.sub(r"\s+", "", text)
+    compact = re.sub(r"\s+", "", strip_script_markup(text))
     if not compact:
         return True
     letters = len(re.findall(r"[A-Za-z\u3040-\u30ff\u3400-\u9fff]", compact))
@@ -300,7 +302,7 @@ def _positioned_captions(
             pieces.append(value)
             if previous_y - y > 2:
                 previous_y = y
-        caption = re.sub(r"\s+", " ", "".join(pieces)).strip()
+        caption = _merge_adjacent_scripts(re.sub(r"\s+", " ", "".join(pieces)).strip())
         if caption:
             captions.append(PositionedCaption(caption, start_x, start_y))
     return captions
@@ -568,16 +570,19 @@ def _positioned_equations(
 
 
 def _mark_equation_boundaries(text: str, equations: list[PositionedEquation]) -> str:
+    # The layout text of an equation has no script markup but the page text
+    # does (E_{algo}), so markup characters may appear between characters.
+    gap = r"(?:\s|[_^]\{|\})*"
     for equation in equations:
         compact_equation = re.sub(r"\s+", "", equation.text)
         if not compact_equation:
             continue
-        patterns = [r"\s*".join(re.escape(character) for character in compact_equation)]
+        patterns = [gap.join(re.escape(character) for character in compact_equation) + r"\}?"]
         if len(compact_equation) >= 24:
             patterns.append(
-                rf"{r'\s*'.join(re.escape(character) for character in compact_equation[:12])}"
+                rf"{gap.join(re.escape(character) for character in compact_equation[:12])}"
                 rf"[\s\S]{{0,3000}}?"
-                rf"{r'\s*'.join(re.escape(character) for character in compact_equation[-12:])}"
+                rf"{gap.join(re.escape(character) for character in compact_equation[-12:])}"
             )
         # Plain extraction can order a fraction or a superscript line
         # differently from the layout ("σ = 216 dpi / 72 pt/in = 3 (4)"). Fall
@@ -587,7 +592,7 @@ def _mark_equation_boundaries(text: str, equations: list[PositionedEquation]) ->
         for anchor_size in (8, 5):
             if len(compact_equation) > anchor_size + 4:
                 patterns.append(
-                    rf"{r'\s*'.join(re.escape(character) for character in compact_equation[:anchor_size])}"
+                    rf"{gap.join(re.escape(character) for character in compact_equation[:anchor_size])}"
                     rf"(?:(?!\n\s*\n)[\s\S]){{0,{span}}}?\(\s*{equation.number}\s*\)"
                 )
         for pattern in patterns:
@@ -751,7 +756,7 @@ def split_text(text: str, max_chars: int = 1800) -> list[str]:
 
 
 def _block_kind(text: str) -> str:
-    compact = text.strip()
+    compact = strip_script_markup(text).strip()
     if compact.startswith(EQUATION_MARKER):
         return "equation"
     if compact.startswith(BODY_MARKER):
@@ -1126,6 +1131,105 @@ def _remove_fragment_once(text: str, value: str, *, from_end: bool) -> str:
     return text[: match.start()] + "\n" + text[match.end() :]
 
 
+def strip_script_markup(text: str) -> str:
+    """Return text without subscript/superscript markup: E_{algo} -> Ealgo."""
+    return SCRIPT_MARKUP_PATTERN.sub(r"\2", text)
+
+
+def _script_roles(fragments: list[LayoutFragment], page_width: float) -> dict[int, str]:
+    """Classify small, raised or lowered fragments as superscripts or subscripts.
+
+    A script is set in a smaller font than the character before it and its
+    baseline is shifted: down for a subscript (E_algo), up for a superscript
+    (b^⋆, footnote marks). Small text on the same baseline, such as small
+    capitals, is left alone.
+    """
+    midpoint = page_width / 2
+    roles: dict[int, str] = {}
+    for index, fragment in enumerate(fragments):
+        core = fragment.text.strip()
+        if not core or "{" in core or "}" in core or len(core) > 40:
+            continue
+        for previous in range(index - 1, max(-1, index - 5), -1):
+            base = fragments[previous]
+            if (base.x < midpoint) != (fragment.x < midpoint) or abs(base.y - fragment.y) > 0.75 * max(base.size, fragment.size):
+                break
+            if base.size < fragment.size * 1.15:
+                if previous in roles and abs(base.size - fragment.size) < 0.3 and abs(base.y - fragment.y) < 0.8:
+                    # The next piece of the same script, e.g. "i=" then "1".
+                    roles[index] = roles[previous]
+                    break
+                if abs(base.size - fragment.size) < 0.3:
+                    break
+                continue
+            shift = fragment.y - base.y
+            if shift >= 0.2 * base.size:
+                roles[index] = "sup"
+            elif shift <= -0.08 * base.size:
+                roles[index] = "sub"
+            break
+    return roles
+
+
+def _wrap_script(value: str, role: str) -> str:
+    start = len(value) - len(value.lstrip())
+    end = len(value.rstrip())
+    return f"{value[:start]}{'_' if role == 'sub' else '^'}{{{value[start:end]}}}{value[end:]}"
+
+
+def _apply_script_markup(raw: str, parts: list[str], fragment_parts: list[int], roles: dict[int, str]) -> str:
+    """Insert script markup into the extracted text.
+
+    The extracted text is the visitor fragments in order, except that some
+    fragments (text inside form XObjects such as figure labels) are not in
+    it. Fragments are matched at the cursor; a fragment that does not match
+    is skipped. Markup is only ever inserted, so removing it gives back the
+    original text.
+    """
+    if not roles:
+        return raw
+    role_by_part = {fragment_parts[order]: role for order, role in roles.items() if order < len(fragment_parts)}
+    output: list[str] = []
+    cursor = 0
+    for number, part in enumerate(parts):
+        if not part or not raw.startswith(part, cursor):
+            continue
+        role = role_by_part.get(number)
+        output.append(_wrap_script(part, role) if role else part)
+        cursor += len(part)
+    output.append(raw[cursor:])
+    return _merge_adjacent_scripts("".join(output))
+
+
+def _merge_adjacent_scripts(text: str) -> str:
+    """Join a script split over several fragments: s_{p}_{,}_{k} -> s_{p,k}."""
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"([_^])\{([^{}\n]*)\}\1\{", r"\1{\2", text)
+    return text
+
+
+def restore_script_markup(source: str, translation: str) -> str:
+    """Put back E_{algo} markup that a translation flattened to "Ealgo"."""
+    for match in SCRIPT_MARKUP_PATTERN.finditer(source):
+        marked = match.group(0)
+        if marked in translation:
+            continue
+        base = re.search(r"[^\s(\[{}_^]{1,12}$", strip_script_markup(source[: match.start()]))
+        if not base:
+            continue
+        content = match.group(2)
+        for flattened in (f"{base.group(0)}{match.group(1)}{content}", f"{base.group(0)}{content}"):
+            position = translation.find(flattened)
+            if position >= 0:
+                translation = (
+                    translation[:position] + base.group(0) + marked + translation[position + len(flattened) :]
+                )
+                break
+    return translation
+
+
 def _page_number_candidates_at_edges(
     candidates: list[tuple[str, str]],
     fragments: list[LayoutFragment],
@@ -1329,10 +1433,15 @@ def extract_document(
             page_height = float(page.mediabox.height)
             try:
 
+                text_parts: list[str] = []
+                fragment_parts: list[int] = []
+
                 def collect_fragment(value: str, _cm: Any, tm: list[float], _font: Any, size: float) -> None:
+                    text_parts.append(value)
                     if not value.strip():
                         return
                     x, y = float(tm[4]), float(tm[5])
+                    fragment_parts.append(len(text_parts) - 1)
                     fragments.append((x, y, value))
                     layout_fragments.append(LayoutFragment(len(layout_fragments), x, y, value, float(size)))
                     if float(size) <= 8.5 and 10 < y < 85:
@@ -1342,6 +1451,13 @@ def extract_document(
 
                 raw = page.extract_text(visitor_text=collect_fragment) or ""
                 margin_candidates = _page_number_candidates_at_edges(margin_candidates, layout_fragments)
+                # Layout analysis keeps the plain fragment text; the body text
+                # and caption fragments carry E_{algo} / b^{⋆} markup.
+                roles = _script_roles(layout_fragments, float(page.mediabox.width))
+                raw = _apply_script_markup(raw, text_parts, fragment_parts, roles)
+                for order, role in roles.items():
+                    x, y, value = fragments[order]
+                    fragments[order] = (x, y, _wrap_script(value, role))
             except TypeError:
                 fragments = []
                 layout_fragments = []
@@ -1552,7 +1668,10 @@ class LlamaTranslator:
             result = data["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"翻訳エンジンから予期しない応答が返りました: {data}") from exc
-        return re.sub(r"(?:<\|plamo:(?:tag|bos)\|>)+$", "", result).strip()
+        translation = re.sub(r"(?:<\|plamo:(?:tag|bos)\|>)+$", "", result).strip()
+        # PLaMo keeps E_{algo} markup in practice; repair it if a translation
+        # ever flattens it to "Ealgo".
+        return restore_script_markup(text, translation)
 
 
 def document_to_dict(title: str, segments: Iterable[Segment], **metadata: Any) -> dict[str, Any]:
@@ -1564,6 +1683,11 @@ def document_to_dict(title: str, segments: Iterable[Segment], **metadata: Any) -
         **metadata,
         "segments": [asdict(segment) for segment in segments],
     }
+
+
+def script_html(text: str) -> str:
+    """Render E_{algo} / b^{⋆} markup as <sub>/<sup>; the input is already escaped or Markdown."""
+    return SCRIPT_MARKUP_PATTERN.sub(lambda match: f"<{'sub' if match.group(1) == '_' else 'sup'}>{match.group(2)}</{'sub' if match.group(1) == '_' else 'sup'}>", text)
 
 
 def bilingual_markdown(title: str, segments: Iterable[Segment]) -> str:
@@ -1578,7 +1702,7 @@ def bilingual_markdown(title: str, segments: Iterable[Segment]) -> str:
         if segment.kind == "heading":
             marker = " ★" if segment.bookmarked else ""
             level = min(6, max(2, segment.heading_level + 1))
-            lines.extend([f"{'#' * level} {segment.source}{marker}", "", f"**訳:** {segment.translation or segment.source}", ""])
+            lines.extend([f"{'#' * level} {script_html(segment.source)}{marker}", "", f"**訳:** {script_html(segment.translation or segment.source)}", ""])
             continue
         position = f"P{segment.paragraph} / S{segment.sentence}" if segment.sentence else f"P{segment.paragraph}"
         for asset in segment.assets:
@@ -1587,11 +1711,11 @@ def bilingual_markdown(title: str, segments: Iterable[Segment]) -> str:
             [
                 f"### {segment.index + 1}. 原文（{position}）",
                 "",
-                segment.source,
+                script_html(segment.source),
                 "",
                 "### 訳文",
                 "",
-                segment.translation or f"⚠ {segment.error or '未翻訳'}",
+                script_html(segment.translation) if segment.translation else f"⚠ {segment.error or '未翻訳'}",
                 "",
             ]
         )
@@ -1621,15 +1745,15 @@ def bilingual_html(
         if equation_image:
             source_content = (
                 f'{images}<details class="equation-text"><summary>検索用テキスト</summary>'
-                f'<p>{html.escape(segment.source).replace(chr(10), "<br>")}</p></details>'
+                f'<p>{script_html(html.escape(segment.source)).replace(chr(10), "<br>")}</p></details>'
             )
             translation_content = (
                 f'{images}<details class="equation-text"><summary>抽出テキスト</summary>'
-                f'<p>{html.escape(translation).replace(chr(10), "<br>")}</p></details>'
+                f'<p>{script_html(html.escape(translation)).replace(chr(10), "<br>")}</p></details>'
             )
         else:
-            source_content = f'{images}<p>{html.escape(segment.source).replace(chr(10), "<br>")}</p>'
-            translation_content = f'<p>{html.escape(translation).replace(chr(10), "<br>")}</p>'
+            source_content = f'{images}<p>{script_html(html.escape(segment.source)).replace(chr(10), "<br>")}</p>'
+            translation_content = f'<p>{script_html(html.escape(translation)).replace(chr(10), "<br>")}</p>'
         paragraph_start = bool(segment.paragraph and segment.paragraph != previous_paragraph)
         if segment.paragraph:
             position = f"P{segment.paragraph}<br>S{segment.sentence}" if segment.sentence else f"P{segment.paragraph}"
