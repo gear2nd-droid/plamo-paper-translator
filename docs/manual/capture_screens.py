@@ -67,6 +67,26 @@ MANUAL_SEGMENTS = [
     ("heading", 1, 18, "5 Translation", "5 翻訳", {}),
 ]
 
+MANUAL_SUMMARY = r"""論文形式で書かれたPLaMo Paper Translatorの利用マニュアル。
+
+## 研究課題
+- 英語の論文を**このPCだけで**、構造を保ったまま対訳して読む
+
+## 手法
+構成は図2のとおり。各文の文脈は次の式で作る。
+
+$$
+c_{p,k} = \mathrm{trunc}_{1400}\bigl(u \,\Vert\, B_{p,k} \,\Vert\, A_{p,k}\bigr)
+$$
+
+![[図2]]
+
+> 翻訳そのものは、llama.cppのllama-serverが担います。 [[#10]]
+
+## 次に確認すること
+1. 2Bモデルとの速度差
+"""
+
 LIBRARY_EXTRA = [
     ("0" * 31 + "2", "Sample Notes on Two-Column Layouts", "completed", ["layout", "test"],
      "二段組みPDFの読み順を確認するための自作メモ。", "2026-11-09T09:30:00+00:00"),
@@ -109,7 +129,7 @@ def build_home(home: Path) -> None:
         # headless screenshot blank because of the scroll restore timing.
         MANUAL_JOB, "PLaMo Paper Translator User Manual", segments, reading_status="reading", reading_index=0,
         tags=["manual", "PLaMo", "local inference"],
-        summary="論文形式で書かれたPLaMo Paper Translatorの利用マニュアル。インストール、処理の流れ、翻訳、閲覧画面、ライブラリを説明する。",
+        summary=MANUAL_SUMMARY,
     )
     (jobs_dir / f"{MANUAL_JOB}.json").write_text(json.dumps(manual, ensure_ascii=False), encoding="utf-8")
     for job_id, title, status, tags, summary, updated in LIBRARY_EXTRA:
@@ -153,6 +173,21 @@ def main() -> None:
             library = Path(directory) / "library.png"
             screenshot(f"http://127.0.0.1:{PORT}/?job={MANUAL_JOB}", reader, Path(directory) / "p1")
             screenshot(f"http://127.0.0.1:{PORT}/?library=1", library, Path(directory) / "p2", size=(1100, 820))
+            summary = Path(directory) / "summary.png"
+            # The summary panel opens from a remembered browser setting, so a
+            # short page on the same origin sets it and then opens the paper.
+            opener = ROOT / "static" / "_manual_capture.html"
+            opener.write_text(
+                "<script>localStorage.setItem('plamo-paper-translator.summaryOpen','true');"
+                "localStorage.setItem('plamo-paper-translator.summaryMode','preview');"
+                f"location.replace('/?job={MANUAL_JOB}');</script>",
+                encoding="utf-8",
+            )
+            try:
+                screenshot(f"http://127.0.0.1:{PORT}/_manual_capture.html", summary, Path(directory) / "p3")
+            finally:
+                opener.unlink(missing_ok=True)
+            Image.open(summary).convert("RGB").crop(SUMMARY_CROP).save(FIGURES / "fig-summary.png", optimize=True)
             full = Image.open(reader).convert("RGB")
             full.save(FIGURES / "fig-reader.png", optimize=True)
             for name, box in CROPS.items():
@@ -187,6 +222,8 @@ CROPS = {
     "fig-clips": (2112, 1268, 2840, 1770),
 }
 LIBRARY_CROP = (0, 0, 2200, 1640)
+# The summary panel: 420 px wide at the right edge, below the 76 px top bar.
+SUMMARY_CROP = (2040, 152, 2880, 1600)
 DATA_DIR_BOX = (92, 462, 900, 494)
 
 if __name__ == "__main__":
