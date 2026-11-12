@@ -40,6 +40,7 @@ try {
     Copy-Item -Recurse -Force -LiteralPath "chrome-extension" -Destination $ChromeExtensionDestination
     $LicenseRoot = Join-Path $PackageRoot "licenses"
     New-Item -ItemType Directory -Force -Path $LicenseRoot | Out-Null
+    Copy-Item -Force -LiteralPath "static\vendor\katex\LICENSE" -Destination (Join-Path $LicenseRoot "KaTeX-LICENSE.txt")
 
     $PythonBase = (& $Python -c "import sys; print(sys.base_prefix)").Trim()
     $PythonLicense = Join-Path $PythonBase "LICENSE.txt"

@@ -7,7 +7,7 @@ const CLIP_PARTS = {
 };
 const REFERENCE_PATTERN = /\b(?:fig(?:ure)?s?\.?\s*\d+(?:\s*[-–]\s*\d+)?|eq(?:uation)?s?\.?\s*\(?\d+\)?|tables?\s+\d+)|(?:図|式|表)\s*\(?\d+\)?/gi;
 const ACADEMIC_LINK_PATTERN = /https?:\/\/[^\s<>"']+|(?:doi:\s*)?10\.\d{4,9}\/[-._;()/:a-z0-9]+|arxiv:\s*\d{4}\.\d{4,5}(?:v\d+)?/gi;
-const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], segmentationMode: 'sentence', tocObserver: null, referenceTargets: new Map(), referenceHistory: [], resultsReady: false, paperTags: [], paperSummary: '', paperSourceUrl: '', paperReadingStatus: 'unread', readingIndex: 0, readingSaveTimer: null, lastSavedReadingIndex: null, paperSummaryScrollY: 0, librarySearchTimer: null, revisionSegmentIndex: null };
+const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], segmentationMode: 'sentence', tocObserver: null, referenceTargets: new Map(), referenceHistory: [], resultsReady: false, paperTags: [], paperSummary: '', paperSourceUrl: '', paperReadingStatus: 'unread', readingIndex: 0, readingSaveTimer: null, lastSavedReadingIndex: null, summaryOpen: false, summaryMode: 'edit', summarySaveTimer: null, summarySaving: null, summaryDirty: false, librarySearchTimer: null, revisionSegmentIndex: null };
 const noteTimers = new Map();
 const $ = (id) => document.getElementById(id);
 
@@ -52,6 +52,7 @@ async function upload(file) {
 
 async function startJob() {
   if (!state.documentId) return toast('先に論文を読み込んでください');
+  if (state.summaryOpen) closePaperSummaryPanel();
   const payload = {document_id: state.documentId, title: $('title').value, source_url: $('sourceUrl').value, segmentation_mode: document.querySelector('input[name="segmentationMode"]:checked').value, source_lang: $('sourceLang').value, target_lang: $('targetLang').value, form: $('form').value, context: $('context').value, glossary: $('glossary').value};
   state.resultsReady = false; state.segments = []; state.paperTags = []; state.paperSummary = ''; state.paperSourceUrl = ''; state.paperReadingStatus = 'unread'; state.readingIndex = 0;
   $('step3').classList.remove('results-ready');
@@ -116,6 +117,8 @@ function showResults(data) {
   $('topbarResultStatus').title = resultStatus;
   updatePaperSummaryButton();
   updateReaderToolbar();
+  if (state.summaryOpen) fillSummaryPanel();
+  else if (viewerSetting('summaryOpen') === 'true' && window.innerWidth >= 1100) openPaperSummaryPanel({focus:false});
   ['Html','Md','Json'].forEach((format) => $(`export${format}`).href = `/api/jobs/${state.jobId}/export?format=${format.toLowerCase()}`);
   $('results').innerHTML = state.segments.map((item, position, list) => renderSegment(item, position, list, mode)).join('');
   document.querySelectorAll('.note-editor').forEach(resizeNote);
@@ -157,7 +160,7 @@ function renderSegment(item, position, list, mode) {
     <div class="unit-meta"><b>${String(item.index + 1).padStart(3, '0')}</b><span>${escapeHtml(unitPosition)}</span><i>${escapeHtml(unitLabel)}</i></div>
     <article class="source-pane">${sourceContent}</article>
     <article class="translation-pane">${translationContent}</article>
-    <aside class="memo-pane"><div class="annotation-actions"><button type="button" class="bookmark-toggle" data-bookmark-index="${item.index}" aria-pressed="${bookmarked}" aria-label="${item.index + 1}番をブックマーク${bookmarked ? 'から削除' : 'に追加'}"><span aria-hidden="true">${bookmarked ? '★' : '☆'}</span>${bookmarked ? '登録済み' : 'ブックマーク'}</button><span class="clip-button-group" aria-label="クリップ対象">${clipButtons}</span></div><textarea class="note-editor" rows="1" data-note-index="${item.index}" aria-label="${item.index + 1}番のメモ" placeholder="この箇所へのメモ…">${escapeHtml(item.note || '')}</textarea><small class="note-status">${item.note ? '保存済み' : '未入力'}</small></aside>
+    <aside class="memo-pane"><div class="annotation-actions"><button type="button" class="bookmark-toggle" data-bookmark-index="${item.index}" aria-pressed="${bookmarked}" aria-label="${item.index + 1}番をブックマーク${bookmarked ? 'から削除' : 'に追加'}"><span aria-hidden="true">${bookmarked ? '★' : '☆'}</span>${bookmarked ? '登録済み' : 'ブックマーク'}</button><span class="clip-button-group" aria-label="クリップ対象">${clipButtons}</span><button type="button" class="summary-quote" data-summary-quote="${item.index}" aria-label="${item.index + 1}番をまとめに引用" title="まとめに引用"><span aria-hidden="true">✎</span>まとめへ</button></div><textarea class="note-editor" rows="1" data-note-index="${item.index}" aria-label="${item.index + 1}番のメモ" placeholder="この箇所へのメモ…">${escapeHtml(item.note || '')}</textarea><small class="note-status">${item.note ? '保存済み' : '未入力'}</small></aside>
   </section>`;
 }
 
@@ -358,9 +361,13 @@ function renderPaperNavigation() {
 
 function renderBookmarkList() {
   const bookmarked = state.segments.filter((item) => Boolean(item.bookmarked));
-  $('bookmarkList').innerHTML = bookmarked.length
+  const html = bookmarked.length
     ? bookmarked.map((item) => `<button type="button" class="bookmark-link" data-nav-index="${item.index}"><span aria-hidden="true">★</span><b>${escapeHtml(navigationLabel(item, 54))}</b><small>${String(item.index + 1).padStart(3, '0')}</small></button>`).join('')
     : '<p class="navigation-empty">右側の☆から追加できます。</p>';
+  // The right-hand bookmark column gives way to the summary panel; the
+  // compact copy in the left navigation is shown while the panel is open.
+  $('bookmarkList').innerHTML = html;
+  $('bookmarkListCompact').innerHTML = html;
 }
 
 function itemClips(item) {
@@ -496,7 +503,8 @@ function formatLibraryDate(value) {
 
 function renderLibraryItem(item) {
   const tags = Array.isArray(item.tags) ? item.tags.slice(0, 8).map((tag) => `<span>${escapeHtml(tag)}</span>`).join('') : '';
-  const summary = String(item.summary || '').trim();
+  const rawSummary = String(item.summary || '');
+  const summary = (window.PaperMarkdown ? window.PaperMarkdown.markdownToPlainText(rawSummary) : rawSummary).trim();
   const progress = Math.max(0, Math.min(100, Number(item.reading_progress) || 0));
   const source = item.source_url ? `<a class="library-source" href="${escapeHtml(item.source_url)}" target="_blank" rel="noreferrer">原文を開く ↗</a>` : '';
   const busy = item.status === 'queued' || item.status === 'running';
@@ -876,82 +884,271 @@ function updatePaperSummaryLength() {
   $('paperSummaryLength').textContent = `${$('paperSummaryText').value.length.toLocaleString()} / 20,000`;
 }
 
-function insertPaperSummaryTemplate() {
-  const template = `研究課題\n- \n\n提案・手法\n- \n\nデータ／実験条件\n- \n\n主要な結果\n- \n\n新規性・貢献\n- \n\n限界・注意点\n- \n\n次に確認すること\n- `;
+function insertIntoSummary(text) {
   const editor = $('paperSummaryText');
-  editor.value = editor.value.trim() ? `${editor.value.trimEnd()}\n\n---\n\n${template}` : template;
-  updatePaperSummaryLength();
-  editor.focus({preventScroll:true});
+  const start = editor.selectionStart ?? editor.value.length;
+  const end = editor.selectionEnd ?? start;
+  const before = editor.value.slice(0, start);
+  const after = editor.value.slice(end);
+  const leading = before && !before.endsWith('\n\n') ? (before.endsWith('\n') ? '\n' : '\n\n') : '';
+  const inserted = `${leading}${text}\n\n`;
+  editor.value = `${before}${inserted}${after}`.slice(0, 20000);
+  const caret = Math.min(editor.value.length, before.length + inserted.length);
+  editor.setSelectionRange(caret, caret);
+  onSummaryInput();
+}
+
+function insertPaperSummaryTemplate() {
+  const template = ['研究課題', '提案・手法', 'データ／実験条件', '主要な結果', '新規性・貢献', '限界・注意点', '次に確認すること']
+    .map((heading) => `## ${heading}\n- `).join('\n\n');
+  setSummaryMode('edit');
+  insertIntoSummary(template);
+  $('paperSummaryText').focus({preventScroll:true});
 }
 
 function updatePaperSummaryButton() {
   const hasContent = state.paperTags.length > 0 || Boolean(state.paperSummary.trim());
   $('paperSummaryButton').dataset.hasContent = String(hasContent);
+  $('paperSummaryButton').setAttribute('aria-pressed', String(state.summaryOpen));
   $('paperSummaryCount').textContent = state.paperTags.length ? String(state.paperTags.length) : (hasContent ? '●' : '');
-  $('paperSummaryButton').setAttribute('aria-label', hasContent ? `論文のまとめを編集（タグ${state.paperTags.length}件）` : '論文のまとめを作成');
+  $('paperSummaryButton').setAttribute('aria-label', hasContent ? `論文のまとめ（タグ${state.paperTags.length}件）を${state.summaryOpen ? '閉じる' : '開く'}` : '論文のまとめを作成');
 }
 
-function openPaperSummaryDialog() {
-  if (!state.jobId || !state.resultsReady) return;
-  state.paperSummaryScrollY = window.scrollY;
-  document.body.style.top = `-${state.paperSummaryScrollY}px`;
-  document.body.classList.add('paper-summary-open');
+function updateSummaryMetaHint() {
+  const statusLabels = {unread:'未読', reading:'読書中', completed:'読了', archived:'保留'};
+  const tags = parsePaperTags($('paperTags').value);
+  $('summaryMetaHint').textContent = `${statusLabels[$('paperReadingStatus').value] || ''}${tags.length ? ` · タグ${tags.length}件` : ''}`;
+}
+
+function segmentByIndex(index) {
+  return state.segments.find((item) => Number(item.index) === Number(index)) || null;
+}
+
+function summaryReference(label, embed) {
+  const rowNumber = label.match(/^#\s*(\d{1,5})$/);
+  let index;
+  if (rowNumber) {
+    index = Number(rowNumber[1]) - 1;
+  } else {
+    const identity = referenceIdentity(label);
+    index = identity ? state.referenceTargets.get(referenceKey(identity.type, identity.number)) : undefined;
+  }
+  const item = Number.isInteger(index) ? segmentByIndex(index) : null;
+  if (!item) return `<span class="summary-ref-missing" title="この論文に参照先が見つかりません">${escapeHtml(`${embed ? '!' : ''}[[${label}]]`)}</span>`;
+  const linkLabel = rowNumber ? `#${String(index + 1).padStart(3, '0')}` : label;
+  const link = `<button type="button" class="reference-link summary-ref" data-reference-index="${index}" title="本文の該当箇所へ移動">${escapeHtml(linkLabel)}</button>`;
+  if (!embed) return link;
+  const assets = Array.isArray(item.assets) ? item.assets : [];
+  const body = assets.length
+    ? assets.map((asset) => `<img src="${escapeHtml(asset)}" alt="${escapeHtml(linkLabel)}" loading="lazy">`).join('')
+    : `<span class="summary-embed-text">${renderReferencedText(item.translation || item.source, index)}</span>`;
+  return `<span class="summary-embed" role="figure">${body}<span class="summary-embed-caption">${link} ${escapeHtml(navigationLabel(item, 56))}</span></span>`;
+}
+
+function renderSummaryMarkdown(value) {
+  if (!window.PaperMarkdown) return `<p>${escapeHtml(value)}</p>`;
+  return window.PaperMarkdown.renderMarkdown(value, {
+    text: (text) => renderReferencedText(text, -1),
+    reference: summaryReference,
+  });
+}
+
+function renderSummaryPreview() {
+  const value = $('paperSummaryText').value;
+  $('summaryPreviewPane').innerHTML = value.trim()
+    ? renderSummaryMarkdown(value)
+    : '<p class="summary-empty">まだ何も書かれていません。「編集」から書き始めるか、本文の各行の「まとめへ」で引用できます。</p>';
+}
+
+function currentSummaryBlock() {
+  const editor = $('paperSummaryText');
+  const value = editor.value;
+  const caret = editor.selectionStart ?? value.length;
+  const start = value.lastIndexOf('\n\n', Math.max(0, caret - 1));
+  const end = value.indexOf('\n\n', caret);
+  return value.slice(start < 0 ? 0 : start + 2, end < 0 ? value.length : end);
+}
+
+function updateSummaryCaretPreview() {
+  const preview = $('summaryCaretPreview');
+  if (state.summaryMode !== 'edit') { preview.hidden = true; return; }
+  const block = currentSummaryBlock();
+  const hasRichContent = /\$[^$\s]|\[\[|図\s*\d|式\s*\(?\d|表\s*\d|fig(?:ure)?\.?\s*\d|eq(?:uation)?\.?\s*\(?\d/i.test(block);
+  preview.hidden = !hasRichContent;
+  if (hasRichContent) preview.innerHTML = renderSummaryMarkdown(block);
+}
+
+function setSummaryMode(mode) {
+  state.summaryMode = mode === 'preview' ? 'preview' : 'edit';
+  const preview = state.summaryMode === 'preview';
+  $('summaryModeEdit').setAttribute('aria-pressed', String(!preview));
+  $('summaryModePreview').setAttribute('aria-pressed', String(preview));
+  $('summaryEditPane').hidden = preview;
+  $('summaryPreviewPane').hidden = !preview;
+  if (preview) renderSummaryPreview();
+  else updateSummaryCaretPreview();
+  rememberViewerSetting('summaryMode', state.summaryMode);
+}
+
+function rememberViewerSetting(key, value) {
+  try { localStorage.setItem(`plamo-paper-translator.${key}`, String(value)); } catch (_) { /* storage may be unavailable */ }
+}
+
+function viewerSetting(key) {
+  try { return localStorage.getItem(`plamo-paper-translator.${key}`); } catch (_) { return null; }
+}
+
+function applySummaryWidth(width) {
+  const maximum = Math.max(320, Math.min(820, window.innerWidth * 0.62));
+  const clamped = Math.round(Math.min(maximum, Math.max(300, Number(width) || 420)));
+  document.documentElement.style.setProperty('--summary-width', `${clamped}px`);
+  return clamped;
+}
+
+function fillSummaryPanel() {
   $('paperTags').value = state.paperTags.join(', ');
   $('paperSourceUrl').value = state.paperSourceUrl;
   $('paperReadingStatus').value = state.paperReadingStatus;
   $('paperSummaryText').value = state.paperSummary;
-  $('paperSummaryStatus').textContent = 'このPC内の翻訳ジョブに保存されます。';
-  $('paperSummaryStatus').className = 'dialog-status';
   renderPaperTagPreview();
   updatePaperSummaryLength();
-  $('paperSummaryDialog').showModal();
-  requestAnimationFrame(() => {
-    $('paperTags').focus({preventScroll: true});
-  });
+  updateSummaryMetaHint();
+  setSummaryStatus('入力すると自動保存します。');
+  setSummaryMode(state.summaryMode);
 }
 
-function closePaperSummaryDialog() {
-  if ($('paperSummaryDialog').open) $('paperSummaryDialog').close();
-  document.body.classList.remove('paper-summary-open');
-  document.body.style.removeProperty('top');
-  window.scrollTo({top: state.paperSummaryScrollY, behavior: 'auto'});
-  requestAnimationFrame(() => window.scrollTo({top: state.paperSummaryScrollY, behavior: 'auto'}));
+function openPaperSummaryPanel({focus = true} = {}) {
+  if (!state.jobId || !state.resultsReady) return;
+  if (!state.summaryOpen) fillSummaryPanel();
+  state.summaryOpen = true;
+  $('summaryPanel').hidden = false;
+  document.body.classList.add('summary-open');
+  rememberViewerSetting('summaryOpen', 'true');
+  updatePaperSummaryButton();
+  if (focus) {
+    requestAnimationFrame(() => (state.summaryMode === 'preview' ? $('summaryModePreview') : $('paperSummaryText')).focus({preventScroll:true}));
+  }
 }
 
-async function savePaperSummary(event) {
-  event.preventDefault();
+async function closePaperSummaryPanel() {
+  if (!state.summaryOpen) return;
+  await flushSummarySave();
+  state.summaryOpen = false;
+  $('summaryPanel').hidden = true;
+  document.body.classList.remove('summary-open');
+  rememberViewerSetting('summaryOpen', 'false');
+  updatePaperSummaryButton();
+}
+
+function togglePaperSummaryPanel() {
+  if (state.summaryOpen) closePaperSummaryPanel();
+  else openPaperSummaryPanel();
+}
+
+function setSummaryStatus(message, kind = '') {
+  $('paperSummaryStatus').textContent = message;
+  $('paperSummaryStatus').className = `dialog-status${kind ? ` ${kind}` : ''}`;
+}
+
+function onSummaryInput() {
+  updatePaperSummaryLength();
+  updateSummaryCaretPreview();
+  scheduleSummarySave();
+}
+
+function scheduleSummarySave() {
+  state.summaryDirty = true;
+  setSummaryStatus('保存待ち…', 'saving');
+  clearTimeout(state.summarySaveTimer);
+  state.summarySaveTimer = setTimeout(savePaperSummary, 800);
+}
+
+async function flushSummarySave() {
+  clearTimeout(state.summarySaveTimer);
+  if (state.summaryDirty) await savePaperSummary();
+  if (state.summarySaving) await state.summarySaving;
+}
+
+async function savePaperSummary() {
+  clearTimeout(state.summarySaveTimer);
+  if (state.summarySaving) {
+    // Save again after the request in flight so the latest text wins.
+    await state.summarySaving;
+    if (!state.summaryDirty) return;
+  }
   const tags = parsePaperTags($('paperTags').value);
-  const summary = $('paperSummaryText').value;
-  if (tags.length > 20) {
-    $('paperSummaryStatus').textContent = 'タグは20件までです。';
-    $('paperSummaryStatus').className = 'dialog-status error';
-    return;
+  if (tags.length > 20) { setSummaryStatus('タグは20件までです。保存していません。', 'error'); return; }
+  if (tags.some((tag) => tag.length > 40)) { setSummaryStatus('タグは1件40文字以内にしてください。保存していません。', 'error'); return; }
+  const jobId = state.jobId;
+  state.summaryDirty = false;
+  setSummaryStatus('保存しています…', 'saving');
+  state.summarySaving = (async () => {
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/summary`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tags, summary:$('paperSummaryText').value, source_url:$('paperSourceUrl').value, reading_status:$('paperReadingStatus').value})});
+      const data = await response.json(); if (!response.ok) throw new Error(data.error || '論文のまとめを保存できません');
+      if (jobId !== state.jobId) return;
+      state.paperTags = data.tags || [];
+      state.paperSummary = data.summary || '';
+      state.paperSourceUrl = data.source_url || '';
+      state.paperReadingStatus = data.reading_status || 'unread';
+      updatePaperSummaryButton();
+      if (!state.summaryDirty) setSummaryStatus(`保存しました（${new Date().toLocaleTimeString('ja-JP', {hour:'2-digit', minute:'2-digit'})}）`);
+    } catch (error) {
+      state.summaryDirty = true;
+      setSummaryStatus(error.message || '論文のまとめを保存できません', 'error');
+    } finally {
+      state.summarySaving = null;
+    }
+  })();
+  await state.summarySaving;
+}
+
+function summaryQuoteFor(item) {
+  const declaration = segmentReferenceDeclarations(item).find((entry) => ['figure', 'equation', 'table'].includes(entry.type));
+  if (declaration && hasVisualAsset(item)) {
+    const label = {figure:'図', equation:'式', table:'表'}[declaration.type] + declaration.number;
+    return `![[${label}]]`;
   }
-  if (tags.some((tag) => tag.length > 40)) {
-    $('paperSummaryStatus').textContent = 'タグは1件40文字以内にしてください。';
-    $('paperSummaryStatus').className = 'dialog-status error';
-    return;
-  }
-  const button = $('paperSummarySave');
-  button.disabled = true;
-  $('paperSummaryStatus').textContent = '保存しています…';
-  $('paperSummaryStatus').className = 'dialog-status saving';
-  try {
-    const response = await fetch(`/api/jobs/${state.jobId}/summary`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tags, summary, source_url:$('paperSourceUrl').value, reading_status:$('paperReadingStatus').value})});
-    const data = await response.json(); if (!response.ok) throw new Error(data.error || '論文のまとめを保存できません');
-    state.paperTags = data.tags || [];
-    state.paperSummary = data.summary || '';
-    state.paperSourceUrl = data.source_url || '';
-    state.paperReadingStatus = data.reading_status || 'unread';
-    updatePaperSummaryButton();
-    closePaperSummaryDialog();
-    toast('論文のまとめを保存しました');
-  } catch (error) {
-    $('paperSummaryStatus').textContent = error.message || '論文のまとめを保存できません';
-    $('paperSummaryStatus').className = 'dialog-status error';
-  } finally {
-    button.disabled = false;
-  }
+  if (hasVisualAsset(item)) return `![[#${Number(item.index) + 1}]]`;
+  const text = String(item.translation || item.source || '').replace(/\s+/g, ' ').trim();
+  return `> ${text} [[#${Number(item.index) + 1}]]`;
+}
+
+function quoteSegmentInSummary(index) {
+  const item = segmentByIndex(index);
+  if (!item) return;
+  openPaperSummaryPanel({focus:false});
+  setSummaryMode('edit');
+  insertIntoSummary(summaryQuoteFor(item));
+  $('paperSummaryText').focus({preventScroll:true});
+  toast(`${String(Number(index) + 1).padStart(3, '0')}番をまとめに引用しました`);
+}
+
+function startSummaryResize(event) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  const resizer = $('summaryResizer');
+  resizer.setPointerCapture(event.pointerId);
+  document.body.classList.add('summary-resizing');
+  const move = (moveEvent) => applySummaryWidth(window.innerWidth - moveEvent.clientX);
+  const stop = () => {
+    resizer.removeEventListener('pointermove', move);
+    resizer.removeEventListener('pointerup', stop);
+    resizer.removeEventListener('pointercancel', stop);
+    document.body.classList.remove('summary-resizing');
+    rememberViewerSetting('summaryWidth', parseInt(getComputedStyle(document.documentElement).getPropertyValue('--summary-width'), 10));
+  };
+  resizer.addEventListener('pointermove', move);
+  resizer.addEventListener('pointerup', stop);
+  resizer.addEventListener('pointercancel', stop);
+}
+
+function resizeSummaryWithKeyboard(event) {
+  if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+  event.preventDefault();
+  const current = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--summary-width'), 10) || 420;
+  const width = applySummaryWidth(current + (event.key === 'ArrowLeft' ? 32 : -32));
+  rememberViewerSetting('summaryWidth', width);
 }
 
 function escapeHtml(value) { const node = document.createElement('div'); node.textContent = String(value ?? ''); return node.innerHTML; }
@@ -1005,14 +1202,35 @@ $('qualityItems').addEventListener('click', (event) => {
   closeQualityDialog();
   jumpToSegment(index);
 });
-$('paperSummaryButton').addEventListener('click', openPaperSummaryDialog);
-$('paperSummaryClose').addEventListener('click', closePaperSummaryDialog);
-$('paperSummaryCancel').addEventListener('click', closePaperSummaryDialog);
-$('paperSummaryForm').addEventListener('submit', savePaperSummary);
-$('paperTags').addEventListener('input', renderPaperTagPreview);
-$('paperSummaryText').addEventListener('input', updatePaperSummaryLength);
+$('paperSummaryButton').addEventListener('click', togglePaperSummaryPanel);
+$('paperSummaryClose').addEventListener('click', closePaperSummaryPanel);
+$('paperTags').addEventListener('input', () => { renderPaperTagPreview(); updateSummaryMetaHint(); scheduleSummarySave(); });
+$('paperSourceUrl').addEventListener('input', scheduleSummarySave);
+$('paperReadingStatus').addEventListener('change', () => { updateSummaryMetaHint(); scheduleSummarySave(); });
+$('paperSummaryText').addEventListener('input', onSummaryInput);
+['click', 'keyup'].forEach((name) => $('paperSummaryText').addEventListener(name, updateSummaryCaretPreview));
 $('paperSummaryTemplate').addEventListener('click', insertPaperSummaryTemplate);
-$('paperSummaryDialog').addEventListener('click', (event) => { if (event.target === $('paperSummaryDialog')) closePaperSummaryDialog(); });
+$('summaryModeEdit').addEventListener('click', () => { setSummaryMode('edit'); $('paperSummaryText').focus({preventScroll:true}); });
+$('summaryModePreview').addEventListener('click', () => setSummaryMode('preview'));
+$('summaryHelpToggle').addEventListener('click', () => {
+  const open = $('summaryHelp').hidden;
+  $('summaryHelp').hidden = !open;
+  $('summaryHelpToggle').setAttribute('aria-expanded', String(open));
+});
+$('summaryPanel').addEventListener('click', (event) => {
+  const reference = event.target.closest('.reference-link');
+  if (!reference) return;
+  if (window.innerWidth < 1100) closePaperSummaryPanel();
+  jumpToReference(Number(reference.dataset.referenceIndex));
+});
+$('summaryPanel').addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') { event.preventDefault(); closePaperSummaryPanel(); $('paperSummaryButton').focus(); }
+});
+$('summaryResizer').addEventListener('pointerdown', startSummaryResize);
+$('summaryResizer').addEventListener('keydown', resizeSummaryWithKeyboard);
+applySummaryWidth(viewerSetting('summaryWidth'));
+state.summaryMode = viewerSetting('summaryMode') === 'preview' ? 'preview' : 'edit';
+window.addEventListener('resize', () => applySummaryWidth(parseInt(getComputedStyle(document.documentElement).getPropertyValue('--summary-width'), 10)));
 $('revisionClose').addEventListener('click', closeTranslationHistory);
 $('revisionDialog').addEventListener('click', (event) => { if (event.target === $('revisionDialog')) closeTranslationHistory(); });
 $('revisionItems').addEventListener('click', (event) => {
@@ -1054,6 +1272,8 @@ $('readerLayout').addEventListener('click', (event) => {
   }
   const clipButton = event.target.closest('.clip-toggle');
   if (clipButton) { toggleClip(clipButton); return; }
+  const quoteButton = event.target.closest('[data-summary-quote]');
+  if (quoteButton) { quoteSegmentInSummary(Number(quoteButton.dataset.summaryQuote)); return; }
   const reference = event.target.closest('.reference-link');
   if (reference) { jumpToReference(Number(reference.dataset.referenceIndex)); return; }
   const target = event.target.closest('[data-nav-index]');
@@ -1070,6 +1290,13 @@ $('readerSearch').addEventListener('input', (event) => {
 window.addEventListener('scroll', scheduleReadingPositionSave, {passive:true});
 window.addEventListener('beforeunload', () => {
   if (!state.jobId || !state.resultsReady) return;
+  if (state.summaryDirty) {
+    const tags = parsePaperTags($('paperTags').value);
+    if (tags.length <= 20 && !tags.some((tag) => tag.length > 40)) {
+      const payload = {tags, summary:$('paperSummaryText').value, source_url:$('paperSourceUrl').value, reading_status:$('paperReadingStatus').value};
+      navigator.sendBeacon(`/api/jobs/${state.jobId}/summary`, new Blob([JSON.stringify(payload)], {type:'application/json'}));
+    }
+  }
   const index = currentReadingIndex();
   if (index === state.lastSavedReadingIndex) return;
   navigator.sendBeacon(`/api/jobs/${state.jobId}/metadata`, new Blob([JSON.stringify({reading_index:index})], {type:'application/json'}));
@@ -1081,7 +1308,7 @@ document.addEventListener('keydown', (event) => {
   }
   if (event.altKey && !event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 's' && state.resultsReady) {
     event.preventDefault();
-    openPaperSummaryDialog();
+    togglePaperSummaryPanel();
   }
 });
 
