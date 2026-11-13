@@ -1,9 +1,19 @@
 % PLaMo Paper Translator user manual, typeset as an academic paper.
 % Dedicated to the public domain under CC0 1.0. See README.md in this folder.
-\documentclass[10pt,twocolumn]{article}
+% manual-onecolumn.tex defines \manualonecolumn before reading this file
+% to typeset the same text as a single-column edition.
+\ifdefined\manualonecolumn
+  \documentclass[11pt]{article}
+\else
+  \documentclass[10pt,twocolumn]{article}
+\fi
 \usepackage[T1]{fontenc}
 \usepackage{mathptmx}
-\usepackage[margin=0.75in,columnsep=0.28in]{geometry}
+\ifdefined\manualonecolumn
+  \usepackage[margin=1in]{geometry}
+\else
+  \usepackage[margin=0.75in,columnsep=0.28in]{geometry}
+\fi
 \usepackage{amsmath,amssymb}
 \usepackage{graphicx}
 \usepackage{booktabs,multirow}
@@ -12,9 +22,25 @@
 \usepackage[hidelinks]{hyperref}
 \captionsetup{font=small,labelfont=bf}
 \graphicspath{{figures/}}
+% Width of figures that fill one column; narrower in the single-column edition.
+% In one column, [t]-only floats pile up and drift to the end of the paper,
+% so the single-column edition lets them stay near their text.
+\ifdefined\manualonecolumn
+  \let\manualfigure\figure \let\endmanualfigure\endfigure
+  \renewenvironment{figure}[1][]{\manualfigure[!htbp]}{\endmanualfigure}
+  \renewenvironment{figure*}[1][]{\manualfigure[!htbp]}{\endmanualfigure}
+  \let\manualtable\table \let\endmanualtable\endtable
+  \renewenvironment{table}[1][]{\manualtable[!htbp]}{\endmanualtable}
+  \renewcommand{\topfraction}{0.85}
+  \renewcommand{\bottomfraction}{0.6}
+  \renewcommand{\textfraction}{0.1}
+  \renewcommand{\floatpagefraction}{0.75}
+\fi
+\newlength{\figwidth}
+\AtBeginDocument{\ifdefined\manualonecolumn\setlength{\figwidth}{0.62\textwidth}\else\setlength{\figwidth}{\columnwidth}\fi}
 
 \title{\textbf{PLaMo Paper Translator: Local, Sentence-Aligned\\Bilingual Reading of Academic PDFs}\\[4pt]
-\large User Manual, Version 1.2}
+\large User Manual, Version 1.2\ifdefined\manualonecolumn\ (Single-Column Edition)\fi}
 \author{The PLaMo Paper Translator Project}
 \date{November 2026}
 
@@ -101,7 +127,7 @@ The reference machine has an NVIDIA RTX 2000 Ada laptop GPU with 16\,GB of video
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\columnwidth]{fig-model-sizes.png}
+  \includegraphics[width=\figwidth]{fig-model-sizes.png}
   \caption{Model file sizes compared with the 16\,GB video memory of the reference GPU.}
   \label{fig:models}
 \end{figure}
@@ -190,7 +216,7 @@ where $u$ is the reader's own context note, $B_{p,k} = s_{p,1}\cdots s_{p,k-1}$ 
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\columnwidth]{fig-context.png}
+  \includegraphics[width=\figwidth]{fig-context.png}
   \caption{Context for one sentence. Only sentences from the same paragraph are used, so unrelated text never leaks into the prompt.}
   \label{fig:context}
 \end{figure}
@@ -268,13 +294,13 @@ Figure~\ref{fig:panels} shows the outline and the clip shelf.
 
 \begin{figure}[t]
   \centering
-  \begin{subfigure}[b]{0.47\columnwidth}
+  \begin{subfigure}[b]{0.47\figwidth}
     \centering
     \includegraphics[width=\textwidth]{fig-outline.png}
     \caption{Outline}
     \label{fig:panels-outline}
   \end{subfigure}\hfill
-  \begin{subfigure}[b]{0.47\columnwidth}
+  \begin{subfigure}[b]{0.47\figwidth}
     \centering
     \includegraphics[width=\textwidth]{fig-clips.png}
     \caption{Clip shelf}
@@ -309,7 +335,7 @@ The notes are written in Markdown with the additions in Table~\ref{tab:summary}.
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.82\columnwidth]{fig-summary.png}
+  \includegraphics[width=0.82\figwidth]{fig-summary.png}
   \caption{The summary panel showing rendered notes: headings, a display equation, an embedded figure and a quoted row with a link back to the text.}
   \label{fig:summary}
 \end{figure}
@@ -377,7 +403,7 @@ The library lists every saved translation (Figure~\ref{fig:library}). It searche
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\columnwidth]{fig-library.png}
+  \includegraphics[width=\figwidth]{fig-library.png}
   \caption{The paper library with search, reading-status filter, backup and restore.}
   \label{fig:library}
 \end{figure}

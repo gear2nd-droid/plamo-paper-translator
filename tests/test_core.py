@@ -28,6 +28,7 @@ from paper_core import (
     _page_number_candidates_at_edges,
     _positioned_equations,
     _positioned_letter_headings,
+    _is_single_column_page,
     _apply_script_markup,
     _block_kind,
     _mark_equation_boundaries,
@@ -559,9 +560,22 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("paper-summary", bilingual_html("T", segments, static_dir=static_dir))
 
     def test_bundled_manual_extracts_every_numbered_element(self):
-        manual = Path(__file__).resolve().parents[1] / "docs" / "manual" / "manual.pdf"
-        if not manual.exists():
-            self.skipTest("docs/manual/manual.pdf is not present")
+        # The same text in two layouts: two columns and a single column.
+        for name in ("manual.pdf", "manual-onecolumn.pdf"):
+            manual = Path(__file__).resolve().parents[1] / "docs" / "manual" / name
+            with self.subTest(manual=name):
+                if not manual.exists():
+                    self.skipTest(f"docs/manual/{name} is not present")
+                self._check_bundled_manual(manual)
+
+    def test_single_and_two_column_pages_are_told_apart(self):
+        def page(starts):
+            return [LayoutFragment(order, x, 700 - order * 12, "words in a line of text", 10) for order, x in enumerate(starts)]
+
+        self.assertFalse(_is_single_column_page(page([54] * 20 + [316] * 20), 612))
+        self.assertTrue(_is_single_column_page(page([72] * 30 + [360, 410]), 612))
+
+    def _check_bundled_manual(self, manual):
         with tempfile.TemporaryDirectory() as directory:
             segments, _pages = extract_document(manual, asset_dir=Path(directory), asset_url_prefix="/a")
         equations = {segment.label for segment in segments if segment.label.startswith("equation:") and segment.assets}

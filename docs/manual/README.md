@@ -2,9 +2,16 @@
 
 [`manual.pdf`](manual.pdf) は、PLaMo Paper Translator の使い方を英語の学術論文の体裁で書いたマニュアルです。デモと動作確認に使うサンプル論文を兼ねています。
 
+| ファイル | 体裁 | ページ |
+|---|---|---:|
+| [`manual.pdf`](manual.pdf) | 二段組み（10pt） | 8 |
+| [`manual-onecolumn.pdf`](manual-onecolumn.pdf) | 一段組み（11pt、arXivのプレプリントに多い体裁） | 13 |
+
+どちらも本文は同じ `manual.tex` から組版します。一段組み版は `manual-onecolumn.tex` が一段組みの指定をしてから `manual.tex` を読み込みます。
+
 ## ライセンス：CC0 1.0（パブリックドメイン）
 
-この文書（`manual.tex`、`manual.pdf`、`figures/` の画像）は [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/deed.ja) によりパブリックドメインに提供します。翻訳、動画やスクリーンショットへの掲載、再配布、改変は、目的を問わず許可も表示もなしで行えます。
+この文書（`manual.tex`、`manual-onecolumn.tex`、2つのPDF、`figures/` の画像）は [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/deed.ja) によりパブリックドメインに提供します。翻訳、動画やスクリーンショットへの掲載、再配布、改変は、目的を問わず許可も表示もなしで行えます。
 
 - スクリーンショットに映る論文は、このマニュアル自身です。日本語訳は手書きしたもので、第三者の論文は含みません。
 - 本アプリでこの文書を翻訳して公開する場合、訳文はPLaMoの生成物になります。そのため、PLaMo Community Licenseに従って `Built with PLaMo` の表示が必要です。エクスポートしたファイルには自動で付きます。
@@ -33,4 +40,7 @@
 cd docs\manual
 pdflatex manual.tex
 pdflatex manual.tex
+# 一段組み版
+pdflatex manual-onecolumn.tex
+pdflatex manual-onecolumn.tex
 ```

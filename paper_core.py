@@ -178,6 +178,8 @@ class PositionedEquation:
     x1: float
     y1: float
     trim_top_context: bool = False
+    # Page-space boxes of prose that overlaps the crop and is painted white.
+    masks: tuple[tuple[float, float, float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -433,16 +435,39 @@ def _flush_left_prose(line: list[LayoutFragment], text_left: float | None) -> bo
     return len(words) >= 2 and not re.search(r"[=∑∫√±≤≥≈≠∈∀∪∩⊂^_{}|×·]", value)
 
 
+def _is_single_column_page(fragments: list[LayoutFragment], page_width: float) -> bool:
+    """Tell a single-column page from a two-column one.
+
+    On a two-column page many lines of the right column start at the same
+    x position. On a single-column page, text in the right half only
+    continues a line (after inline math, for example) and starts anywhere.
+    """
+    midpoint = page_width / 2
+    starts = [round(fragment.x) for fragment in fragments if len(fragment.text.split()) >= 3]
+    left = Counter(x for x in starts if x < midpoint)
+    right = Counter(x for x in starts if x >= midpoint)
+    left_lines = left.most_common(1)[0][1] if left else 0
+    right_lines = right.most_common(1)[0][1] if right else 0
+    return left_lines >= 3 and right_lines <= 2
+
+
 def _positioned_equations(
     fragments: list[LayoutFragment],
     page_width: float,
 ) -> list[PositionedEquation]:
     midpoint = page_width / 2
     equations: list[PositionedEquation] = []
-    for column in (0, 1):
-        column_left = 36.0 if column == 0 else midpoint
-        column_right = midpoint if column == 0 else page_width - 36.0
-        column_fragments = [fragment for fragment in fragments if (fragment.x < midpoint) == (column == 0)]
+    single_column = _is_single_column_page(fragments, page_width)
+    # A centred display equation crosses the middle of a single-column page,
+    # so such a page is searched as one column.
+    for column in ((None,) if single_column else (0, 1)):
+        if column is None:
+            column_left, column_right = 36.0, page_width - 36.0
+            column_fragments = list(fragments)
+        else:
+            column_left = 36.0 if column == 0 else midpoint
+            column_right = midpoint if column == 0 else page_width - 36.0
+            column_fragments = [fragment for fragment in fragments if (fragment.x < midpoint) == (column == 0)]
         if not column_fragments:
             continue
         lines: list[list[LayoutFragment]] = []
@@ -461,7 +486,12 @@ def _positioned_equations(
             for fragment in line:
                 if _equation_number_of(fragment.text) is None:
                     continue
-                near_right = fragment.x >= column_left + (column_right - column_left) * 0.55
+                # A fragment reports where its text chunk starts. When the
+                # number shares a chunk with the end of a centred equation
+                # (" 3 (4)"), that start is right of the page centre but far
+                # from the margin, so a single column only needs the centre.
+                share = 0.5 if column is None else 0.55
+                near_right = fragment.x >= column_left + (column_right - column_left) * share
                 if near_right and not _layout_line_is_prose(line):
                     number_locations.append((line_index, fragment))
 
@@ -552,6 +582,22 @@ def _positioned_equations(
             bottom_limit = max(lines_below) + font_size * 0.8 if lines_below else lowest_selected_y - font_size * 0.9
             y1 = max(y1, min(highest_selected_y + font_size * 1.6, top_limit))
             y0 = max(0.0, min(y0, max(lowest_selected_y - font_size * 0.9, bottom_limit)))
+            # A tall bracket can reach up beside the sentence just above it,
+            # so cutting the crop lower would clip the equation. Instead,
+            # blank out prose lines that fall inside the crop.
+            masks = []
+            for index in range(len(lines)):
+                if index in selected or not _layout_line_is_prose(lines[index]):
+                    continue
+                for fragment in lines[index]:
+                    top, bottom = fragment.y + fragment.size * 0.85, fragment.y - fragment.size * 0.25
+                    if bottom >= y1 or top <= y0:
+                        continue
+                    following = [item.x for item in lines[index] if item.x > fragment.x]
+                    end = fragment.x + 0.52 * fragment.size * len(fragment.text.strip())
+                    if following:
+                        end = max(end, min(following))
+                    masks.append((fragment.x - 1, bottom, end + 1, top))
             trim_top_context = any(
                 index not in selected and highest_selected_y < line_y[index] <= y1 for index in range(len(lines))
             )
@@ -564,6 +610,7 @@ def _positioned_equations(
                     x1=x1,
                     y1=y1,
                     trim_top_context=trim_top_context,
+                    masks=tuple(masks),
                 )
             )
     return equations
@@ -621,7 +668,7 @@ def _render_equation_images(
 ) -> dict[int, str]:
     if asset_dir is None or pdfium_document is None or not equations:
         return {}
-    from PIL import Image, ImageChops
+    from PIL import Image, ImageChops, ImageDraw
 
     def trim_stray_edge_ink(image: Any) -> Any:
         grayscale = image.convert("L")
@@ -662,6 +709,11 @@ def _render_equation_images(
                 max(0.0, page_height - equation.y1),
             )
             image = page.render(scale=3, crop=crop).to_pil().convert("RGB")
+            if equation.masks:
+                paint = ImageDraw.Draw(image)
+                left, top = crop[0], page_height - crop[3]
+                for x0, y0, x1, y1 in equation.masks:
+                    paint.rectangle(((x0 - left) * 3, (top - y1) * 3, (x1 - left) * 3, (top - y0) * 3), fill="white")
             if equation.trim_top_context:
                 grayscale = image.convert("L")
                 ink_rows = [grayscale.crop((0, y, grayscale.width, y + 1)).getextrema()[0] < 245 for y in range(grayscale.height)]
