@@ -15,7 +15,7 @@ PLaMo 3 Translate をこのPC上で動かし、PDF論文を一文単位の対訳
 
 デモ動画（約70秒）：[論文PDFを手元のPCだけで対訳に｜PLaMo Paper Translator デモ](https://www.youtube.com/watch?v=pXtkL5Bdif4)
 
-インストール後、同梱の [`docs/manual/manual.pdf`](docs/manual/manual.pdf) を読み込んでみてください。このアプリのマニュアルを英語の論文形式で書いたPDFで、図・表・番号付き数式・参考文献・付録を含みます。CC0（パブリックドメイン）なので、翻訳結果を動画や記事に載せる場合も原文側のクレジットは不要です（翻訳結果には `Built with PLaMo` の表示が必要です）。
+インストール後、同梱の [`docs/manual/manual.pdf`](docs/manual/manual.pdf) を読み込んでみてください。このアプリのマニュアルを英語の論文形式（二段組み）で書いたPDFで、図・表・番号付き数式・参考文献・付録を含みます。同じ内容の一段組み版 [`docs/manual/manual-onecolumn.pdf`](docs/manual/manual-onecolumn.pdf) もあります。CC0（パブリックドメイン）なので、翻訳結果を動画や記事に載せる場合も原文側のクレジットは不要です（翻訳結果には `Built with PLaMo` の表示が必要です）。
 
 ## English
 
