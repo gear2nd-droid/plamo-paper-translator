@@ -180,6 +180,10 @@ class PositionedEquation:
     trim_top_context: bool = False
     # Page-space boxes of prose that overlaps the crop and is painted white.
     masks: tuple[tuple[float, float, float, float], ...] = ()
+    # Page heights spanned by the equation's own lines. Ink that does not
+    # touch this span (a neighbouring equation or sentence) is cropped off.
+    core_low: float | None = None
+    core_high: float | None = None
 
 
 @dataclass(frozen=True)
@@ -387,7 +391,10 @@ def _mark_heading_boundaries(text: str, headings: list[str]) -> str:
 
 
 def _layout_line_is_prose(fragments: list[LayoutFragment]) -> bool:
-    value = " ".join(fragment.text.strip() for fragment in fragments if fragment.text.strip())
+    # Read the line left to right: a subscript reported after the rest of
+    # the line ("C | ... | (2) | SF :") must not make it end with a colon.
+    ordered = sorted(fragments, key=lambda fragment: (fragment.x, fragment.order))
+    value = " ".join(fragment.text.strip() for fragment in ordered if fragment.text.strip())
     math_symbols = len(re.findall(r"[=∑∫√±≤≥≈≠∞∂∇α-ωΑ-Ω^_{}|×·∈∀∪∩⊂]", value))
     words = re.findall(r"[A-Za-z]{2,}", value)
     has_long_prose_fragment = any(
@@ -495,6 +502,7 @@ def _positioned_equations(
                 if near_right and not _layout_line_is_prose(line):
                     number_locations.append((line_index, fragment))
 
+        number_lines = [index for index, _fragment in number_locations]
         for line_index, number_fragment in number_locations:
             selected = {line_index}
             for direction in (-1, 1):
@@ -508,6 +516,16 @@ def _positioned_equations(
                         for item in lines[cursor]
                     ):
                         break
+                    # In a stack of display equations, the upper part of the
+                    # next equation (a fraction, an integral) is its own
+                    # layout line; it belongs to the nearest numbered line.
+                    own_distance = abs(line_y[cursor] - line_y[line_index])
+                    if any(abs(line_y[cursor] - line_y[other]) < own_distance for other in number_lines if other != line_index):
+                        break
+                    if any(POSITIONED_CAPTION_PATTERN.match(item.text.strip()) for item in lines[cursor]):
+                        break  # a figure or table caption, not part of the equation
+                    if all(_is_lead_in_fragment(item, lines[cursor], text_left) for item in lines[cursor]):
+                        break  # a lone "where" above the equation
                     if _layout_line_is_prose(lines[cursor]) or _flush_left_prose(lines[cursor], text_left):
                         break
                     compact_line = "".join(item.text.strip() for item in lines[cursor])
@@ -587,7 +605,8 @@ def _positioned_equations(
             # blank out prose lines that fall inside the crop.
             masks = []
             for index in range(len(lines)):
-                if index in selected or not _layout_line_is_prose(lines[index]):
+                lead_in_only = all(_is_lead_in_fragment(item, lines[index], text_left) for item in lines[index])
+                if index in selected or not (_layout_line_is_prose(lines[index]) or lead_in_only):
                     continue
                 for fragment in lines[index]:
                     top, bottom = fragment.y + fragment.size * 0.85, fragment.y - fragment.size * 0.25
@@ -611,6 +630,8 @@ def _positioned_equations(
                     y1=y1,
                     trim_top_context=trim_top_context,
                     masks=tuple(masks),
+                    core_low=lowest_selected_y - font_size * 0.35,
+                    core_high=highest_selected_y + font_size * 0.8,
                 )
             )
     return equations
@@ -620,6 +641,8 @@ def _mark_equation_boundaries(text: str, equations: list[PositionedEquation]) ->
     # The layout text of an equation has no script markup but the page text
     # does (E_{algo}), so markup characters may appear between characters.
     gap = r"(?:\s|[_^]\{|\})*"
+    # A fuzzy match never runs across a paragraph break or into a caption.
+    within = rf"(?!\n\s*\n|{CAPTION_MARKER}|(?:Fig(?:ure)?\.?|Table)\s*\d+\s*[.:])"
     for equation in equations:
         compact_equation = re.sub(r"\s+", "", equation.text)
         if not compact_equation:
@@ -628,7 +651,7 @@ def _mark_equation_boundaries(text: str, equations: list[PositionedEquation]) ->
         if len(compact_equation) >= 24:
             patterns.append(
                 rf"{gap.join(re.escape(character) for character in compact_equation[:12])}"
-                rf"[\s\S]{{0,3000}}?"
+                rf"(?:{within}[\s\S]){{0,3000}}?"
                 rf"{gap.join(re.escape(character) for character in compact_equation[-12:])}"
             )
         # Plain extraction can order a fraction or a superscript line
@@ -636,12 +659,15 @@ def _mark_equation_boundaries(text: str, equations: list[PositionedEquation]) ->
         # back to the start of the equation and its printed number, within
         # one paragraph.
         span = len(compact_equation) * 2 + 40
-        for anchor_size in (8, 5):
-            if len(compact_equation) > anchor_size + 4:
-                patterns.append(
-                    rf"{gap.join(re.escape(character) for character in compact_equation[:anchor_size])}"
-                    rf"(?:(?!\n\s*\n)[\s\S]){{0,{span}}}?\(\s*{equation.number}\s*\)"
-                )
+        # Stray text from a nearby drawing can precede the equation in the
+        # layout ("LPD" + "OSsmooth(g) = ..."), so also try later starts.
+        for skip in (0, 1, 2, 3, 4, 6, 8, 12, 16, 20, 24):
+            for anchor_size in (8, 5):
+                if len(compact_equation) > skip + anchor_size + 4:
+                    patterns.append(
+                        rf"{gap.join(re.escape(character) for character in compact_equation[skip:skip + anchor_size])}"
+                        rf"(?:{within}[\s\S]){{0,{span}}}?\(\s*{equation.number}\s*\)"
+                    )
         for pattern in patterns:
             text, replacements = re.subn(
                 pattern,
@@ -655,6 +681,60 @@ def _mark_equation_boundaries(text: str, equations: list[PositionedEquation]) ->
             if replacements:
                 break
     return text
+
+
+def _crop_shows_number(page: Any, crop: tuple[float, float, float, float], page_width: float, page_height: float, image_height: int, number: int, skipped_rows: int = 0) -> bool:
+    """Whether the PDF text inside the kept part of the crop has "(number)".
+
+    The crop is (left, bottom, right, top margins). After the ink bands are
+    filtered the image keeps its top rows; its height gives the bottom.
+    """
+    try:
+        textpage = page.get_textpage()
+    except Exception:  # an older pypdfium2 without text access: do not block the image
+        return True
+    try:
+        top = page_height - crop[3] - skipped_rows / 3.0
+        bottom = max(crop[1], top - image_height / 3.0)
+        text = textpage.get_text_bounded(left=crop[0], bottom=bottom, right=page_width - crop[2], top=top)
+    except Exception:
+        return True
+    finally:
+        textpage.close()
+    return re.search(rf"\(\s*{number}\s*\)", text or "") is not None
+
+
+def _keep_ink_bands(image: Any, top: float, core_low: float, core_high: float, scale: float = 3.0) -> tuple[Any, int]:
+    """Keep only the horizontal ink bands that touch the equation's lines.
+
+    A band is a run of rows with ink, separated from the next by blank
+    rows. A fraction's numerator, bar and denominator touch the main line
+    and stay; a neighbouring equation or sentence above or below is a
+    separate band and is removed. ``top`` is the page height of row 0.
+    Returns the image and the number of rows removed from its top.
+    """
+    grayscale = image.convert("L")
+    width = grayscale.width
+    rows = [grayscale.crop((0, y, width, y + 1)).getextrema()[0] < 245 for y in range(grayscale.height)]
+    bands: list[list[int]] = []
+    blank = 0
+    for y, has_ink in enumerate(rows):
+        if has_ink:
+            if bands and blank < 5:
+                bands[-1][1] = y
+            else:
+                bands.append([y, y])
+            blank = 0
+        else:
+            blank += 1
+    first_row = max(0, int((top - core_high) * scale))
+    last_row = int((top - core_low) * scale)
+    kept = [band for band in bands if band[1] >= first_row and band[0] <= last_row]
+    if not kept or len(kept) == len(bands):
+        return image, 0
+    upper = max(0, kept[0][0] - 6)
+    lower = min(grayscale.height, kept[-1][1] + 7)
+    return image.crop((0, upper, width, lower)), upper
 
 
 def _render_equation_images(
@@ -709,12 +789,21 @@ def _render_equation_images(
                 max(0.0, page_height - equation.y1),
             )
             image = page.render(scale=3, crop=crop).to_pil().convert("RGB")
+            skipped_rows = 0
             if equation.masks:
                 paint = ImageDraw.Draw(image)
                 left, top = crop[0], page_height - crop[3]
                 for x0, y0, x1, y1 in equation.masks:
                     paint.rectangle(((x0 - left) * 3, (top - y1) * 3, (x1 - left) * 3, (top - y0) * 3), fill="white")
-            if equation.trim_top_context:
+            if equation.core_low is not None and equation.core_high is not None:
+                image, skipped_rows = _keep_ink_bands(image, page_height - crop[3], equation.core_low, equation.core_high)
+            # A crop that does not contain its own printed number shows
+            # something else (prose, the next equation); no image is better.
+            if not _crop_shows_number(page, crop, page_width, page_height, image.height, equation.number, skipped_rows):
+                continue
+            # The ink bands above already removed neighbouring text; the older
+            # top trim would now cut into the equation itself.
+            if equation.trim_top_context and equation.core_low is None:
                 grayscale = image.convert("L")
                 ink_rows = [grayscale.crop((0, y, grayscale.width, y + 1)).getextrema()[0] < 245 for y in range(grayscale.height)]
                 first_ink = next((y for y, has_ink in enumerate(ink_rows) if has_ink), None)
@@ -1613,6 +1702,7 @@ def extract_document(
             layout_fragments: list[LayoutFragment] = []
             margin_candidates: list[tuple[str, str]] = []
             page_height = float(page.mediabox.height)
+            page_width = float(page.mediabox.width)
             try:
 
                 text_parts: list[str] = []
@@ -1627,6 +1717,11 @@ def extract_document(
                     # text matrix instead; use the size as drawn.
                     scale = (float(tm[2]) ** 2 + float(tm[3]) ** 2) ** 0.5
                     size = float(size) * (scale if scale > 0 else 1.0)
+                    if not (-5 <= x <= page_width + 5 and -5 <= y <= page_height + 5):
+                        # Text inside a reused drawing (a form XObject) can be
+                        # reported in the drawing's own coordinates, off the
+                        # page. Its position is meaningless for the layout.
+                        return
                     fragment_parts.append(len(text_parts) - 1)
                     fragments.append((x, y, value))
                     layout_fragments.append(LayoutFragment(len(layout_fragments), x, y, value, size))
