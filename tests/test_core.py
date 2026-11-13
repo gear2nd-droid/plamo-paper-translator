@@ -29,6 +29,7 @@ from paper_core import (
     _positioned_equations,
     _positioned_letter_headings,
     _is_single_column_page,
+    _drawn_figure_box,
     _apply_script_markup,
     _block_kind,
     _mark_equation_boundaries,
@@ -574,6 +575,25 @@ class CoreTests(unittest.TestCase):
 
         self.assertFalse(_is_single_column_page(page([54] * 20 + [316] * 20), 612))
         self.assertTrue(_is_single_column_page(page([72] * 30 + [360, 410]), 612))
+
+    def test_drawn_figure_area_runs_from_caption_to_body_text(self):
+        body = "This is a full line of body text in the right column of the page"
+        fragments = [
+            LayoutFragment(0, 316, 700, body, 9),
+            LayoutFragment(1, 316, 689, body, 9),
+            LayoutFragment(2, 420, 640, "cusp height", 9),  # a label inside the drawing
+            LayoutFragment(3, 316, 560, "Figure 2: Cusps in the surface.", 9),
+        ] + [LayoutFragment(4 + n, 54, 700 - n * 11, body, 9) for n in range(20)]
+        caption = PositionedCaption("Figure 2: Cusps in the surface.", 316, 560)
+        x0, y0, x1, y1 = _drawn_figure_box(caption, fragments, 612, 792)
+        self.assertGreaterEqual(x0, 300)  # stays in the right column
+        self.assertAlmostEqual(y0, 570)
+        self.assertAlmostEqual(y1, 686)  # just below the last body line
+        # With no body text in the other column, the figure spans the page.
+        lone = fragments[:4]
+        x0, _y0, x1, _y1 = _drawn_figure_box(caption, lone, 612, 792)
+        self.assertLess(x0, 306)
+        self.assertGreater(x1, 560)
 
     def _check_bundled_manual(self, manual):
         with tempfile.TemporaryDirectory() as directory:

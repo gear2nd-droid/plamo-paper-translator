@@ -1055,6 +1055,133 @@ def _extract_page_images(
     return assets
 
 
+def _drawn_figure_box(
+    caption: PositionedCaption,
+    fragments: list[LayoutFragment],
+    page_width: float,
+    page_height: float,
+) -> tuple[float, float, float, float] | None:
+    """Page box of a figure drawn with vector graphics, above its caption.
+
+    The figure is the area between the caption and the nearest line of body
+    text above it. Short labels inside the drawing are not body text. When
+    the other column has no body text beside that area either, the figure
+    spans the full width.
+    """
+    midpoint = page_width / 2
+
+    def end_of(fragment: LayoutFragment) -> float:
+        return fragment.x + 0.5 * fragment.size * len(fragment.text.strip())
+
+    # Margins are symmetric; estimate them from whichever side has text.
+    leftmost = min((fragment.x for fragment in fragments), default=36.0)
+    rightmost = max((end_of(fragment) for fragment in fragments), default=page_width - 36.0)
+    left_margin = max(18.0, min(leftmost, page_width - rightmost) - 4)
+    right_margin = page_width - left_margin
+    caption_left = caption.x < midpoint
+    caption_top = caption.y + 10
+
+    def lines_in(x_from: float, x_to: float, above: float) -> list[list[LayoutFragment]]:
+        """Lines above a height whose text overlaps a horizontal range,
+        including a running header that starts in the other column."""
+        lines: list[list[LayoutFragment]] = []
+        for fragment in sorted(
+            (
+                item
+                for item in fragments
+                if item.y > above
+                and (x_from <= item.x < x_to or (item.x < x_from and end_of(item) - x_from > 0.4 * (x_to - x_from)))
+            ),
+            key=lambda item: (item.y, item.x),
+        ):
+            if lines and abs(lines[-1][0].y - fragment.y) <= 3.2:
+                lines[-1].append(fragment)
+            else:
+                lines.append([fragment])
+        return lines
+
+    def body_line(line: list[LayoutFragment], width: float) -> bool:
+        # Body text runs across most of the column; labels and the text in
+        # flowchart boxes inside a drawing are short.
+        extent = max(end_of(item) for item in line) - min(item.x for item in line)
+        return _layout_line_is_prose(line) and extent >= 0.55 * width
+
+    column = (left_margin, midpoint) if caption_left else (midpoint, right_margin)
+    width = column[1] - column[0]
+    # Small text in the top margin is the running header, never the figure.
+    header = [item.y for item in fragments if item.y >= page_height - 60 and item.size <= 8.5]
+    top = min([page_height - 30] + [y - 3 for y in header])
+    for line in lines_in(*column, caption_top):
+        if body_line(line, width) or any(_equation_number_of(item.text) is not None for item in line):
+            top = min(item.y for item in line) - 3
+            break
+    if top - caption_top < 30:
+        return None
+    other = (midpoint, right_margin) if caption_left else (left_margin, midpoint)
+    beside = [line for line in lines_in(*other, caption_top) if min(item.y for item in line) < top and body_line(line, width)]
+    if not beside:
+        return (left_margin, caption_top, right_margin, top)
+    # Within one column, cut at the column's own text edges so the end of
+    # a line in the neighbouring column never enters the crop.
+    starts = Counter(round(item.x) for item in fragments if column[0] <= item.x < column[1] and len(item.text.split()) >= 3)
+    x0 = (starts.most_common(1)[0][0] - 4) if starts else column[0]
+    x1 = column[1] if caption_left else right_margin
+    if caption_left:
+        x1 = min(column[1], max((end_of(item) for item in fragments if column[0] <= item.x < column[1] and len(item.text.split()) >= 3), default=column[1]) + 4)
+    return (max(column[0] - 4, x0), caption_top, x1, top)
+
+
+def _render_drawn_figures(
+    pdfium_document: Any,
+    page_number: int,
+    page_segments: list[Segment],
+    captions: list[PositionedCaption],
+    fragments: list[LayoutFragment],
+    page_width: float,
+    page_height: float,
+    asset_dir: Path | None,
+    url_prefix: str,
+) -> None:
+    """Crop figures that have no embedded image (line art, charts, diagrams)."""
+    if asset_dir is None or pdfium_document is None or not fragments:
+        return
+    from PIL import Image, ImageChops
+
+    leaders: dict[tuple[str, int], Segment] = {}
+    for segment in page_segments:
+        identity = _caption_identity(segment.source)
+        if identity and identity not in leaders:
+            leaders[identity] = segment
+    page: Any = None
+    try:
+        for caption in captions:
+            identity = _caption_identity(caption.text)
+            if not identity or identity[0] != "figure":
+                continue
+            leader = leaders.get(identity)
+            if leader is None or leader.assets:
+                continue
+            box = _drawn_figure_box(caption, fragments, page_width, page_height)
+            if box is None:
+                continue
+            x0, y0, x1, y1 = box
+            if page is None:
+                page = pdfium_document[page_number - 1]
+            image = page.render(scale=3, crop=(x0, y0, page_width - x1, page_height - y1)).to_pil().convert("RGB")
+            content = ImageChops.difference(image, Image.new("RGB", image.size, "white")).getbbox()
+            if not content or (content[2] - content[0]) < 90 or (content[3] - content[1]) < 60:
+                continue  # nothing drawn there
+            left, top, right, bottom = content
+            image = image.crop((max(0, left - 12), max(0, top - 12), min(image.width, right + 12), min(image.height, bottom + 12)))
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"page-{page_number:03d}-drawn-figure-{identity[1]:02d}.png"
+            image.save(asset_dir / filename, format="PNG", optimize=True)
+            leader.assets.append(f"{url_prefix.rstrip('/')}/{filename}")
+    finally:
+        if page is not None:
+            page.close()
+
+
 def _caption_identity(text: str) -> tuple[str, int] | None:
     match = re.match(r"^(figure|fig\.?)\s*(\d+)\s*[.:]", text.strip(), re.I)
     if match:
@@ -1496,12 +1623,16 @@ def extract_document(
                     if not value.strip():
                         return
                     x, y = float(tm[4]), float(tm[5])
+                    # Some producers set the font size to 1 and scale the
+                    # text matrix instead; use the size as drawn.
+                    scale = (float(tm[2]) ** 2 + float(tm[3]) ** 2) ** 0.5
+                    size = float(size) * (scale if scale > 0 else 1.0)
                     fragment_parts.append(len(text_parts) - 1)
                     fragments.append((x, y, value))
-                    layout_fragments.append(LayoutFragment(len(layout_fragments), x, y, value, float(size)))
-                    if float(size) <= 8.5 and 10 < y < 85:
+                    layout_fragments.append(LayoutFragment(len(layout_fragments), x, y, value, size))
+                    if size <= 8.5 and 10 < y < 85:
                         margin_candidates.append((value, "bottom"))
-                    elif float(size) <= 8.5 and page_height - 65 < y <= page_height:
+                    elif size <= 8.5 and page_height - 65 < y <= page_height:
                         margin_candidates.append((value, "top"))
 
                 raw = page.extract_text(visitor_text=collect_fragment) or ""
@@ -1604,6 +1735,17 @@ def extract_document(
                         )
                     )
                     paragraph_offset += 1
+            _render_drawn_figures(
+                pdfium_document,
+                page_number,
+                segments[page_start:],
+                positioned_captions,
+                layout_fragments,
+                float(page.mediabox.width),
+                float(page.mediabox.height),
+                asset_dir,
+                asset_url_prefix,
+            )
         if not segments:
             if pdfium_document is not None:
                 pdfium_document.close()
