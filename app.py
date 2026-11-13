@@ -77,6 +77,8 @@ READING_STATUSES = {"unread", "reading", "completed", "archived"}
 MAX_BACKUP_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_BACKUP_EXPANDED_BYTES = 8 * 1024 * 1024 * 1024
 MAX_BACKUP_FILES = 100_000
+# One version for the app, the Chrome extension and the release.
+APP_VERSION = "1.2.0"
 NATIVE_HOST_NAME = "jp.gear2.plamo_paper_translator"
 CHROME_EXTENSION_ID = "cpiiadekehcofkocnlplcaolgioefcjd"
 CHROME_EXTENSION_ORIGIN = f"chrome-extension://{CHROME_EXTENSION_ID}/"
@@ -1018,7 +1020,7 @@ def _translate_job(job_id: str) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "PLaMoPaperTranslator/1.0"
+    server_version = f"PLaMoPaperTranslator/{APP_VERSION}"
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -1045,12 +1047,13 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path == "/api/ping":
-            self._json({"app": "plamo-paper-translator", "pid": os.getpid()})
+            self._json({"app": "plamo-paper-translator", "version": APP_VERSION, "pid": os.getpid()})
             return
         if path == "/api/status":
             model = _find_one(MODEL_DIR, "*.gguf")
             self._json(
                 {
+                    "version": APP_VERSION,
                     "engine": "ready" if translator.health() else "not_ready",
                     "engine_error": llama_process.error,
                     "model": model.name if model else None,
