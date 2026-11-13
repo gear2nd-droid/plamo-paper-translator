@@ -20,7 +20,7 @@ try {
     & $Python -m PyInstaller --noconfirm --clean --onefile --name PLaMoPaperTranslator --icon "assets\app.ico" --hidden-import pypdf --add-data "static;static" app.py
     New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
     Copy-Item -Force "dist\PLaMoPaperTranslator.exe" $PackageRoot
-    Copy-Item -Force "Start-PLaMoPaperTranslator.cmd","start.ps1","setup.ps1","requirements.txt","README.md","DISTRIBUTION.md","THIRD_PARTY_NOTICES.md","LICENSE" $PackageRoot
+    Copy-Item -Force "Start-PLaMoPaperTranslator.cmd","start.ps1","setup.ps1","requirements.txt","README.md","CHANGELOG.md","DISTRIBUTION.md","THIRD_PARTY_NOTICES.md","LICENSE" $PackageRoot
     $DocsDestination = Join-Path $PackageRoot "docs"
     if (Test-Path -LiteralPath $DocsDestination) {
         Remove-Item -Recurse -Force -LiteralPath $DocsDestination
