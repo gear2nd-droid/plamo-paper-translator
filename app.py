@@ -80,7 +80,7 @@ MAX_BACKUP_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_BACKUP_EXPANDED_BYTES = 8 * 1024 * 1024 * 1024
 MAX_BACKUP_FILES = 100_000
 # One version for the app, the Chrome extension and the release.
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 NATIVE_HOST_NAME = "jp.gear2.plamo_paper_translator"
 CHROME_EXTENSION_ID = "cpiiadekehcofkocnlplcaolgioefcjd"
 CHROME_EXTENSION_ORIGIN = f"chrome-extension://{CHROME_EXTENSION_ID}/"
