@@ -172,7 +172,8 @@ nvidia-smi
 
 ## 対応範囲と制約
 
-- テキストを内包するPDFに対応します。画像だけのスキャンPDFは、先にOCRしてください。
+- テキストを内包するPDFに対応します。画像だけのスキャンPDFは、先にOCRしてください（読み込み時にその旨を表示します）。
+- 日本語・中国語・韓国語の論文にも対応します。文字の対応表を持たないフォント（LaTeXで作られた日本語論文に多い）は、Adobeの公開文字表で読み取ります。図・表のキャプション（「図1」「表1」）と数式の画像化は、英語論文ほどには認識しません。
 - 二段組みはPDF内部の読み順に沿って抽出します。複雑な脚注や数式の文字表現はPDFの内部構造に依存します。
 - PDFに埋め込まれたラスター図は抽出して図キャプション付近へ配置します。線や図形だけで描かれた図（グラフ、フローチャート、模式図）は、キャプションの上の領域をページから切り出して画像にします。図の中の文字（「(a) (b)」、凡例、目盛りなど）は図の画像に含まれるため、本文からは外します。画像化されていない表は原文テキストとして保持されます。
 - 番号付きの独立数式は216dpi相当のPNGとして切り出します。インライン数式と画像化できない数式は抽出テキストへフォールバックします。
@@ -205,7 +206,7 @@ UIや `static/` を変更した場合、ポータブル版のexeには同梱フ�
 .\build-portable.ps1
 ```
 
-モデルはPLaMo Community Licenseの確認と公式配布元からの取得を受取人ごとに行う設計です。ポータブルZIPにはアプリのMIT Licenseと、同梱するPython・pypdf・Pillow・pypdfium2/PDFium・KaTeX・PyInstallerのライセンス本文を収録します。詳しい配布方式の比較は `DISTRIBUTION.md` を参照してください。
+モデルはPLaMo Community Licenseの確認と公式配布元からの取得を受取人ごとに行う設計です。ポータブルZIPにはアプリのMIT Licenseと、同梱するPython・pypdf・Pillow・pypdfium2/PDFium・KaTeX・Adobe CMap・PyInstallerのライセンス本文を収録します。詳しい配布方式の比較は `DISTRIBUTION.md` を参照してください。
 
 ## ライセンス
 
@@ -218,5 +219,6 @@ UIや `static/` を変更した場合、ポータブル版のexeには同梱フ�
 - Pillow: https://python-pillow.org/
 - pypdfium2 / PDFium: https://github.com/pypdfium2-team/pypdfium2
 - KaTeX: https://katex.org/
+- Adobe CMap resources: https://github.com/adobe-type-tools/mapping-resources-pdf
 
 生成物を第三者へ提供・公表する場合は、`Built with PLaMo`、生成元の明示、ライセンスの提供など、PLaMo Community License第4条・第5条の条件を確認してください。組織内利用を含む商業目的では、直近事業年度の収入または売上が10億円以下でも事前登録が必要で、超える場合はPFNから別途商業用ライセンスを取得する必要があります。

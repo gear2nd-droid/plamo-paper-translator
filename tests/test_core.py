@@ -32,6 +32,9 @@ from paper_core import (
     _drawn_figure_box,
     _figure_text_orders,
     _footer_lines,
+    _attach_cid_to_unicode,
+    _body_font_size,
+    _positioned_captions,
     _apply_script_markup,
     _block_kind,
     _mark_equation_boundaries,
@@ -262,6 +265,84 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(grouped[2].source.startswith("[APH^{∗}03] AGRAWALA"))
         self.assertTrue(grouped[2].source.endswith("(2003). 10, 11"))
         self.assertEqual((grouped[3].source, grouped[3].page), ("[Att15] ATTENE M.: Shapes in a box.", 12))
+
+    def test_cjk_fonts_without_tounicode_get_adobe_tables(self):
+        from pypdf.generic import ArrayObject, DictionaryObject, NameObject, TextStringObject
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+        from build_cid_tables import parse_cmap
+
+        def type0(ordering, encoding="/Identity-H"):
+            descendant = DictionaryObject(
+                {
+                    NameObject("/Subtype"): NameObject("/CIDFontType0"),
+                    NameObject("/CIDSystemInfo"): DictionaryObject(
+                        {
+                            NameObject("/Registry"): TextStringObject("Adobe"),
+                            NameObject("/Ordering"): TextStringObject(ordering),
+                        }
+                    ),
+                }
+            )
+            return DictionaryObject(
+                {
+                    NameObject("/Type"): NameObject("/Font"),
+                    NameObject("/Subtype"): NameObject("/Type0"),
+                    NameObject("/BaseFont"): NameObject("/IPAMincho"),
+                    NameObject("/Encoding"): NameObject(encoding),
+                    NameObject("/DescendantFonts"): ArrayObject([descendant]),
+                }
+            )
+
+        fonts = DictionaryObject(
+            {
+                NameObject("/F1"): type0("Japan1"),
+                NameObject("/F2"): type0("Japan1", "/UniJIS-UCS2-H"),
+                NameObject("/F3"): type0("Identity"),
+            }
+        )
+        page = DictionaryObject({NameObject("/Resources"): DictionaryObject({NameObject("/Font"): fonts})})
+        _attach_cid_to_unicode(page)
+        self.assertIn("/ToUnicode", fonts["/F1"])
+        self.assertNotIn("/ToUnicode", fonts["/F2"])
+        self.assertNotIn("/ToUnicode", fonts["/F3"])
+        # CIDs of は, じ, め, に and 日 in Adobe-Japan1.
+        mapping = parse_cmap(fonts["/F1"]["/ToUnicode"].get_data().decode("ascii"))
+        self.assertEqual("".join(mapping[cid] for cid in (1, 551, 580, 559, 547, 3284)), " はじめに日")
+
+    def test_japanese_lines_and_sentences(self):
+        text = "本論文では，新たな分析手法を提案する．Transformer は様々な言語モ\nデルに用いられる．\n\n1. は じ め に"
+        units = split_document_units(_normalize_block(text))
+        self.assertEqual(
+            [unit[0] for unit in units],
+            ["本論文では，新たな分析手法を提案する．", "Transformer は様々な言語モデルに用いられる．", "1. はじめに"],
+        )
+        self.assertEqual(units[2][1], "heading")
+        self.assertEqual(heading_level("2 種類の線形変換を施し（ここでは，それぞれ"), 0)
+        self.assertEqual(
+            split_document_units("近年，深層学習[LeCun 15]の成功により2015年から2023年までに3つの手法と4種類のデータが提案され，5件の報告がある．")[0][1],
+            "sentence",
+        )
+
+    def test_caption_written_word_by_word_is_found(self):
+        fragments = [
+            (166.4, 618.6, "Figure"),
+            (198.4, 618.6, " 5."),
+            (207.7, 618.6, " Parameterization of a triangle."),
+            (166.4, 590.0, "Body text continues here."),
+        ]
+        captions = _positioned_captions(fragments, 297)
+        self.assertEqual(len(captions), 1)
+        self.assertTrue(captions[0].text.startswith("Figure 5. Parameterization"))
+        self.assertEqual(_positioned_captions([(166.4, 618.6, "Figure"), (198.4, 600.0, "shows")], 297), [])
+
+    def test_body_font_size_counts_characters(self):
+        fragments = [
+            LayoutFragment(0, 50, 700, "A long line of body text set in eight points.", 8),
+            LayoutFragment(1, 50, 30, "Heliyon 9", 6.4),
+        ]
+        self.assertEqual(_body_font_size(fragments), 8.0)
+        self.assertEqual(_body_font_size([]), 10.0)
 
     def test_footer_is_judged_as_a_whole_line(self):
         parts = [
