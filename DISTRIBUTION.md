@@ -25,7 +25,7 @@ PLaMoPaperTranslator/
 ├─ docs/                        # 公開デモ候補・運用資料
 ├─ LICENSE                      # アプリ独自コードのMIT License
 ├─ THIRD_PARTY_NOTICES.md
-├─ licenses/                    # Python・PDF関連ライブラリ・KaTeX・PyInstallerのライセンス本文
+├─ licenses/                    # Python・PDF関連ライブラリ・KaTeX・Adobe CMap・PyInstallerのライセンス本文
 ├─ models/                      # 初回セットアップ後にGGUFを保存
 ├─ runtime/                     # llama.cpp CUDA/Vulkan版
 └─ data/                        # PDFと翻訳結果（配布時は空）

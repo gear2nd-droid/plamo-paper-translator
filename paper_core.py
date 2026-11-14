@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import difflib
+import functools
+import gzip
 import html
 import json
 import re
+import sys
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -59,6 +62,10 @@ HEADING_MATH_PATTERN =re.compile(r"[=<>≤≥≈≠∑∫√±×·∈∀∪∩�
 def _numbered_title_is_heading(number: str, raw_number: str, title: str) -> bool:
     """Reject numbered list items and display equations that look like headings."""
     if not title or re.search(r"[.!?。！？]", title):
+        return False
+    if re.search(r"[，、．（）「」]", title):
+        # "2 種類の線形変換を施し（ここでは，...": a wrapped line of Japanese
+        # prose that starts with a number, not a section title.
         return False
     if re.fullmatch(r"[\d\s.]+", title):
         # "0 4 8 12 16 20": axis ticks or a row of numbers, not a title.
@@ -207,10 +214,26 @@ def _mostly_nonlinguistic(text: str) -> bool:
     return letters / len(compact) < 0.18
 
 
+CJK_CHARACTER = r"　-〿぀-ヿ㐀-䶿一-鿿豈-﫿＀-￯"
+CJK_GAP_PATTERN = re.compile(rf"(?<=[{CJK_CHARACTER}])[ \t]+(?=[{CJK_CHARACTER}])")
+
+
+def _join_lines(lines: list[str]) -> str:
+    """Join wrapped lines: with a space in English, directly in Japanese and Chinese."""
+    text = ""
+    for line in lines:
+        if text and not (re.search(rf"[{CJK_CHARACTER}]$", text) and re.match(rf"[{CJK_CHARACTER}]", line)):
+            text += " "
+        text += line
+    return text
+
+
 def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"(?<=[A-Za-z])-\n(?=[a-z])", "", text)
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    # Japanese has no spaces between words; PDF extraction adds them where
+    # characters are spaced out ("は じ め に") or between text runs.
+    lines = [CJK_GAP_PATTERN.sub("", re.sub(r"[ \t]+", " ", line)).strip() for line in text.splitlines()]
     if not any(lines):
         return ""
 
@@ -219,7 +242,7 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
 
     def flush() -> None:
         if current:
-            paragraphs.append(" ".join(current))
+            paragraphs.append(_join_lines(current))
             current.clear()
 
     for line in lines:
@@ -244,13 +267,13 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
         if special_kind == "list_item":
             flush()
             current.append(line)
-            if re.search(r"[.!?。！？;；]$", line):
+            if re.search(r"[.!?。！？．;；]$", line):
                 flush()
             continue
         if current and _block_kind(current[0]) == "list_item":
             if special_kind not in {"heading", "figure", "table", "equation"}:
                 current.append(line)
-                if re.search(r"[.!?。！？;；]$", line):
+                if re.search(r"[.!?。！？．;；]$", line):
                     flush()
                 continue
             flush()
@@ -285,7 +308,7 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
             paragraphs.append(line)
         else:
             current.append(line)
-            if re.search(r"[.!?。！？:]$", line) and len(" ".join(current)) >= 220:
+            if re.search(r"[.!?。！？．:]$", line) and len(" ".join(current)) >= 220:
                 flush()
     flush()
     return "\n\n".join(paragraphs)
@@ -298,7 +321,13 @@ def _positioned_captions(
     captions: list[PositionedCaption] = []
     for start, (start_x, start_y, start_text) in enumerate(fragments):
         if not POSITIONED_CAPTION_PATTERN.match(start_text.strip()):
-            continue
+            # Some producers write each word as its own fragment:
+            # "Figure" | " " | "3." on one line.
+            if not re.fullmatch(r"(?:figure|fig\.?|table)", start_text.strip(), re.I):
+                continue
+            head = "".join(value for x, y, value in fragments[start : start + 4] if abs(y - start_y) <= 2)
+            if not POSITIONED_CAPTION_PATTERN.match(head.strip()):
+                continue
         left_column = start_x < page_midpoint
         previous_y = start_y
         pieces = [start_text]
@@ -929,7 +958,9 @@ def _block_kind(text: str) -> str:
     # section, figure, table or equation do not make a line a table row.
     countable = re.sub(r"\b(?:sections?|sec\.|chapters?|figures?|figs?\.|tables?|equations?|eqs?\.|§)\s*\(?\d+(?:\.\d+)*\)?", " ", compact, flags=re.I)
     numeric_tokens = len(re.findall(r"(?<!\w)[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?!\w)", countable))
-    if numeric_tokens >= 5 and numeric_tokens >= max(3, len(compact.split()) // 4):
+    # Japanese prose has no spaces, so count its characters as words too.
+    words = len(compact.split()) + len(re.findall(rf"[{CJK_CHARACTER}]", compact)) // 2
+    if numeric_tokens >= 5 and numeric_tokens >= max(3, words // 4):
         return "table"
     return "sentence"
 
@@ -952,10 +983,12 @@ def _sentence_parts(text: str) -> list[str]:
         flags=re.I,
     )
     protected = re.sub(
-        r"([.!?。！？][\"'”’\)\]]*)\s+(?=[\"'“‘(\[]?[A-Z0-9\u3040-\u30ff\u3400-\u9fff])",
+        r"([.!?。！？．][\"'”’\)\]]*)\s+(?=[\"'“‘(\[]?[A-Z0-9\u3040-\u30ff\u3400-\u9fff])",
         rf"\1{boundary}",
         protected,
     )
+    # Japanese sentences end in 。 or ． with no space before the next one.
+    protected = re.sub(r"([。．！？][」』）)]*)(?=[^\s」』）)。．、，\uE001])", rf"\1{boundary}", protected)
     parts = protected.split(boundary)
     return [part.replace(marker, ".").strip() for part in parts if part.strip()]
 
@@ -1792,6 +1825,14 @@ def _page_number_candidates_at_edges(
     ]
 
 
+def _body_font_size(fragments: list[LayoutFragment]) -> float:
+    """The font size most of a page's characters are set in."""
+    counts: Counter[float] = Counter()
+    for fragment in fragments:
+        counts[round(fragment.size * 2) / 2] += len(fragment.text.strip())
+    return counts.most_common(1)[0][0] if counts else 10.0
+
+
 def _footer_lines(parts: list[tuple[float, str]]) -> list[str]:
     """Whole lines of small text just above the bottom margin.
 
@@ -1973,6 +2014,98 @@ def _reindex_segments(segments: list[Segment]) -> list[Segment]:
     return segments
 
 
+CID_ORDERINGS = ("Japan1", "GB1", "CNS1", "Korea1")
+CMAP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "cmaps"
+
+
+@functools.lru_cache(maxsize=None)
+def _cid_to_unicode_cmap(ordering: str) -> bytes | None:
+    """A /ToUnicode CMap for an Adobe character collection (Identity-H codes are CIDs)."""
+    path = CMAP_DIR / f"Adobe-{ordering}.json.gz"
+    try:
+        ranges = json.loads(gzip.decompress(path.read_bytes()))["ranges"]
+    except (OSError, ValueError, KeyError):
+        return None
+    singles: list[str] = []
+    runs: list[str] = []
+    for first, text, count in ranges:
+        if count == 1:
+            singles.append(f"<{first:04x}> <{text.encode('utf-16-be').hex()}>")
+            continue
+        # A bfrange must not cross a boundary of the code's last byte.
+        cid, code, left = first, ord(text), count
+        while left:
+            span = min(left, 256 - (cid & 0xFF))
+            runs.append(f"<{cid:04x}> <{cid + span - 1:04x}> <{chr(code).encode('utf-16-be').hex()}>")
+            cid, code, left = cid + span, code + span, left - span
+    lines = [
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap",
+        "/CMapName /Adobe-Identity-UCS def /CMapType 2 def",
+        "1 begincodespacerange <0000> <FFFF> endcodespacerange",
+    ]
+    for start in range(0, len(singles), 100):
+        chunk = singles[start : start + 100]
+        lines += [f"{len(chunk)} beginbfchar", *chunk, "endbfchar"]
+    for start in range(0, len(runs), 100):
+        chunk = runs[start : start + 100]
+        lines += [f"{len(chunk)} beginbfrange", *chunk, "endbfrange"]
+    lines.append("endcmap CMapName currentdict /CMap defineresource pop end end")
+    return "\n".join(lines).encode("ascii")
+
+
+def _attach_cid_to_unicode(page: Any) -> None:
+    """Give CJK fonts without a /ToUnicode map Adobe's CID -> Unicode table.
+
+    LaTeX papers set in IPAMincho and similar fonts are embedded with the
+    Identity-H encoding and no /ToUnicode map, so their codes are CIDs of a
+    public character collection (Adobe-Japan1 and others). PDF viewers read
+    them with Adobe's tables; without one, "はじめに" came out as "͸ ͡ Ί ʹ".
+    """
+    from pypdf.generic import DecodedStreamObject, NameObject
+
+    seen: set[int] = set()
+
+    def visit(resources: Any, depth: int) -> None:
+        if resources is None or depth > 6:
+            return
+        resources = resources.get_object()
+        fonts = resources.get("/Font")
+        for _name, reference in (fonts.get_object().items() if fonts is not None else []):
+            font = reference.get_object()
+            if id(font) in seen:
+                continue
+            seen.add(id(font))
+            if font.get("/Subtype") != "/Type0" or "/ToUnicode" in font:
+                continue
+            if font.get("/Encoding") not in ("/Identity-H", "/Identity-V"):
+                continue
+            descendants = font.get("/DescendantFonts")
+            if not descendants:
+                continue
+            info = descendants.get_object()[0].get_object().get("/CIDSystemInfo")
+            info = info.get_object() if info is not None else {}
+            ordering = str(info.get("/Ordering", ""))
+            if str(info.get("/Registry", "")) != "Adobe" or ordering not in CID_ORDERINGS:
+                continue
+            data = _cid_to_unicode_cmap(ordering)
+            if data is None:
+                continue
+            stream = DecodedStreamObject()
+            stream.set_data(data)
+            font[NameObject("/ToUnicode")] = stream
+        xobjects = resources.get("/XObject")
+        for _name, reference in (xobjects.get_object().items() if xobjects is not None else []):
+            target = reference.get_object()
+            if id(target) not in seen and target.get("/Subtype") == "/Form":
+                seen.add(id(target))
+                visit(target.get("/Resources"), depth + 1)
+
+    try:
+        visit(page.get("/Resources"), 0)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return
+
+
 def extract_document(
     path: Path,
     max_chars: int = 1000,
@@ -1998,19 +2131,24 @@ def extract_document(
             tuple[Any, str, list[tuple[float, float, str]], list[LayoutFragment], list[tuple[str, str]]]
         ] = []
         margin_counts: Counter[str] = Counter()
+        page_margin_parts: list[tuple[list[tuple[str, str, float]], list[tuple[float, str, float]]]] = []
         for page in reader.pages:
+            _attach_cid_to_unicode(page)
             fragments: list[tuple[float, float, str]] = []
             layout_fragments: list[LayoutFragment] = []
-            margin_candidates: list[tuple[str, str]] = []
+            margin_parts: list[tuple[str, str, float]] = []
+            footer_parts: list[tuple[float, str, float]] = []
             page_height = float(page.mediabox.height)
             page_width = float(page.mediabox.width)
             try:
 
                 text_parts: list[str] = []
                 fragment_parts: list[int] = []
-                footer_parts: list[tuple[float, str]] = []
 
                 def collect_fragment(value: str, _cm: Any, tm: list[float], _font: Any, size: float) -> None:
+                    # Some producers (MDPI) put no-break spaces between all
+                    # words, which hides "Figure 7." from every pattern.
+                    value = value.replace("\xa0", " ")
                     text_parts.append(value)
                     if not value.strip():
                         return
@@ -2028,11 +2166,11 @@ def extract_document(
                     fragments.append((x, y, value))
                     layout_fragments.append(LayoutFragment(len(layout_fragments), x, y, value, size))
                     if size <= 8.5 and 10 < y < 85:
-                        margin_candidates.append((value, "bottom"))
+                        margin_parts.append((value, "bottom", size))
                     elif size <= 8.5 and 85 <= y < 110:
-                        footer_parts.append((y, value))
+                        footer_parts.append((y, value, size))
                     elif size <= 8.5 and page_height - 65 < y <= page_height:
-                        margin_candidates.append((value, "top"))
+                        margin_parts.append((value, "top", size))
 
                 image_boxes: list[tuple[float, float, float, float]] = []
                 image_names = _image_xobject_names(page)
@@ -2049,9 +2187,7 @@ def extract_document(
                     ys = (f, b + f, d + f, b + d + f)
                     image_boxes.append((min(xs), min(ys), max(xs), max(ys)))
 
-                raw = page.extract_text(visitor_text=collect_fragment, visitor_operand_before=collect_image) or ""
-                margin_candidates = _page_number_candidates_at_edges(margin_candidates, layout_fragments)
-                margin_candidates.extend((line, "bottom") for line in _footer_lines(footer_parts))
+                raw = (page.extract_text(visitor_text=collect_fragment, visitor_operand_before=collect_image) or "").replace("\xa0", " ")
                 # Layout analysis keeps the plain fragment text; the body text
                 # and caption fragments carry E_{algo} / b^{⋆} markup. Text
                 # drawn inside figures is left out of the body text.
@@ -2070,10 +2206,41 @@ def extract_document(
             except TypeError:
                 fragments = []
                 layout_fragments = []
-                margin_candidates = []
-                raw = page.extract_text() or ""
+                margin_parts = []
+                footer_parts = []
+                raw = (page.extract_text() or "").replace("\xa0", " ")
+            page_records.append((page, raw, fragments, layout_fragments, []))
+            page_margin_parts.append((margin_parts, footer_parts))
+
+        letters = sum(len(re.findall(r"[^\W\d_]", record[1])) for record in page_records)
+        if page_records and letters < 150 * len(page_records):
+            # Scanned pages: only a running footer is text, the body is an
+            # image. Translating that footer alone would only mislead.
+            if pdfium_document is not None:
+                pdfium_document.close()
+            raise ValueError(
+                "本文の文字をほとんど抽出できませんでした。ページが画像として埋め込まれたPDF（スキャンPDFなど）のようです。"
+                "OCRで文字を付けてから読み込んでください。"
+            )
+
+        # Headers and footers are set smaller than the body text. When the
+        # body itself is small (8 pt), its last lines near the page edge must
+        # not be taken for a footer: common words such as "material" also
+        # appear at the bottom of other pages.
+        # A page of small references can outweigh the body, so the larger of
+        # the page's and the document's common size counts as body text.
+        document_body_size = _body_font_size([fragment for record in page_records for fragment in record[3]])
+        for position, (margin_parts, footer_parts) in enumerate(page_margin_parts):
+            page, raw, fragments, layout_fragments, _ = page_records[position]
+            body_size = max(document_body_size, _body_font_size(layout_fragments))
+            margin_candidates = [(value, zone) for value, zone, size in margin_parts if size < body_size - 0.3]
+            margin_candidates = _page_number_candidates_at_edges(margin_candidates, layout_fragments)
+            margin_candidates.extend(
+                (line, "bottom")
+                for line in _footer_lines([(y, value) for y, value, size in footer_parts if size < body_size - 0.3])
+            )
             margin_counts.update({_margin_key(value) for value, _zone in margin_candidates if value.strip()})
-            page_records.append((page, raw, fragments, layout_fragments, margin_candidates))
+            page_records[position] = (page, raw, fragments, layout_fragments, margin_candidates)
 
         repeated_margin_keys = {key for key, count in margin_counts.items() if count >= 2}
         repeated_margin_keys.add("__page_number__")

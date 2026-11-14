@@ -17,7 +17,7 @@ if (Test-Path -LiteralPath $ResolvedPackageRoot) {
 & $Python -m pip install --disable-pip-version-check "pyinstaller>=6.16,<7"
 Push-Location $AppRoot
 try {
-    & $Python -m PyInstaller --noconfirm --clean --onefile --name PLaMoPaperTranslator --icon "assets\app.ico" --hidden-import pypdf --add-data "static;static" app.py
+    & $Python -m PyInstaller --noconfirm --clean --onefile --name PLaMoPaperTranslator --icon "assets\app.ico" --hidden-import pypdf --add-data "static;static" --add-data "cmaps;cmaps" app.py
     New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
     Copy-Item -Force "dist\PLaMoPaperTranslator.exe" $PackageRoot
     Copy-Item -Force "Start-PLaMoPaperTranslator.cmd","start.ps1","setup.ps1","requirements.txt","README.md","CHANGELOG.md","DISTRIBUTION.md","THIRD_PARTY_NOTICES.md","LICENSE" $PackageRoot
@@ -41,6 +41,7 @@ try {
     $LicenseRoot = Join-Path $PackageRoot "licenses"
     New-Item -ItemType Directory -Force -Path $LicenseRoot | Out-Null
     Copy-Item -Force -LiteralPath "static\vendor\katex\LICENSE" -Destination (Join-Path $LicenseRoot "KaTeX-LICENSE.txt")
+    Copy-Item -Force -LiteralPath "cmaps\LICENSE-Adobe.txt" -Destination (Join-Path $LicenseRoot "Adobe-CMap-LICENSE.txt")
 
     $PythonBase = (& $Python -c "import sys; print(sys.base_prefix)").Trim()
     $PythonLicense = Join-Path $PythonBase "LICENSE.txt"

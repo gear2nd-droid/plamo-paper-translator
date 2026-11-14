@@ -46,6 +46,14 @@ PDFiumは独立表示数式をPDFから画像として切り出すために使�
 
 論文のまとめに書いた `$…$` の数式を表示するために使用します。外部サーバーから読み込まず、`static/vendor/katex/` の同梱ファイル（JavaScript、CSS、フォント）だけを使います。
 
+## Adobe CMap resources (pdf2unicode)
+
+- Project: https://github.com/adobe-type-tools/mapping-resources-pdf
+- License: BSD-3-Clause（Copyright 1990-2019 Adobe）
+- Included license: `licenses/Adobe-CMap-LICENSE.txt`（ソースでは `cmaps/LICENSE-Adobe.txt`）
+
+`pdf2unicode/Adobe-{Japan1,GB1,CNS1,Korea1}-UCS2` を、`tools/build_cid_tables.py` で範囲リストに変換して `cmaps/` に収録しています。文字の対応表（ToUnicode）を持たない日本語・中国語・韓国語フォントの文字を、Unicodeとして読み取るために使用します。
+
 ## Python
 
 - Project: https://www.python.org/
