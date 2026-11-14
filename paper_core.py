@@ -43,7 +43,11 @@ PLAMO_ATTRIBUTION = "Built with PLaMo"
 
 LIST_PATTERN = re.compile(r"^(?:[•●◦▪‣*-]\s+|\((?:[1-9]|1[01])\)\s+|(?:[1-9]|1[01])[.)]\s+)")
 
-POSITIONED_CAPTION_PATTERN = re.compile(r"^(?:figure|fig\.?|table)\s*\d+\s*[.:]", re.I)
+# "図 1: ..." / "表2 ...". A body sentence such as "図1に示すように" is not a
+# caption, so a particle right after the number rules it out.
+JA_CAPTION = r"(?:図|表)\s*(?:[A-Z]\.?\s*)?\d+(?:\s*[:：．.]|\s+)(?!\s*(?:に|は|の|で|を|が|と|から|より|や|も|へ|まで|および|及び))"
+CAPTION_START_PATTERN = re.compile(rf"^(?:(?:figure|fig\.?|table)\s*\d+\s*[.:]|{JA_CAPTION})", re.I)
+POSITIONED_CAPTION_PATTERN = CAPTION_START_PATTERN
 SECTION_NAME_PATTERN = re.compile(
     r"^(?:abstract|introduction|background|related work|methods?|materials?|results?|discussion|"
     r"conclusions?|references|acknowledg(?:e)?ments?|appendix|supplementary materials?)\s*$",
@@ -62,6 +66,8 @@ HEADING_MATH_PATTERN =re.compile(r"[=<>≤≥≈≠∑∫√±×·∈∀∪∩�
 def _numbered_title_is_heading(number: str, raw_number: str, title: str) -> bool:
     """Reject numbered list items and display equations that look like headings."""
     if not title or re.search(r"[.!?。！？]", title):
+        return False
+    if re.match(r"[年月日をがで]", title):  # not は/に: "はじめに", "について"
         return False
     if re.search(r"[，、．（）「」]", title):
         # "2 種類の線形変換を施し（ここでは，...": a wrapped line of Japanese
@@ -259,7 +265,7 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
         verified_caption = line.startswith(CAPTION_MARKER)
         if verified_caption:
             line = CAPTION_MARKER + line.removeprefix(CAPTION_MARKER).lstrip()
-        elif captions_marked and re.match(r"^(?:figure|fig\.|table)\s*\d+[.:]", line, re.I):
+        elif captions_marked and CAPTION_START_PATTERN.match(line):
             # A body sentence can legitimately begin with "Figure 8.". Only
             # position-verified captions receive figure/table treatment in PDF.
             line = BODY_MARKER + line
@@ -278,7 +284,7 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
                 continue
             flush()
         is_caption = verified_caption or (
-            not captions_marked and bool(re.match(r"^(?:figure|fig\.|table)\s*\d+[.:]", line, re.I))
+            not captions_marked and bool(CAPTION_START_PATTERN.match(line))
         )
         if is_caption:
             flush()
@@ -286,11 +292,7 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
             continue
         if (
             current
-            and re.match(
-                r"^(?:figure|fig\.|table)\s*\d+[.:]",
-                current[0].removeprefix(CAPTION_MARKER),
-                re.I,
-            )
+            and CAPTION_START_PATTERN.match(current[0].removeprefix(CAPTION_MARKER))
             and special_kind not in {"heading", "equation", "table"}
         ):
             # PDF captions are commonly wrapped across physical lines. Keep the
@@ -317,17 +319,35 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
 def _positioned_captions(
     fragments: list[tuple[float, float, str]],
     page_midpoint: float,
+    sizes: list[float] | None = None,
+    body_size: float = 0.0,
 ) -> list[PositionedCaption]:
+    """Captions found at the start of a layout line.
+
+    ``sizes`` (the font size of each fragment) confirms Japanese captions:
+    body text often starts a line with "図 3 では" too, but captions are set
+    smaller than the body.
+    """
+    if sizes:
+        weights: Counter[float] = Counter()
+        for (_x, _y, value), size in zip(fragments, sizes):
+            weights[round(size * 2) / 2] += len(value.strip())
+        # An appendix page can be set small throughout; the document's body
+        # size (passed in) still tells captions apart there.
+        body_size = max(body_size, weights.most_common(1)[0][0] if weights else 0.0)
     captions: list[PositionedCaption] = []
     for start, (start_x, start_y, start_text) in enumerate(fragments):
         if not POSITIONED_CAPTION_PATTERN.match(start_text.strip()):
             # Some producers write each word as its own fragment:
             # "Figure" | " " | "3." on one line.
-            if not re.fullmatch(r"(?:figure|fig\.?|table)", start_text.strip(), re.I):
+            if not re.fullmatch(r"(?:figure|fig\.?|table|図|表)", start_text.strip(), re.I):
                 continue
             head = "".join(value for x, y, value in fragments[start : start + 4] if abs(y - start_y) <= 2)
             if not POSITIONED_CAPTION_PATTERN.match(head.strip()):
                 continue
+        # Sizes are rounded to half points; 7.8 pt captions under 8 pt body text count.
+        if sizes and body_size and start_text.strip().startswith(("図", "表")) and sizes[start] >= body_size - 0.15:
+            continue
         left_column = start_x < page_midpoint
         previous_y = start_y
         pieces = [start_text]
@@ -338,6 +358,8 @@ def _positioned_captions(
                 break
             if POSITIONED_CAPTION_PATTERN.match(value.strip()):
                 break
+            if previous_y - y > 2 and re.search(r"[。．]\s*$", "".join(pieces)):
+                break  # a Japanese caption ends at 。/．; body text follows
             pieces.append(value)
             if previous_y - y > 2:
                 previous_y = y
@@ -360,7 +382,7 @@ def _mark_caption_boundaries(text: str, caption_source: str | list[str]) -> str:
     if isinstance(caption_source, str):
         for raw_block in re.split(r"\n\s*\n+", caption_source):
             lines = [re.sub(r"[ \t]+", " ", line).strip() for line in raw_block.splitlines() if line.strip()]
-            if lines and re.match(r"^(?:figure|fig\.|table)\s*\d+[.:]", lines[0], re.I):
+            if lines and CAPTION_START_PATTERN.match(lines[0]):
                 caption_blocks.append(" ".join(lines))
     for caption in caption_blocks:
         tokens = caption.split()
@@ -375,6 +397,18 @@ def _mark_caption_boundaries(text: str, caption_source: str | list[str]) -> str:
         )
         if replacements:
             continue
+        if re.search(rf"[{CJK_CHARACTER}]", caption):
+            # Japanese has no word spaces, so the extracted text can break a
+            # line or insert a space anywhere: allow both between characters.
+            compact = re.sub(r"\s+", "", caption)
+            text, replacements = re.subn(
+                r"\s*".join(re.escape(character) for character in compact),
+                lambda match: f"\n\n{CAPTION_MARKER}{match.group(0)}\n\n",
+                text,
+                count=1,
+            )
+            if replacements:
+                continue
         # Text extraction can insert or remove spaces around equations and
         # inline symbols. Match stable anchors at both ends so the complete
         # layout-verified caption still becomes its own paragraph.
@@ -701,18 +735,24 @@ def _mark_equation_boundaries(text: str, equations: list[PositionedEquation]) ->
                         rf"{gap.join(re.escape(character) for character in compact_equation[skip:skip + anchor_size])}"
                         rf"(?:{within}[\s\S]){{0,{span}}}?\(\s*{equation.number}\s*\)"
                     )
+        own_cjk = len(re.findall(rf"[{CJK_CHARACTER}]", equation.text))
+        if own_cjk > 12:
+            continue  # Japanese prose taken for a display equation
         for pattern in patterns:
-            text, replacements = re.subn(
-                pattern,
-                lambda match: (
-                    f"\n\n{EQUATION_MARKER}{equation.number}:"
-                    f"{re.sub(r'\s+', ' ', match.group(0)).strip()}\n\n"
-                ),
-                text,
-                count=1,
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            if len(re.findall(rf"[{CJK_CHARACTER}]", match.group(0))) - own_cjk > 8:
+                # Japanese prose has no spaces and wraps around inline math,
+                # so a loose match can swallow sentences. A row marked as an
+                # equation is shown as its image and never translated.
+                continue
+            text = (
+                text[: match.start()]
+                + f"\n\n{EQUATION_MARKER}{equation.number}:{re.sub(r'\s+', ' ', match.group(0)).strip()}\n\n"
+                + text[match.end() :]
             )
-            if replacements:
-                break
+            break
     return text
 
 
@@ -941,9 +981,9 @@ def _block_kind(text: str) -> str:
         return "heading"
     if LIST_PATTERN.match(compact):
         return "list_item"
-    if re.match(r"^(?:figure|fig\.)\s*\d+[.:]", compact, re.I):
+    if re.match(rf"^(?:(?:figure|fig\.)\s*\d+[.:]|(?=図){JA_CAPTION})", compact, re.I):
         return "figure"
-    if re.match(r"^table\s*\d+[.:]", compact, re.I):
+    if re.match(rf"^(?:table\s*\d+[.:]|(?=表){JA_CAPTION})", compact, re.I):
         return "table"
     math_symbols = len(re.findall(r"[=∑∫√±≤≥≈≠∞∂∇α-ωΑ-Ω^_{}|]", compact))
     letters = len(re.findall(r"[A-Za-z\u3040-\u30ff\u3400-\u9fff]", compact))
@@ -975,6 +1015,8 @@ def _sentence_parts(text: str) -> list[str]:
         protected,
         flags=re.I,
     )
+    protected = re.sub(r"^((?:図|表)\s*(?:[A-Z]\.?\s*)?\d+)[．.]", lambda match: match.group(1) + "\uE002", protected)
+    protected = re.sub(r"^((?:図|表)\s*[A-Z])\.(?=\s*\d)", lambda match: match.group(1) + marker, protected)
     protected = re.sub(r"\b([A-Z])\.(?=\s+[A-Z])", lambda match: match.group(1) + marker, protected)
     protected = re.sub(
         r"\b(?:e\.g|i\.e|et\s+al|Fig|Figs|Eq|Eqs|Sec|Secs|Dr|Prof|No|Nos|Vol|Trans|Proc|Conf|Comput|Graph|Int|pp|eds?)\s*\.",
@@ -990,7 +1032,7 @@ def _sentence_parts(text: str) -> list[str]:
     # Japanese sentences end in 。 or ． with no space before the next one.
     protected = re.sub(r"([。．！？][」』）)]*)(?=[^\s」』）)。．、，\uE001])", rf"\1{boundary}", protected)
     parts = protected.split(boundary)
-    return [part.replace(marker, ".").strip() for part in parts if part.strip()]
+    return [part.replace(marker, ".").replace("\uE002", "．").strip() for part in parts if part.strip()]
 
 
 def split_document_units(
@@ -1565,6 +1607,11 @@ def _caption_identity(text: str) -> tuple[str, int] | None:
     match = re.match(r"^table\s*(\d+)\s*[.:]", text.strip(), re.I)
     if match:
         return "table", int(match.group(1))
+    match = re.match(rf"^(?=(図|表)){JA_CAPTION}", text.strip())
+    if match:
+        return ("figure" if match.group(1) == "図" else "table"), int(re.search(r"\d+", text).group(0)) + (
+            1000 * (ord(letter.group(1)) - 64) if (letter := re.match(r"^(?:図|表)\s*([A-Z])", text.strip())) else 0
+        )
     return None
 
 
@@ -2014,6 +2061,21 @@ def _reindex_segments(segments: list[Segment]) -> list[Segment]:
     return segments
 
 
+def _text_position(tm: Any, cm: Any) -> tuple[float, float, float, float]:
+    """Page position (x, y) and the size column (c, d) of text matrix tm under cm."""
+    a, b, c, d, e, f = (float(value) for value in tm[:6])
+    try:
+        ca, cb, cc, cd, ce, cf = (float(value) for value in cm[:6])
+    except (TypeError, ValueError):
+        return e, f, c, d
+    return (
+        e * ca + f * cc + ce,
+        e * cb + f * cd + cf,
+        c * ca + d * cc,
+        c * cb + d * cd,
+    )
+
+
 CID_ORDERINGS = ("Japan1", "GB1", "CNS1", "Korea1")
 CMAP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "cmaps"
 
@@ -2145,32 +2207,21 @@ def extract_document(
                 text_parts: list[str] = []
                 fragment_parts: list[int] = []
 
-                def collect_fragment(value: str, _cm: Any, tm: list[float], _font: Any, size: float) -> None:
+                visited: list[tuple[int, str, tuple[float, float, float], tuple[float, float, float]]] = []
+
+                def collect_fragment(value: str, cm: Any, tm: list[float], _font: Any, size: float) -> None:
                     # Some producers (MDPI) put no-break spaces between all
                     # words, which hides "Figure 7." from every pattern.
                     value = value.replace("\xa0", " ")
                     text_parts.append(value)
                     if not value.strip():
                         return
-                    x, y = float(tm[4]), float(tm[5])
                     # Some producers set the font size to 1 and scale the
                     # text matrix instead; use the size as drawn.
-                    scale = (float(tm[2]) ** 2 + float(tm[3]) ** 2) ** 0.5
-                    size = float(size) * (scale if scale > 0 else 1.0)
-                    if not (-5 <= x <= page_width + 5 and -5 <= y <= page_height + 5):
-                        # Text inside a reused drawing (a form XObject) can be
-                        # reported in the drawing's own coordinates, off the
-                        # page. Its position is meaningless for the layout.
-                        return
-                    fragment_parts.append(len(text_parts) - 1)
-                    fragments.append((x, y, value))
-                    layout_fragments.append(LayoutFragment(len(layout_fragments), x, y, value, size))
-                    if size <= 8.5 and 10 < y < 85:
-                        margin_parts.append((value, "bottom", size))
-                    elif size <= 8.5 and 85 <= y < 110:
-                        footer_parts.append((y, value, size))
-                    elif size <= 8.5 and page_height - 65 < y <= page_height:
-                        margin_parts.append((value, "top", size))
+                    plain = (float(tm[4]), float(tm[5]), float(size) * ((float(tm[2]) ** 2 + float(tm[3]) ** 2) ** 0.5 or 1.0))
+                    x, y, c, d = _text_position(tm, cm)
+                    placed = (x, y, float(size) * ((c**2 + d**2) ** 0.5 or 1.0))
+                    visited.append((len(text_parts) - 1, value, plain, placed))
 
                 image_boxes: list[tuple[float, float, float, float]] = []
                 image_names = _image_xobject_names(page)
@@ -2188,13 +2239,42 @@ def extract_document(
                     image_boxes.append((min(xs), min(ys), max(xs), max(ys)))
 
                 raw = (page.extract_text(visitor_text=collect_fragment, visitor_operand_before=collect_image) or "").replace("\xa0", " ")
+
+                def on_page(position: tuple[float, float, float]) -> bool:
+                    return -5 <= position[0] <= page_width + 5 and -5 <= position[1] <= page_height + 5
+
+                # The text matrix is in user space and the current transform
+                # (cm) places it on the page. Most producers leave cm alone
+                # around body text, but pLaTeX/dvipdfmx moves the origin with
+                # it, so the text matrix alone puts the whole body off the page
+                # (y = -186). Use the placed positions only for such a page:
+                # text in reused drawings (forms) is otherwise better left out.
+                use_placed = sum(on_page(placed) for *_rest, placed in visited) > 2 * max(
+                    1, sum(on_page(plain) for _part, _value, plain, _placed in visited)
+                )
+                for part, value, plain, placed in visited:
+                    x, y, size = placed if use_placed else plain
+                    if not on_page((x, y, size)):
+                        # Text inside a reused drawing (a form XObject) can be
+                        # reported in the drawing's own coordinates, off the
+                        # page. Its position is meaningless for the layout.
+                        continue
+                    fragment_parts.append(part)
+                    fragments.append((x, y, value))
+                    layout_fragments.append(LayoutFragment(len(layout_fragments), x, y, value, size))
+                    if size <= 8.5 and 10 < y < 85:
+                        margin_parts.append((value, "bottom", size))
+                    elif size <= 8.5 and 85 <= y < 110:
+                        footer_parts.append((y, value, size))
+                    elif size <= 8.5 and page_height - 65 < y <= page_height:
+                        margin_parts.append((value, "top", size))
                 # Layout analysis keeps the plain fragment text; the body text
                 # and caption fragments carry E_{algo} / b^{⋆} markup. Text
                 # drawn inside figures is left out of the body text.
                 roles = _script_roles(layout_fragments, float(page.mediabox.width))
                 figure_text = _figure_text_orders(
                     layout_fragments,
-                    _positioned_captions(fragments, page_width / 2),
+                    _positioned_captions(fragments, page_width / 2, [fragment.size for fragment in layout_fragments]),
                     image_boxes,
                     page_width,
                     page_height,
@@ -2251,7 +2331,12 @@ def extract_document(
             positioned_captions: list[PositionedCaption] = []
             positioned_equations: list[PositionedEquation] = []
             if fragments:
-                positioned_captions = _positioned_captions(fragments, float(page.mediabox.width) / 2)
+                positioned_captions = _positioned_captions(
+                    fragments,
+                    float(page.mediabox.width) / 2,
+                    [fragment.size for fragment in layout_fragments],
+                    document_body_size,
+                )
                 raw = _mark_caption_boundaries(raw, [caption.text for caption in positioned_captions])
             if layout_fragments:
                 positioned_equations = _positioned_equations(layout_fragments, float(page.mediabox.width))
