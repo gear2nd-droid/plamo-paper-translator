@@ -37,8 +37,10 @@ from paper_core import (
     bilingual_markdown,
     document_to_dict,
     extract_document,
+    merge_reextracted_segments,
     neighboring_context,
     parse_glossary,
+    remap_summary_row_references,
     segments_for_mode,
     strip_script_markup,
 )
@@ -97,6 +99,9 @@ for directory in (DATA_DIR, UPLOAD_DIR, JOB_DIR, ASSET_DIR):
 documents: dict[str, dict[str, Any]] = {}
 jobs: dict[str, dict[str, Any]] = {}
 active_retranslations: set[tuple[str, int]] = set()
+active_reextractions: set[str] = set()
+REEXTRACT_BACKUP_DIR = DATA_DIR / "reextract-backups"
+MAX_REEXTRACT_BACKUPS = 3
 control_token = ""
 state_lock = threading.RLock()
 translator = LlamaTranslator()
@@ -165,7 +170,7 @@ def _launch_detached_server() -> None:
 
 def _server_is_busy() -> bool:
     with state_lock:
-        if active_retranslations:
+        if active_retranslations or active_reextractions:
             return True
         return any(job.get("status") in {"queued", "running"} for job in jobs.values())
 
@@ -669,6 +674,8 @@ def _delete_library_job(job_id: str) -> dict[str, Any]:
             raise ValueError("翻訳中の論文は削除できません。先に翻訳をキャンセルしてください。")
         if any(key[0] == job_id for key in active_retranslations):
             raise ValueError("再翻訳中の論文は削除できません。完了後にもう一度お試しください。")
+        if job_id in active_reextractions:
+            raise ValueError("再抽出中の論文は削除できません。完了後にもう一度お試しください。")
         (JOB_DIR / f"{job_id}.json").unlink(missing_ok=True)
         jobs.pop(job_id, None)
         removed_files = 1
@@ -850,6 +857,109 @@ def _retranslate_segment(job_id: str, job: dict[str, Any], index: int) -> Segmen
             active_retranslations.discard(key)
 
 
+def _remove_unreferenced_document(document_id: str) -> None:
+    """Delete a source file and its images once no saved paper points at them."""
+    if not re.fullmatch(r"[a-f0-9]{32}", document_id) or _document_is_referenced(document_id, excluding_job=""):
+        return
+    documents.pop(document_id, None)
+    for upload in UPLOAD_DIR.glob(f"{document_id}_*"):
+        if upload.is_file():
+            upload.unlink(missing_ok=True)
+    asset_root = ASSET_DIR / document_id
+    if asset_root.is_dir() and ASSET_DIR.resolve() in asset_root.resolve().parents:
+        shutil.rmtree(asset_root, ignore_errors=True)
+
+
+def _backup_job_before_reextract(job: dict[str, Any]) -> Path:
+    REEXTRACT_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    target = REEXTRACT_BACKUP_DIR / f'{job["id"]}-{stamp}.json'
+    payload = dict(job)
+    payload["segments"] = [segment.__dict__ if isinstance(segment, Segment) else segment for segment in job["segments"]]
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    for old in sorted(REEXTRACT_BACKUP_DIR.glob(f'{job["id"]}-*.json'))[:-MAX_REEXTRACT_BACKUPS]:
+        old.unlink(missing_ok=True)
+    return target
+
+
+def _reextract_job(job_id: str) -> dict[str, Any]:
+    """Extract a saved paper again with the current extractor, keeping the reader's work.
+
+    The source PDF is copied under a new document id so the old images stay
+    valid until the merged job is saved. Rows that are new or changed are
+    translated in the background.
+    """
+    job = _load_saved_job(job_id)
+    if not job:
+        raise LookupError("ジョブが見つかりません。")
+    with state_lock:
+        if job.get("status") in {"queued", "running"}:
+            raise ValueError("翻訳中の論文は再抽出できません。翻訳の完了かキャンセルを待ってください。")
+        if any(key[0] == job_id for key in active_retranslations):
+            raise ValueError("再翻訳中の論文は再抽出できません。完了後にもう一度お試しください。")
+        if job_id in active_reextractions:
+            raise ValueError("この論文はすでに再抽出中です。")
+        old_document_id = str(job.get("document_id", ""))
+        sources = (
+            sorted(path for path in UPLOAD_DIR.glob(f"{old_document_id}_*") if path.is_file())
+            if re.fullmatch(r"[a-f0-9]{32}", old_document_id)
+            else []
+        )
+        if not sources:
+            raise ValueError("元の論文ファイルが保存されていないため再抽出できません。")
+        active_reextractions.add(job_id)
+    try:
+        source = sources[0]
+        new_document_id = uuid.uuid4().hex
+        target = UPLOAD_DIR / f"{new_document_id}_{source.name[len(old_document_id) + 1:]}"
+        asset_root = ASSET_DIR / new_document_id
+        try:
+            shutil.copy2(source, target)
+            extracted, _pages = extract_document(
+                target,
+                asset_dir=asset_root,
+                asset_url_prefix=f"/api/assets/{new_document_id}",
+            )
+            fresh = segments_for_mode(extracted, str(job.get("segmentation_mode", "sentence")))
+            if not fresh:
+                raise ValueError("本文を抽出できませんでした。")
+        except Exception:
+            target.unlink(missing_ok=True)
+            shutil.rmtree(asset_root, ignore_errors=True)
+            raise
+        with state_lock:
+            _backup_job_before_reextract(job)
+            old_count = len(job["segments"])
+            merged, index_map, counts = merge_reextracted_segments(job["segments"], fresh)
+            job["segments"] = merged
+            job["document_id"] = new_document_id
+            job["total"] = len(merged)
+            job["paper_summary"] = remap_summary_row_references(str(job.get("paper_summary", "") or ""), index_map)
+            reading_index = int(job.get("reading_index", 0) or 0)
+            job["reading_index"] = index_map.get(reading_index, min(reading_index, len(merged) - 1))
+            job["cancelled"] = False
+            needs_translation = counts["needs_translation"] > 0
+            if needs_translation:
+                job["status"] = "queued"
+                job["message"] = f"再抽出しました。新しい・変わった{counts['needs_translation']}行を翻訳します"
+                job["completed"] = 0
+                job["progress"] = 0
+            else:
+                failed = sum(bool(segment.error) for segment in merged)
+                job["status"] = "completed" if failed == 0 else "completed_with_errors"
+                job["message"] = "再抽出しました" if failed == 0 else f"再抽出しました（{failed}件のエラーあり）"
+                job["completed"] = len(merged)
+                job["progress"] = 100
+            _save_job(job)
+            _remove_unreferenced_document(old_document_id)
+        if needs_translation:
+            threading.Thread(target=_translate_job, args=(job_id, True), daemon=True).start()
+        return {"id": job_id, "old_rows": old_count, "new_rows": len(merged), "translating": needs_translation, **counts}
+    finally:
+        with state_lock:
+            active_reextractions.discard(job_id)
+
+
 def _set_job_summary(job: dict[str, Any], tags: Any, summary: Any) -> tuple[list[str], str]:
     if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
         raise ValueError("タグの形式が不正です。")
@@ -962,7 +1072,8 @@ def _export_summary_fields(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _translate_job(job_id: str) -> None:
+def _translate_job(job_id: str, only_missing: bool = False) -> None:
+    """Translate every row, or with ``only_missing`` just rows without a translation."""
     with state_lock:
         job = jobs[job_id]
         job["status"] = "running"
@@ -987,7 +1098,9 @@ def _translate_job(job_id: str) -> None:
                 return
             job["message"] = f"{index + 1} / {len(segments)} 行を翻訳中"
             job["completed"] = index
-        if segment.kind == "equation" and segment.assets:
+        if only_missing and (segment.translation.strip() or segment.label == "asset"):
+            pass
+        elif segment.kind == "equation" and segment.assets:
             # Preserve the source equation exactly. The bitmap is authoritative;
             # extracted text remains available only for search and copying.
             segment.translation = segment.source
@@ -1004,6 +1117,7 @@ def _translate_job(job_id: str) -> None:
                     glossary=glossary,
                 )
                 segment.translation_origin = "model"
+                segment.error = ""
             except Exception as exc:
                 segment.error = str(exc)
         with state_lock:
@@ -1409,6 +1523,26 @@ class Handler(BaseHTTPRequestHandler):
                     "max": MAX_CLIPS,
                 }
             )
+            return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/reextract", parsed.path)
+        if match:
+            # A JSON content type forces a CORS preflight, so other web pages
+            # cannot start a re-extraction against this local server.
+            if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
+                self._error("Content-Type must be application/json", 415)
+                return
+            try:
+                result = _reextract_job(match.group(1))
+            except LookupError as exc:
+                self._error(str(exc), 404)
+                return
+            except ValueError as exc:
+                self._error(str(exc), 409)
+                return
+            except Exception as exc:
+                self._error(f"再抽出できません: {exc}", 500)
+                return
+            self._json({"ok": True, **result})
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/cancel", parsed.path)
         if match:

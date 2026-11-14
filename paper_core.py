@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import html
 import json
 import re
@@ -1037,6 +1038,131 @@ def segments_for_mode(segments: Iterable[Segment], mode: str) -> list[Segment]:
             )
         )
     return result
+
+
+SUMMARY_ROW_REFERENCE_PATTERN = re.compile(r"(\[\[#\s*)(\d{1,5})(\s*\]\])")
+
+
+def _reextract_key(source: str) -> str:
+    return re.sub(r"\s+", " ", strip_script_markup(source)).strip().casefold()
+
+
+def _shared_text_ratio(first: str, second: str) -> float:
+    """How much of the shorter text also appears in the longer one."""
+    if not first or not second:
+        return 0.0
+    matcher = difflib.SequenceMatcher(None, first, second, autojunk=False)
+    shared = sum(block.size for block in matcher.get_matching_blocks())
+    return shared / min(len(first), len(second))
+
+
+def _needs_translation(segment: Segment) -> bool:
+    if segment.label == "asset" or (segment.kind == "equation" and segment.assets):
+        return False
+    return not segment.translation.strip()
+
+
+def merge_reextracted_segments(
+    old_segments: list[Segment], new_segments: list[Segment]
+) -> tuple[list[Segment], dict[int, int], dict[str, int]]:
+    """Carry the reader's work over to a fresh extraction of the same paper.
+
+    Rows whose text is unchanged keep their translation and its history.
+    Notes, bookmarks and clips of every old row are moved to the new row
+    that holds most of its text (or to the row at the same place), so no
+    note is lost. Manually edited translations of changed rows are kept in
+    the new row's translation history. Returns the merged rows, a map from
+    old row index to new row index, and counts for the report.
+    """
+    old_keys = [_reextract_key(segment.source) for segment in old_segments]
+    new_keys = [_reextract_key(segment.source) for segment in new_segments]
+    merged = [Segment(**{**asdict(segment), "index": position}) for position, segment in enumerate(new_segments)]
+    index_map: dict[int, int] = {}
+    same_text: dict[int, int] = {}
+    if merged:
+        matcher = difflib.SequenceMatcher(None, old_keys, new_keys, autojunk=False)
+        for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+            if tag == "equal":
+                for offset in range(old_end - old_start):
+                    index_map[old_start + offset] = new_start + offset
+                    same_text[new_start + offset] = old_start + offset
+                continue
+            for old_index in range(old_start, old_end):
+                if new_start == new_end:
+                    # Removed rows: attach to the row just before the gap.
+                    index_map[old_index] = max(0, min(new_start - 1, len(merged) - 1)) if new_start else 0
+                    continue
+                span = new_end - new_start
+                position = old_index - old_start
+                guess = new_start + min(span - 1, position * span // max(1, old_end - old_start))
+                if (old_end - old_start) * span > 2_500:
+                    index_map[old_index] = guess
+                    continue
+                index_map[old_index] = max(
+                    range(new_start, new_end),
+                    key=lambda candidate: (
+                        round(_shared_text_ratio(old_keys[old_index], new_keys[candidate]), 2),
+                        -abs(candidate - guess),
+                    ),
+                )
+
+    counts = {"kept_translations": 0, "moved_notes": 0, "kept_bookmarks": 0, "needs_translation": 0}
+    for new_index, old_index in same_text.items():
+        target, previous = merged[new_index], old_segments[old_index]
+        if previous.translation.strip():
+            target.translation = previous.translation
+            target.translation_origin = previous.translation_origin
+            target.translation_edited_at = previous.translation_edited_at
+            target.translation_revisions = list(previous.translation_revisions)
+            target.error = previous.error
+            counts["kept_translations"] += 1
+    for old_index, previous in enumerate(old_segments):
+        if old_index not in index_map:
+            continue
+        new_index = index_map[old_index]
+        target = merged[new_index]
+        unchanged = same_text.get(new_index) == old_index
+        note = previous.note.strip()
+        if note and note not in target.note:
+            target.note = f"{target.note.rstrip()}\n\n{previous.note}" if target.note.strip() else previous.note
+            if not unchanged:
+                counts["moved_notes"] += 1
+        if previous.bookmarked:
+            target.bookmarked = True
+            counts["kept_bookmarks"] += 1
+        target.clips = list(dict.fromkeys([*target.clips, *previous.clips]))
+        target.clipped = bool(target.clips)
+        if not unchanged and previous.translation_origin == "manual" and previous.translation.strip():
+            target.translation_revisions.append(
+                {
+                    "translation": previous.translation,
+                    "changed_at": previous.translation_edited_at,
+                    "origin": "manual",
+                }
+            )
+            target.translation_revisions = target.translation_revisions[-20:]
+    for segment in merged:
+        if segment.kind == "equation" and segment.assets:
+            # Same rule as the translation run: the image is the equation.
+            segment.translation = segment.source
+            segment.translation_origin = "source"
+            segment.error = ""
+        elif _needs_translation(segment):
+            segment.error = ""
+            counts["needs_translation"] += 1
+    return merged, index_map, counts
+
+
+def remap_summary_row_references(summary: str, index_map: dict[int, int]) -> str:
+    """Point ``[[#n]]`` row references at the same text after re-extraction."""
+
+    def replace(match: re.Match[str]) -> str:
+        old_index = int(match.group(2)) - 1
+        if old_index not in index_map:
+            return match.group(0)
+        return f"{match.group(1)}{index_map[old_index] + 1}{match.group(3)}"
+
+    return SUMMARY_ROW_REFERENCE_PATTERN.sub(replace, summary)
 
 
 def _image_display_boxes(page: Any) -> dict[str, list[tuple[float, float, float, float]]]:

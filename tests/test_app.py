@@ -293,6 +293,97 @@ class SavedJobTests(unittest.TestCase):
             with self.assertRaises(LookupError):
                 app._delete_library_job("c" * 32)
 
+    def test_reextract_keeps_reader_work_and_translates_only_new_rows(self):
+        old_document = "d" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._library_root(directory)
+            backups = root / "reextract-backups"
+            backup_patch = patch.object(app, "REEXTRACT_BACKUP_DIR", backups)
+            backup_patch.start()
+            self.addCleanup(backup_patch.stop)
+            payload = {
+                **self.payload,
+                "id": self.job_id,
+                "document_id": old_document,
+                "segmentation_mode": "sentence",
+                "paper_summary": "Key point [[#2]] and ![[#3]].",
+                "reading_index": 2,
+                "segments": [
+                    Segment(0, 1, "Title", "題名").__dict__,
+                    Segment(1, 1, "Broken sentence", "壊れた訳", note="check", translation_origin="manual").__dict__,
+                    Segment(2, 1, "Kept sentence.", "残る訳", bookmarked=True).__dict__,
+                ],
+            }
+            (root / "jobs" / f"{self.job_id}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            (root / "uploads" / f"{old_document}_paper.pdf").write_bytes(b"%PDF")
+            (root / "assets" / old_document).mkdir()
+            (root / "assets" / old_document / "page-001.png").write_bytes(b"png")
+            fresh = [
+                Segment(0, 1, "Title"),
+                Segment(1, 1, "Broken sentence, now whole."),
+                Segment(2, 1, "A new caption."),
+                Segment(3, 1, "Kept sentence."),
+            ]
+            translate = Mock()
+            with (
+                patch.object(app, "extract_document", return_value=(fresh, 1)) as extract,
+                patch.object(app, "_translate_job", translate),
+            ):
+                result = app._reextract_job(self.job_id)
+            job = app.jobs[self.job_id]
+
+            new_document = job["document_id"]
+            self.assertNotEqual(new_document, old_document)
+            self.assertEqual(extract.call_args.kwargs["asset_url_prefix"], f"/api/assets/{new_document}")
+            self.assertTrue((root / "uploads" / f"{new_document}_paper.pdf").exists())
+            self.assertFalse((root / "uploads" / f"{old_document}_paper.pdf").exists())
+            self.assertFalse((root / "assets" / old_document).exists())
+            self.assertEqual(len(list(backups.glob(f"{self.job_id}-*.json"))), 1)
+            segments = job["segments"]
+            self.assertEqual([segment.translation for segment in segments], ["題名", "", "", "残る訳"])
+            self.assertEqual(segments[1].note, "check")
+            self.assertEqual(segments[1].translation_revisions[-1]["translation"], "壊れた訳")
+            self.assertTrue(segments[3].bookmarked)
+            self.assertEqual(job["paper_summary"], "Key point [[#2]] and ![[#4]].")
+            self.assertEqual(job["reading_index"], 3)
+            self.assertEqual(job["status"], "queued")
+            self.assertEqual(result["kept_translations"], 2)
+            self.assertEqual(result["needs_translation"], 2)
+            self.assertEqual(result["moved_notes"], 1)
+            self.assertTrue(result["translating"])
+            translate.assert_called_once_with(self.job_id, True)
+
+    def test_reextract_rejects_busy_jobs_and_missing_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._library_root(directory)
+            self._write_job(root, self.job_id, "d" * 32)
+            with self.assertRaisesRegex(ValueError, "元の論文ファイル"):
+                app._reextract_job(self.job_id)
+            app.jobs[self.job_id]["status"] = "running"
+            with self.assertRaisesRegex(ValueError, "翻訳中"):
+                app._reextract_job(self.job_id)
+            with self.assertRaises(LookupError):
+                app._reextract_job("c" * 32)
+        self.assertFalse(app.active_reextractions)
+
+    def test_translate_job_only_missing_keeps_existing_rows(self):
+        job = dict(self.payload)
+        job["segments"] = [Segment(0, 1, "Done.", "済み"), Segment(1, 1, "Pending.")]
+        app.jobs[self.job_id] = job
+        fake_translator = Mock()
+        fake_translator.health.return_value = True
+        fake_translator.translate.return_value = "新訳"
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(app, "JOB_DIR", Path(directory)),
+            patch.object(app, "translator", fake_translator),
+        ):
+            app._translate_job(self.job_id, only_missing=True)
+
+        self.assertEqual([segment.translation for segment in job["segments"]], ["済み", "新訳"])
+        fake_translator.translate.assert_called_once()
+        self.assertEqual(job["status"], "completed")
+
     def test_manual_translation_keeps_revision_history(self):
         job = dict(self.payload)
         job["updated_at"] = "2026-11-09T00:00:00+00:00"

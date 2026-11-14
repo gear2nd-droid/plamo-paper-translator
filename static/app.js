@@ -525,6 +525,7 @@ function renderLibraryItem(item) {
   const source = item.source_url ? `<a class="library-source" href="${escapeHtml(item.source_url)}" target="_blank" rel="noreferrer">原文を開く ↗</a>` : '';
   const busy = item.status === 'queued' || item.status === 'running';
   const deleteButton = `<button type="button" class="library-delete" data-library-delete="${escapeHtml(item.id)}" data-library-title="${escapeHtml(item.title || 'Untitled')}"${busy ? ' disabled title="翻訳中は削除できません"' : ''}>削除</button>`;
+  const reextractButton = `<button type="button" class="library-reextract" data-library-reextract="${escapeHtml(item.id)}" data-library-title="${escapeHtml(item.title || 'Untitled')}"${busy ? ' disabled title="翻訳中は再抽出できません"' : ' title="最新の抽出処理で読み直します。訳文・メモ・ブックマーク・まとめは引き継ぎます"'}>再抽出</button>`;
   return `<article class="library-card">
     <div class="library-card-main"><h3>${escapeHtml(item.title || 'Untitled')}</h3>
       <div class="library-card-meta"><span class="library-state">${escapeHtml(READING_STATUS_LABELS[item.reading_status] || item.reading_status)}</span><span>${Number(item.total) || 0}セグメント</span><span>更新 ${escapeHtml(formatLibraryDate(item.updated_at || item.created_at))}</span></div>
@@ -533,7 +534,7 @@ function renderLibraryItem(item) {
       ${item.match ? `<p class="library-match">${escapeHtml(item.match)}</p>` : ''}
       <div class="library-progress" title="読書位置 ${progress}%"><i style="width:${progress}%"></i></div>
     </div>
-    <div class="library-card-actions"><button type="button" class="library-open" data-library-job="${escapeHtml(item.id)}">続きから読む</button>${source}${deleteButton}</div>
+    <div class="library-card-actions"><button type="button" class="library-open" data-library-job="${escapeHtml(item.id)}">続きから読む</button>${source}${reextractButton}${deleteButton}</div>
   </article>`;
 }
 
@@ -591,6 +592,34 @@ function openLibraryJob(jobId) {
   if (!/^[a-f0-9]{32}$/.test(jobId || '')) return;
   localStorage.setItem(JOB_STORAGE_KEY, jobId);
   location.href = `/?job=${encodeURIComponent(jobId)}`;
+}
+
+async function reextractLibraryJob(jobId, title, button) {
+  if (!/^[a-f0-9]{32}$/.test(jobId || '')) return;
+  const question = `「${title || 'Untitled'}」を最新の抽出処理で読み直します。\n\n` +
+    '・本文が変わらない行の訳文、メモ、ブックマーク、クリップ、まとめはそのまま引き継ぎます。\n' +
+    '・新しい行や変わった行だけを翻訳し直します（手で直した訳文は履歴に残ります）。\n' +
+    '・実行前の状態は data/reextract-backups に保存します。\n\n再抽出しますか？';
+  if (!window.confirm(question)) return;
+  button.disabled = true;
+  button.textContent = '再抽出中…';
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/reextract`, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '再抽出できません');
+    const moved = data.moved_notes ? `、メモ${data.moved_notes}件を近い行へ移動` : '';
+    const pending = data.translating ? `。${data.needs_translation}行を翻訳しています` : '';
+    toast(`再抽出しました：${data.old_rows}→${data.new_rows}行、訳文${data.kept_translations}行を引き継ぎ${moved}${pending}`);
+    if (state.jobId === jobId) {
+      openLibraryJob(jobId);
+      return;
+    }
+    await loadLibrary();
+  } catch (error) {
+    toast(error.message || '再抽出できません');
+    button.disabled = false;
+    button.textContent = '再抽出';
+  }
 }
 
 function openDeleteDialog(jobId, title) {
@@ -1190,6 +1219,11 @@ $('libraryButton').addEventListener('click', openLibraryDialog);
 $('libraryClose').addEventListener('click', closeLibraryDialog);
 $('libraryDialog').addEventListener('click', (event) => { if (event.target === $('libraryDialog')) closeLibraryDialog(); });
 $('libraryItems').addEventListener('click', (event) => {
+  const reextractButton = event.target.closest('[data-library-reextract]');
+  if (reextractButton) {
+    reextractLibraryJob(reextractButton.dataset.libraryReextract, reextractButton.dataset.libraryTitle, reextractButton);
+    return;
+  }
   const deleteButton = event.target.closest('[data-library-delete]');
   if (deleteButton) {
     openDeleteDialog(deleteButton.dataset.libraryDelete, deleteButton.dataset.libraryTitle);
