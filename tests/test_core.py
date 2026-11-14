@@ -33,6 +33,9 @@ from paper_core import (
     _figure_text_orders,
     _footer_lines,
     _attach_cid_to_unicode,
+    _caption_identity,
+    _text_position,
+    EQUATION_MARKER,
     _body_font_size,
     _positioned_captions,
     _apply_script_markup,
@@ -323,6 +326,37 @@ class CoreTests(unittest.TestCase):
             split_document_units("近年，深層学習[LeCun 15]の成功により2015年から2023年までに3つの手法と4種類のデータが提案され，5件の報告がある．")[0][1],
             "sentence",
         )
+
+    def test_japanese_captions(self):
+        self.assertEqual(_block_kind("図 1: Few-shot メタ模倣学習の問題設定．"), "figure")
+        self.assertEqual(_block_kind("表 2 相関係数上位・下位の単語"), "table")
+        self.assertEqual(_block_kind("図 A.1 対角成分の分布"), "figure")
+        self.assertEqual(_block_kind("図 1 に示すように，提案手法は"), "sentence")
+        self.assertEqual(_block_kind("表 2 は結果をまとめたものである．"), "sentence")
+        self.assertEqual(_caption_identity("図 3: 全体図．"), ("figure", 3))
+        self.assertEqual(_caption_identity("表 1 結果"), ("table", 1))
+        self.assertNotEqual(_caption_identity("図 A.1 分布"), ("figure", 1))
+        self.assertEqual(_sentence_parts("図 1．問題設定．本文が続く．"), ["図 1．問題設定．", "本文が続く．"])
+        # Body text that starts a line with "図 3:" is set in the body size;
+        # only the smaller caption counts.
+        fragments = [
+            (60.0, 600.0, "図 2: 提案手法の全体図．"),
+            (60.0, 500.0, "図 3: と同じ構成を本文で説明する。"),
+            (60.0, 480.0, "本文はこの大きさで組まれている長い段落の続きです。"),
+        ]
+        captions = _positioned_captions(fragments, 297, [8.5, 9.2, 9.2], 9.2)
+        self.assertEqual([caption.text for caption in captions], ["図 2: 提案手法の全体図．"])
+
+    def test_text_position_applies_the_current_transform(self):
+        # pLaTeX/dvipdfmx moves the origin with cm: tm alone says y = -186.
+        self.assertEqual(_text_position([1, 0, 0, 1, -11.1, -186.7], [1, 0, 0, 1, 72, 770]), (60.9, 583.3, 0.0, 1.0))
+        self.assertEqual(_text_position([9, 0, 0, 9, 100, 200], None), (100.0, 200.0, 0.0, 9.0))
+
+    def test_equation_match_never_swallows_japanese_prose(self):
+        equation = PositionedEquation(1, "L = a + b (1)", 300, 600, 500, 610)
+        text = "L =\nは，新たなタスクに関するデモンストレーションが与えられた時に推論を行う手法である．a + b (1)"
+        self.assertNotIn(EQUATION_MARKER, _mark_equation_boundaries(text, [equation]))
+        self.assertIn(EQUATION_MARKER, _mark_equation_boundaries("前文．\nL = a + b (1)\n後文．", [equation]))
 
     def test_caption_written_word_by_word_is_found(self):
         fragments = [
