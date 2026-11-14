@@ -32,6 +32,9 @@ from paper_core import (
     _drawn_figure_box,
     _figure_text_orders,
     _footer_lines,
+    _margin_key,
+    _margin_line_key,
+    _layout_line_is_prose,
     _attach_cid_to_unicode,
     _caption_identity,
     _text_position,
@@ -347,6 +350,34 @@ class CoreTests(unittest.TestCase):
         captions = _positioned_captions(fragments, 297, [8.5, 9.2, 9.2], 9.2)
         self.assertEqual([caption.text for caption in captions], ["図 2: 提案手法の全体図．"])
 
+    def test_running_heads_are_removed_as_whole_lines(self):
+        head = "2 人工知能学会論文誌 38 巻 2 号 A（2023 年）"
+        self.assertEqual(_footer_lines([(788.0, "2"), (788.0, " 人工知能学会論文誌"), (788.0, " 38"), (788.0, " 巻 2 号 A（2023 年）")]), [head])
+        self.assertEqual(_margin_line_key(head, "top-line"), _margin_line_key("6 人工知能学会論文誌 38 巻 2 号 A（2023 年）", "top-line"))
+        # Single fragments keep their digits: "18-layer" is not "34-layer".
+        self.assertNotEqual(_margin_line_key("18-layer", "top"), _margin_line_key("34-layer", "top"))
+        text = "Neural Slicer • 85:5\nBody • item one.\n"
+        candidates = [("Neural Slicer • 85:5", "top-line"), (" •", "top")]
+        keys = {_margin_line_key(value, zone) for value, zone in candidates}
+        self.assertEqual(_strip_repeated_margin_fragments(text, candidates, keys).strip(), "Body • item one.")
+
+    def test_japanese_lines_are_prose_in_layout(self):
+        self.assertTrue(_layout_line_is_prose([LayoutFragment(0, 50, 700, "うに定義する．", 9.2)]))
+        self.assertTrue(_layout_line_is_prose([LayoutFragment(0, 50, 700, "ただし，", 9.2), LayoutFragment(1, 80, 700, "z ∼ f(c)", 9.2)]))
+        self.assertFalse(_layout_line_is_prose([LayoutFragment(0, 50, 700, "L = 1/T ∑ ∥f(o, z) − a∥ (3)", 9.2)]))
+
+    def test_japanese_caption_does_not_take_the_next_page(self):
+        segments = [
+            Segment(0, 1, "図 1: 問題設定．また本稿で扱うタスクの違いは対象物体の違いである．", kind="figure", paragraph=1, sentence=1),
+            Segment(1, 2, "練とテストをそれぞれメタ訓練と呼ぶ．", paragraph=2, sentence=1),
+        ]
+        self.assertEqual(len(_merge_page_continuations(segments)), 2)
+
+    def test_japanese_equation_text_is_trimmed_to_the_display(self):
+        equation = PositionedEquation(3, "うに定義する．L = a + b (3)ただし，z は潜在変数でありここで説明を続ける", 300, 600, 500, 610)
+        marked = _mark_equation_boundaries("損失を次のように定義する．\nL = a + b (3)\nただし，z は潜在変数．", [equation])
+        self.assertIn(f"{EQUATION_MARKER}3:L = a + b (3)", marked)
+
     def test_text_position_applies_the_current_transform(self):
         # pLaTeX/dvipdfmx moves the origin with cm: tm alone says y = -186.
         self.assertEqual(_text_position([1, 0, 0, 1, -11.1, -186.7], [1, 0, 0, 1, 72, 770]), (60.9, 583.3, 0.0, 1.0))
@@ -442,7 +473,7 @@ class CoreTests(unittest.TestCase):
     def test_repeated_footer_fragment_is_removed_from_end(self):
         footer = "ACM Trans. Graph., Vol. 43, No. 4, Article 85. Publication date: July 2024."
         text = "Body text mentions ACM publications.\n" + footer
-        cleaned = _strip_repeated_margin_fragments(text, [(footer, "bottom")], {footer})
+        cleaned = _strip_repeated_margin_fragments(text, [(footer, "bottom")], {_margin_key(footer)})
         self.assertEqual(cleaned.strip(), "Body text mentions ACM publications.")
 
     def test_academic_abbreviations_do_not_split_citation(self):
