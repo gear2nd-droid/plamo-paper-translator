@@ -147,6 +147,9 @@
 .dialog-field input:focus,.dialog-field textarea:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(28,80,147,.08)}
 .paper-tag-preview{display:flex;flex-wrap:wrap;gap:6px;min-height:1px;margin-top:-10px}
 .paper-tag-preview span{padding:4px 8px;border:1px solid #c4cbd5;border-radius:99px;background:#edf0f4;color:#2770cf;font-size:9px}
+.library-reextract{appearance:none;padding:7px 8px;border:1px solid var(--line);background:#fff;color:#2c5c97;font:600 9px inherit;cursor:pointer}
+.library-reextract:hover:not(:disabled){border-color:#2c5c97;background:#eef3fa}
+.library-reextract:disabled{opacity:.4;cursor:not-allowed}
 .library-delete{appearance:none;padding:7px 8px;border:1px solid var(--line);background:#fff;color:#a04435;font:600 9px inherit;cursor:pointer}
 .library-delete:hover:not(:disabled){border-color:#a04435;background:#fbefec}
 .library-delete:disabled{opacity:.4;cursor:not-allowed}

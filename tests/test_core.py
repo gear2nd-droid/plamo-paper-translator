@@ -43,7 +43,9 @@ from paper_core import (
     extract_document,
     heading_level,
     neighboring_context,
+    merge_reextracted_segments,
     parse_glossary,
+    remap_summary_row_references,
     segments_for_mode,
     split_document_units,
     split_text,
@@ -69,6 +71,38 @@ class FakeResponse:
 
 
 class CoreTests(unittest.TestCase):
+    def test_reextract_merge_moves_notes_of_removed_rows_and_equations(self):
+        old = [
+            Segment(0, 1, "Intro text.", "導入"),
+            Segment(1, 1, "(a) (b)", "(a) (b)", note="figure labels", bookmarked=True, clips=["note"]),
+            Segment(2, 1, "x = y", "x = y", note="eq"),
+            Segment(3, 1, "E_{algo} is low.", "E_{algo} は低い。"),
+        ]
+        new = [
+            Segment(0, 1, "Intro text."),
+            Segment(1, 1, "x = y (1)", kind="equation", assets=["/api/assets/n/eq.png"]),
+            Segment(2, 1, "E_{algo}  is low."),
+        ]
+
+        merged, index_map, counts = merge_reextracted_segments(old, new)
+
+        # Rows that changed are matched within the changed stretch, so the
+        # removed figure labels land on the row now at their place.
+        self.assertEqual(index_map, {0: 0, 1: 1, 2: 1, 3: 2})
+        self.assertEqual(merged[0].note, "")
+        self.assertEqual(merged[1].note, "figure labels\n\neq")
+        self.assertTrue(merged[1].bookmarked)
+        self.assertEqual(merged[1].clips, ["note"])
+        self.assertEqual(merged[1].translation, "x = y (1)")
+        self.assertEqual(merged[2].translation, "E_{algo} は低い。")
+        self.assertEqual([segment.index for segment in merged], [0, 1, 2])
+        self.assertEqual(counts["needs_translation"], 0)
+        self.assertEqual(counts["moved_notes"], 2)
+        self.assertEqual(
+            remap_summary_row_references("See [[#2]], ![[# 4 ]] and [[#99]].", index_map),
+            "See [[#2]], ![[# 3 ]] and [[#99]].",
+        )
+
     def test_split_text_respects_limit(self):
         text = "Sentence one. " * 300
         chunks = split_text(text, max_chars=180)
