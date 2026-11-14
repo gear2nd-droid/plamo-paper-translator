@@ -470,7 +470,13 @@ def _layout_line_is_prose(fragments: list[LayoutFragment]) -> bool:
         for fragment in fragments
     )
     prose_lead_in = len(words) >= 2 and bool(re.search(r"(?:\b(?:as|and|by)|:)\s*$", value, re.I))
-    return has_long_prose_fragment or prose_lead_in or (len(words) >= 5 and math_symbols < 2)
+    # Japanese prose has no words to count; a run of kana and kanji is prose.
+    # "うに定義する．" ends the sentence before a display; "ただし，z ∼ f(c)"
+    # starts the one after it, like "where".
+    japanese_prose = (len(re.findall(r"[぀-ヿ㐀-鿿]", value)) >= 4 and math_symbols < 3) or bool(
+        re.match(r"(?:ただし|ここで|なお|ここに|すなわち|但し)", value)
+    )
+    return has_long_prose_fragment or prose_lead_in or japanese_prose or (len(words) >= 5 and math_symbols < 2)
 
 
 def _equation_number_of(text: str) -> int | None:
@@ -711,7 +717,15 @@ def _mark_equation_boundaries(text: str, equations: list[PositionedEquation]) ->
     # A fuzzy match never runs across a paragraph break or into a caption.
     within = rf"(?!\n\s*\n|{CAPTION_MARKER}|(?:Fig(?:ure)?\.?|Table)\s*\d+\s*[.:])"
     for equation in equations:
-        compact_equation = re.sub(r"\s+", "", equation.text)
+        equation_text = equation.text
+        if len(re.findall(rf"[{CJK_CHARACTER}]", equation_text)) > 12:
+            # The layout lines can carry the end of the sentence before the
+            # equation and the start of the next ("うに定義する．L = ... (3)ただし，").
+            # Keep what lies between the last full stop and the number.
+            core = re.search(rf"(?:^|[．。])([^．。]*?\(\s*{equation.number}\s*\))", equation_text)
+            if core:
+                equation_text = core.group(1)
+        compact_equation = re.sub(r"\s+", "", equation_text)
         if not compact_equation:
             continue
         patterns = [gap.join(re.escape(character) for character in compact_equation) + r"\}?"]
@@ -735,7 +749,7 @@ def _mark_equation_boundaries(text: str, equations: list[PositionedEquation]) ->
                         rf"{gap.join(re.escape(character) for character in compact_equation[skip:skip + anchor_size])}"
                         rf"(?:{within}[\s\S]){{0,{span}}}?\(\s*{equation.number}\s*\)"
                     )
-        own_cjk = len(re.findall(rf"[{CJK_CHARACTER}]", equation.text))
+        own_cjk = len(re.findall(rf"[{CJK_CHARACTER}]", equation_text))
         if own_cjk > 12:
             continue  # Japanese prose taken for a display equation
         for pattern in patterns:
@@ -987,7 +1001,10 @@ def _block_kind(text: str) -> str:
         return "table"
     math_symbols = len(re.findall(r"[=∑∫√±≤≥≈≠∞∂∇α-ωΑ-Ω^_{}|]", compact))
     letters = len(re.findall(r"[A-Za-z\u3040-\u30ff\u3400-\u9fff]", compact))
-    if math_symbols >= 2 and (letters < 30 or math_symbols / max(len(compact), 1) > 0.08):
+    cjk = len(re.findall(r"[぀-ヿ㐀-鿿]", compact))
+    if cjk >= 6 and math_symbols / max(len(compact), 1) < 0.2:
+        pass  # Japanese prose with inline math (ψ は予測行動 a_{0:T} と...)
+    elif math_symbols >= 2 and (letters < 30 or math_symbols / max(len(compact), 1) > 0.08):
         return "equation"
     if re.match(r"^\[\d{1,4}\]\s", compact) or re.search(r"\.\s+\[\d{1,4}\]\s+[A-Z]", compact):
         # A numbered reference entry is prose even when it is full of years,
@@ -1724,6 +1741,14 @@ def _margin_key(value: str) -> str:
     return compact
 
 
+def _margin_line_key(value: str, zone: str) -> str:
+    """A whole header/footer line repeats with its page number changed
+    ("2 人工知能学会論文誌 38 巻", "1:4 • Dai, C. et al"); single fragments
+    must match exactly, or "18-layer" would match "34-layer"."""
+    key = _margin_key(value)
+    return re.sub(r"\d+", "#", key) if zone.endswith("-line") else key
+
+
 def _remove_fragment_once(text: str, value: str, *, from_end: bool) -> str:
     tokens = value.split()
     if not tokens:
@@ -1898,7 +1923,8 @@ def _footer_lines(parts: list[tuple[float, str]]) -> list[str]:
     result: list[str] = []
     for _y, values in lines:
         text = re.sub(r"\s+", " ", "".join(values)).strip()
-        if len(text) >= 12 and len(re.findall(r"[A-Za-z]{2,}", text)) >= 2:
+        words = len(re.findall(r"[A-Za-z]{2,}", text)) + len(re.findall(rf"[{CJK_CHARACTER}]", text)) // 2
+        if len(text) >= 12 and words >= 2:
             result.append(text)
     return result
 
@@ -1908,9 +1934,21 @@ def _strip_repeated_margin_fragments(
     candidates: list[tuple[str, str]],
     repeated_keys: set[str],
 ) -> str:
+    """Remove repeated header/footer text; zones "top-line"/"bottom-line" are whole lines.
+
+    A whole line goes first. Its single fragments are then already gone, so
+    they are skipped: removing " •" again would delete a bullet in the body.
+    """
+    removed_lines: list[str] = []
     for value, zone in candidates:
-        if _margin_key(value) in repeated_keys:
-            text = _remove_fragment_once(text, value, from_end=zone == "bottom")
+        if _margin_line_key(value, zone) not in repeated_keys:
+            continue
+        if not zone.endswith("-line") and any(value.strip() and value.strip() in line for line in removed_lines):
+            continue
+        updated = _remove_fragment_once(text, value, from_end=zone.startswith("bottom"))
+        if updated != text and zone.endswith("-line"):
+            removed_lines.append(value)
+        text = updated
     return text
 
 
@@ -1927,7 +1965,7 @@ def _merge_page_continuations(segments: list[Segment]) -> list[Segment]:
             and following.kind in {"sentence", "list_item"}
             and current.label != "asset"
             and following.label != "asset"
-            and not re.search(r"[.!?。！？;；:]\s*[\"'”’\)\]]*$", current.source)
+            and not re.search(r"[.!?。！？．;；:]\s*[\"'”’\)\]]*$", current.source)
         )
         if not can_join:
             index += 1
@@ -1947,7 +1985,7 @@ def _merge_interrupted_sentences(segments: list[Segment]) -> list[Segment]:
     while index < len(result):
         current = result[index]
         if current.kind not in {"sentence", "list_item"} or re.search(
-            r"[.!?。！？;；:]\s*[\"'”’\)\]]*$", current.source
+            r"[.!?。！？．;；:]\s*[\"'”’\)\]]*$", current.source
         ):
             index += 1
             continue
@@ -2193,13 +2231,16 @@ def extract_document(
             tuple[Any, str, list[tuple[float, float, str]], list[LayoutFragment], list[tuple[str, str]]]
         ] = []
         margin_counts: Counter[str] = Counter()
-        page_margin_parts: list[tuple[list[tuple[str, str, float]], list[tuple[float, str, float]]]] = []
+        page_margin_parts: list[
+            tuple[list[tuple[str, str, float]], list[tuple[float, str, float]], list[tuple[float, str]]]
+        ] = []
         for page in reader.pages:
             _attach_cid_to_unicode(page)
             fragments: list[tuple[float, float, str]] = []
             layout_fragments: list[LayoutFragment] = []
             margin_parts: list[tuple[str, str, float]] = []
             footer_parts: list[tuple[float, str, float]] = []
+            header_parts: list[tuple[float, str]] = []
             page_height = float(page.mediabox.height)
             page_width = float(page.mediabox.width)
             try:
@@ -2268,6 +2309,8 @@ def extract_document(
                         footer_parts.append((y, value, size))
                     elif size <= 8.5 and page_height - 65 < y <= page_height:
                         margin_parts.append((value, "top", size))
+                    if page_height - 65 < y <= page_height:
+                        header_parts.append((y, value))
                 # Layout analysis keeps the plain fragment text; the body text
                 # and caption fragments carry E_{algo} / b^{⋆} markup. Text
                 # drawn inside figures is left out of the body text.
@@ -2288,9 +2331,10 @@ def extract_document(
                 layout_fragments = []
                 margin_parts = []
                 footer_parts = []
+                header_parts = []
                 raw = (page.extract_text() or "").replace("\xa0", " ")
             page_records.append((page, raw, fragments, layout_fragments, []))
-            page_margin_parts.append((margin_parts, footer_parts))
+            page_margin_parts.append((margin_parts, footer_parts, header_parts))
 
         letters = sum(len(re.findall(r"[^\W\d_]", record[1])) for record in page_records)
         if page_records and letters < 150 * len(page_records):
@@ -2310,16 +2354,21 @@ def extract_document(
         # A page of small references can outweigh the body, so the larger of
         # the page's and the document's common size counts as body text.
         document_body_size = _body_font_size([fragment for record in page_records for fragment in record[3]])
-        for position, (margin_parts, footer_parts) in enumerate(page_margin_parts):
+        for position, (margin_parts, footer_parts, header_parts) in enumerate(page_margin_parts):
             page, raw, fragments, layout_fragments, _ = page_records[position]
             body_size = max(document_body_size, _body_font_size(layout_fragments))
-            margin_candidates = [(value, zone) for value, zone, size in margin_parts if size < body_size - 0.3]
-            margin_candidates = _page_number_candidates_at_edges(margin_candidates, layout_fragments)
+            # A running head ("2 人工知能学会論文誌 38 巻 2 号 A（2023 年）") can be
+            # set in the body size. Whole lines at the top edge that repeat on
+            # other pages (page numbers aside) are removed before fragments.
+            margin_candidates = [(line, "top-line") for line in _footer_lines(header_parts)]
+            margin_candidates += _page_number_candidates_at_edges(
+                [(value, zone) for value, zone, size in margin_parts if size < body_size - 0.3], layout_fragments
+            )
             margin_candidates.extend(
-                (line, "bottom")
+                (line, "bottom-line")
                 for line in _footer_lines([(y, value) for y, value, size in footer_parts if size < body_size - 0.3])
             )
-            margin_counts.update({_margin_key(value) for value, _zone in margin_candidates if value.strip()})
+            margin_counts.update({_margin_line_key(value, zone) for value, zone in margin_candidates if value.strip()})
             page_records[position] = (page, raw, fragments, layout_fragments, margin_candidates)
 
         repeated_margin_keys = {key for key, count in margin_counts.items() if count >= 2}
