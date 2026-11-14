@@ -30,6 +30,8 @@ from paper_core import (
     _positioned_letter_headings,
     _is_single_column_page,
     _drawn_figure_box,
+    _figure_text_orders,
+    _footer_lines,
     _apply_script_markup,
     _block_kind,
     _mark_equation_boundaries,
@@ -242,6 +244,85 @@ class CoreTests(unittest.TestCase):
         grouped = _merge_reference_entries(segments)
         self.assertEqual([segment.kind for segment in grouped], ["heading", "citation", "citation"])
         self.assertIn("First title.", grouped[1].source)
+
+    def test_alpha_labelled_references_are_split_at_each_label(self):
+        segments = [
+            Segment(0, 11, "References", kind="heading", paragraph=1, sentence=1),
+            Segment(1, 11, "[AAD98] ALEXANDER P., ALLEN S.: Part orientation.", paragraph=2, sentence=1),
+            Segment(2, 11, "Computer-Aided Design 30, 5 (1998), 343–356. 3", paragraph=3, sentence=1),
+            Segment(3, 11, "2 [APH^{∗}03] AGRAWALA M., PHAN D.: Designing effective step-by-step", paragraph=4, sentence=1),
+            Segment(4, 12, "instructions. ACM TOG 22 (2003). 10, 11 [Att15] ATTENE M.: Shapes in a box.", paragraph=5, sentence=1),
+        ]
+        grouped = _merge_reference_entries(segments)
+        self.assertEqual([segment.kind for segment in grouped], ["heading", "citation", "citation", "citation"])
+        self.assertEqual(
+            grouped[1].source,
+            "[AAD98] ALEXANDER P., ALLEN S.: Part orientation. Computer-Aided Design 30, 5 (1998), 343–356. 3 2",
+        )
+        self.assertTrue(grouped[2].source.startswith("[APH^{∗}03] AGRAWALA"))
+        self.assertTrue(grouped[2].source.endswith("(2003). 10, 11"))
+        self.assertEqual((grouped[3].source, grouped[3].page), ("[Att15] ATTENE M.: Shapes in a box.", 12))
+
+    def test_footer_is_judged_as_a_whole_line(self):
+        parts = [
+            (92.4, "Computer Graphics Forum c"),
+            (100.3, "©"),
+            (92.4, "©"),
+            (100.3, " 2016 The Author(s)\n"),
+            (92.4, " 2016 The Eurographics Association and John Wiley & Sons Ltd."),
+            (95.0, "min"),
+        ]
+        self.assertEqual(
+            _footer_lines(parts),
+            [
+                "Computer Graphics Forum c© 2016 The Eurographics Association and John Wiley & Sons Ltd.",
+                "© 2016 The Author(s)",
+            ],
+        )
+
+    def test_axis_ticks_are_not_numbered_headings(self):
+        self.assertEqual(heading_level("0 4 8 12 16 20"), 0)
+        self.assertEqual(heading_level("20 40 60 80 100 1200"), 0)
+        self.assertEqual(heading_level("3 Method"), 1)
+        self.assertEqual(heading_level("4.2 Results"), 2)
+
+    def test_figure_text_is_found_inside_figures_but_not_in_body_text(self):
+        body = "the body text of this paragraph runs across the whole column width here"
+        fragments = [
+            LayoutFragment(0, 54, 700, body, 9),
+            LayoutFragment(1, 54, 689, "and ends here.", 9),
+            LayoutFragment(2, 100, 640, "Model contour", 7),
+            LayoutFragment(3, 160, 600, "(a) (b)", 7),
+            LayoutFragment(4, 54, 560, "Fig. 1. A drawing of the bead shapes.", 8),
+            LayoutFragment(5, 330, 700, body, 9),
+            LayoutFragment(6, 330, 600, body, 9),
+        ]
+        captions = [PositionedCaption("Fig. 1. A drawing of the bead shapes.", 54, 560)]
+        orders = _figure_text_orders(fragments, captions, [], 612, 792)
+        self.assertEqual(orders, {2, 3})
+
+        # With an embedded image, only text on it and panel labels just
+        # below it are figure text; a table under the image stays.
+        fragments = [
+            LayoutFragment(0, 54, 720, body, 9),
+            LayoutFragment(1, 120, 680, "G(x)", 8),
+            LayoutFragment(2, 70, 632, "(a) (b) (c)", 8),
+            LayoutFragment(3, 60, 600, "Support Volume (%)", 8),
+            LayoutFragment(4, 54, 560, "Fig. 2. Results.", 8),
+            LayoutFragment(5, 330, 720, body, 9),
+            LayoutFragment(6, 330, 600, body, 9),
+        ]
+        captions = [PositionedCaption("Fig. 2. Results.", 54, 560)]
+        orders = _figure_text_orders(fragments, captions, [(56, 640, 300, 712), (900, 600, 1100, 700)], 612, 792)
+        self.assertEqual(orders, {1, 2})
+
+    def test_figure_text_is_left_out_of_the_extracted_text(self):
+        parts = ["Body sentence.", "\n", "(a) (b)", "\n", "More body."]
+        raw = "".join(parts)
+        self.assertEqual(
+            _apply_script_markup(raw, parts, [0, 2, 4], {}, {1}),
+            "Body sentence.\n \nMore body.",
+        )
 
     def test_repeated_footer_fragment_is_removed_from_end(self):
         footer = "ACM Trans. Graph., Vol. 43, No. 4, Article 85. Publication date: July 2024."

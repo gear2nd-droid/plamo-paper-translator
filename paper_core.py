@@ -7,7 +7,7 @@ import re
 import urllib.error
 import urllib.request
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -59,6 +59,9 @@ HEADING_MATH_PATTERN =re.compile(r"[=<>≤≥≈≠∑∫√±×·∈∀∪∩�
 def _numbered_title_is_heading(number: str, raw_number: str, title: str) -> bool:
     """Reject numbered list items and display equations that look like headings."""
     if not title or re.search(r"[.!?。！？]", title):
+        return False
+    if re.fullmatch(r"[\d\s.]+", title):
+        # "0 4 8 12 16 20": axis ticks or a row of numbers, not a title.
         return False
     if HEADING_MATH_PATTERN.search(title) or re.search(r"\(\d{1,3}\)$", title):
         # "72 pt/in = 3 (4)": the denominator line of a numbered equation.
@@ -1156,13 +1159,13 @@ def merge_reextracted_segments(
 def remap_summary_row_references(summary: str, index_map: dict[int, int]) -> str:
     """Point ``[[#n]]`` row references at the same text after re-extraction."""
 
-    def replace(match: re.Match[str]) -> str:
+    def renumber(match: re.Match[str]) -> str:
         old_index = int(match.group(2)) - 1
         if old_index not in index_map:
             return match.group(0)
         return f"{match.group(1)}{index_map[old_index] + 1}{match.group(3)}"
 
-    return SUMMARY_ROW_REFERENCE_PATTERN.sub(replace, summary)
+    return SUMMARY_ROW_REFERENCE_PATTERN.sub(renumber, summary)
 
 
 def _image_display_boxes(page: Any) -> dict[str, list[tuple[float, float, float, float]]]:
@@ -1326,9 +1329,21 @@ def _drawn_figure_box(
     # Small text in the top margin is the running header, never the figure.
     header = [item.y for item in fragments if item.y >= page_height - 60 and item.size <= 8.5]
     top = min([page_height - 30] + [y - 3 for y in header])
-    for line in lines_in(*column, caption_top):
+    column_lines = lines_in(*column, caption_top)
+    for position, line in enumerate(column_lines):
         if body_line(line, width) or any(_equation_number_of(item.text) is not None for item in line):
             top = min(item.y for item in line) - 3
+            # The short last line of that paragraph (or caption) follows at
+            # the normal line pitch and starts at the same left edge.
+            previous_y = min(item.y for item in line)
+            left = min(item.x for item in line)
+            pitch = 1.6 * max(item.size for item in line)
+            for tail in reversed(column_lines[:position]):
+                tail_y = max(item.y for item in tail)
+                if previous_y - tail_y > pitch or abs(min(item.x for item in tail) - left) > 12:
+                    break
+                previous_y = min(item.y for item in tail)
+                top = previous_y - 3
             break
     if top - caption_top < 30:
         return None
@@ -1344,6 +1359,119 @@ def _drawn_figure_box(
     if caption_left:
         x1 = min(column[1], max((end_of(item) for item in fragments if column[0] <= item.x < column[1] and len(item.text.split()) >= 3), default=column[1]) + 4)
     return (max(column[0] - 4, x0), caption_top, x1, top)
+
+
+def _image_xobject_names(page: Any) -> set[str]:
+    """Names of the image XObjects a page can draw, including those in forms."""
+    names: set[str] = set()
+    seen: set[int] = set()
+
+    def walk(resources: Any, depth: int) -> None:
+        if depth > 6 or resources is None:
+            return
+        try:
+            xobjects = resources.get_object().get("/XObject")
+            items = xobjects.get_object().items() if xobjects is not None else []
+            for name, reference in items:
+                target = reference.get_object()
+                if id(target) in seen:
+                    continue
+                seen.add(id(target))
+                subtype = target.get("/Subtype")
+                if subtype == "/Image":
+                    names.add(str(name).lstrip("/"))
+                elif subtype == "/Form":
+                    walk(target.get("/Resources"), depth + 1)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return
+
+    try:
+        walk(page.get("/Resources"), 0)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass
+    return names
+
+
+def _figure_text_orders(
+    fragments: list[LayoutFragment],
+    captions: list[PositionedCaption],
+    image_boxes: list[tuple[float, float, float, float]],
+    page_width: float,
+    page_height: float,
+) -> set[int]:
+    """Text drawn inside figures: panel labels, legends, axis ticks.
+
+    It belongs to the figure image, so it is left out of the body text.
+    The figure area is the one above each figure caption; when embedded
+    images sit there, the area is narrowed to them (and the labels between
+    them and the caption), so nearby text such as an algorithm is kept.
+    Lines that read as body text are never removed.
+    """
+    page_area = page_width * page_height
+    images = [
+        box
+        for box in image_boxes
+        if box[2] - box[0] > 20
+        and box[3] - box[1] > 20
+        and (box[2] - box[0]) * (box[3] - box[1]) < 0.6 * page_area
+        # An image drawn inside a form can be reported in the form's own
+        # coordinates; one that leaves the page is not where it is drawn.
+        and box[0] >= -5
+        and box[1] >= -5
+        and box[2] <= page_width + 5
+        and box[3] <= page_height + 5
+    ]
+    # (region, labels_only): text over an embedded image is part of it; just
+    # below it only panel labels are, since a table there is real text.
+    regions: list[tuple[tuple[float, float, float, float], bool]] = []
+    for caption in captions:
+        identity = _caption_identity(caption.text)
+        if not identity or identity[0] != "figure":
+            continue
+        box = _drawn_figure_box(caption, fragments, page_width, page_height)
+        if box is None:
+            continue
+        x0, y0, x1, y1 = box
+
+        def overlap(image: tuple[float, float, float, float]) -> float:
+            width = min(x1, image[2]) - max(x0, image[0])
+            height = min(y1, image[3]) - max(y0, image[1])
+            return max(0.0, width) * max(0.0, height)
+
+        inside = [image for image in images if overlap(image) >= 0.5 * (image[2] - image[0]) * (image[3] - image[1])]
+        if not inside:
+            regions.append(((x0, y0, x1, y1), False))
+            continue
+        for image in inside:
+            # Never past the figure area: the other column stays untouched.
+            left, right = max(x0, image[0] - 3), min(x1, image[2] + 3)
+            regions.append(((left, max(y0, image[1] - 1), right, min(y1, image[3] + 3)), False))
+            regions.append(((left, max(y0, image[1] - 16), right, image[1] - 1), True))
+    if not regions:
+        return set()
+    orders: set[int] = set()
+    for (x0, y0, x1, y1), labels_only in regions:
+        lines: list[list[LayoutFragment]] = []
+        for fragment in sorted(
+            (item for item in fragments if x0 <= item.x < x1 and y0 < item.y < y1), key=lambda item: (-item.y, item.x)
+        ):
+            if lines and abs(lines[-1][0].y - fragment.y) <= 3.2:
+                lines[-1].append(fragment)
+            else:
+                lines.append([fragment])
+        for line in lines:
+            if labels_only:
+                value = " ".join(item.text.strip() for item in sorted(line, key=lambda item: item.x))
+                if re.fullmatch(r"(?:\(\s*[a-z]\d?\s*\)\s*)+", value):
+                    orders.update(item.order for item in line)
+                continue
+            extent = max(item.x + 0.5 * item.size * len(item.text.strip()) for item in line) - min(item.x for item in line)
+            if _layout_line_is_prose(line) and extent >= 0.5 * (x1 - x0):
+                continue
+            if any(_equation_number_of(item.text) is not None for item in line):
+                continue
+            orders.update(item.order for item in line)
+    return orders
 
 
 def _render_drawn_figures(
@@ -1574,25 +1702,36 @@ def _wrap_script(value: str, role: str) -> str:
     return f"{value[:start]}{'_' if role == 'sub' else '^'}{{{value[start:end]}}}{value[end:]}"
 
 
-def _apply_script_markup(raw: str, parts: list[str], fragment_parts: list[int], roles: dict[int, str]) -> str:
-    """Insert script markup into the extracted text.
+def _apply_script_markup(
+    raw: str,
+    parts: list[str],
+    fragment_parts: list[int],
+    roles: dict[int, str],
+    dropped: set[int] | None = None,
+) -> str:
+    """Insert script markup into the extracted text, and leave out ``dropped`` fragments.
 
     The extracted text is the visitor fragments in order, except that some
     fragments (text inside form XObjects such as figure labels) are not in
     it. Fragments are matched at the cursor; a fragment that does not match
-    is skipped. Markup is only ever inserted, so removing it gives back the
-    original text.
+    is skipped. Apart from dropped fragments, markup is only ever inserted,
+    so removing it gives back the original text.
     """
-    if not roles:
+    if not roles and not dropped:
         return raw
     role_by_part = {fragment_parts[order]: role for order, role in roles.items() if order < len(fragment_parts)}
+    dropped_parts = {fragment_parts[order] for order in dropped or () if order < len(fragment_parts)}
     output: list[str] = []
     cursor = 0
     for number, part in enumerate(parts):
         if not part or not raw.startswith(part, cursor):
             continue
         role = role_by_part.get(number)
-        output.append(_wrap_script(part, role) if role else part)
+        if number in dropped_parts:
+            # Keep a line break so the text on either side stays apart.
+            output.append("\n" if "\n" in part else " ")
+        else:
+            output.append(_wrap_script(part, role) if role else part)
         cursor += len(part)
     output.append(raw[cursor:])
     return _merge_adjacent_scripts("".join(output))
@@ -1651,6 +1790,29 @@ def _page_number_candidates_at_edges(
         for value, zone in candidates
         if _margin_key(value) != "__page_number__" or value in edge_values
     ]
+
+
+def _footer_lines(parts: list[tuple[float, str]]) -> list[str]:
+    """Whole lines of small text just above the bottom margin.
+
+    A footer repeated on every page ("© 2016 The Author(s) Computer Graphics
+    Forum") can sit higher than a page number. It is judged as a whole line,
+    never as single fragments, so a subscript such as the "min" of v_min
+    near the bottom of a page is never mistaken for a footer.
+    """
+    lines: list[tuple[float, list[str]]] = []
+    for y, value in parts:
+        line = next((line for line in lines if abs(line[0] - y) <= 1.5), None)
+        if line is None:
+            lines.append((y, [value]))
+        else:
+            line[1].append(value)
+    result: list[str] = []
+    for _y, values in lines:
+        text = re.sub(r"\s+", " ", "".join(values)).strip()
+        if len(text) >= 12 and len(re.findall(r"[A-Za-z]{2,}", text)) >= 2:
+            result.append(text)
+    return result
 
 
 def _strip_repeated_margin_fragments(
@@ -1741,7 +1903,11 @@ def _merge_reference_entries(segments: list[Segment]) -> list[Segment]:
     numbered_pattern = re.compile(r"^(?:\[\d+\]|\d+[.)])\s+")
     year_count = sum(bool(year_pattern.fullmatch(segment.source.strip())) for segment in tail)
     numbered_count = sum(bool(numbered_pattern.match(segment.source.strip())) for segment in tail)
-    if year_count < 2 and numbered_count < 2:
+    # "[CCA^{∗}12] CALÌ J., ...": alpha labels. The page numbers of the
+    # back references ("... 2012. 10, 11") end the previous entry.
+    alpha_label = re.compile(r"(?<!\S)\[[A-Z][A-Za-z]{0,7}(?:\^\{[^{}]*\}|[+∗*])?\d{2}[a-z]?\](?=\s)")
+    alpha_count = sum(len(alpha_label.findall(segment.source)) for segment in tail if segment.label != "asset")
+    if year_count < 2 and numbered_count < 2 and alpha_count < 3:
         return segments
 
     def flush() -> None:
@@ -1771,6 +1937,15 @@ def _merge_reference_entries(segments: list[Segment]) -> list[Segment]:
         if segment.label == "asset":
             flush()
             result.append(segment)
+        elif alpha_count >= 3:
+            starts = [match.start() for match in alpha_label.finditer(segment.source)]
+            bounds = [0, *starts, len(segment.source)]
+            for number, (start, end) in enumerate(zip(bounds, bounds[1:])):
+                piece = segment.source[start:end].strip()
+                if number > 0:
+                    flush()
+                if piece:
+                    current.append(replace(segment, source=piece))
         elif (year_count >= 2 and next_is_year and current) or (
             year_count < 2 and numbered_pattern.match(segment.source.strip()) and current
         ):
@@ -1833,6 +2008,7 @@ def extract_document(
 
                 text_parts: list[str] = []
                 fragment_parts: list[int] = []
+                footer_parts: list[tuple[float, str]] = []
 
                 def collect_fragment(value: str, _cm: Any, tm: list[float], _font: Any, size: float) -> None:
                     text_parts.append(value)
@@ -1853,15 +2029,41 @@ def extract_document(
                     layout_fragments.append(LayoutFragment(len(layout_fragments), x, y, value, size))
                     if size <= 8.5 and 10 < y < 85:
                         margin_candidates.append((value, "bottom"))
+                    elif size <= 8.5 and 85 <= y < 110:
+                        footer_parts.append((y, value))
                     elif size <= 8.5 and page_height - 65 < y <= page_height:
                         margin_candidates.append((value, "top"))
 
-                raw = page.extract_text(visitor_text=collect_fragment) or ""
+                image_boxes: list[tuple[float, float, float, float]] = []
+                image_names = _image_xobject_names(page)
+
+                def collect_image(operation: bytes, operands: list[Any], cm: list[float], _tm: list[float]) -> None:
+                    # Only images: a form XObject is drawn in its own
+                    # coordinates, so the unit square says nothing about it.
+                    if operation != b"Do" or not operands or len(cm) < 6:
+                        return
+                    if str(operands[0]).lstrip("/") not in image_names:
+                        return
+                    a, b, c, d, e, f = (float(value) for value in cm[:6])
+                    xs = (e, a + e, c + e, a + c + e)
+                    ys = (f, b + f, d + f, b + d + f)
+                    image_boxes.append((min(xs), min(ys), max(xs), max(ys)))
+
+                raw = page.extract_text(visitor_text=collect_fragment, visitor_operand_before=collect_image) or ""
                 margin_candidates = _page_number_candidates_at_edges(margin_candidates, layout_fragments)
+                margin_candidates.extend((line, "bottom") for line in _footer_lines(footer_parts))
                 # Layout analysis keeps the plain fragment text; the body text
-                # and caption fragments carry E_{algo} / b^{⋆} markup.
+                # and caption fragments carry E_{algo} / b^{⋆} markup. Text
+                # drawn inside figures is left out of the body text.
                 roles = _script_roles(layout_fragments, float(page.mediabox.width))
-                raw = _apply_script_markup(raw, text_parts, fragment_parts, roles)
+                figure_text = _figure_text_orders(
+                    layout_fragments,
+                    _positioned_captions(fragments, page_width / 2),
+                    image_boxes,
+                    page_width,
+                    page_height,
+                )
+                raw = _apply_script_markup(raw, text_parts, fragment_parts, roles, figure_text)
                 for order, role in roles.items():
                     x, y, value = fragments[order]
                     fragments[order] = (x, y, _wrap_script(value, role))
