@@ -133,11 +133,11 @@ function showResults(data) {
 
 function renderSegment(item, position, list, mode) {
   const kind = item.kind || 'sentence';
-  const labels = {sentence:'文', heading:'見出し', equation:'数式', table:'表', figure:'図', list_item:'箇条書き', citation:'引用'};
+  const labels = {sentence:'文', heading:'見出し', equation:'数式', algorithm:'アルゴリズム', table:'表', figure:'図', list_item:'箇条書き', citation:'引用'};
   const translation = item.translation || `⚠ ${item.error || '未翻訳'}`;
   const imageItems = (item.assets || []).map((asset, number) => `<figure><a href="${escapeHtml(asset)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(asset)}" alt="${kind === 'equation' ? '数式' : '図'} ${item.index + 1}-${number + 1}" loading="lazy"></a></figure>`).join('');
   const images = imageItems ? `<div class="figure-gallery">${imageItems}</div>` : '';
-  const equationImage = kind === 'equation' && Boolean(imageItems);
+  const equationImage = (kind === 'equation' || kind === 'algorithm') && Boolean(imageItems);
   const sourceText = renderReferencedText(item.source, item.index);
   const translationText = renderReferencedText(translation, item.index);
   const sourceContent = equationImage ? `${images}<details class="equation-text"><summary>検索用テキスト</summary><p>${sourceText}</p></details>` : `${images}<p>${sourceText}</p>`;
@@ -431,7 +431,7 @@ function renderClipShelf() {
 
 function renderClipCard(item, part) {
   const kind = item.kind || 'sentence';
-  const labels = {sentence:'文', heading:'見出し', equation:'数式', table:'表', figure:'図', list_item:'箇条書き', citation:'引用'};
+  const labels = {sentence:'文', heading:'見出し', equation:'数式', algorithm:'アルゴリズム', table:'表', figure:'図', list_item:'箇条書き', citation:'引用'};
   const definition = CLIP_PARTS[part];
   const translation = item.translation || `⚠ ${item.error || '未翻訳'}`;
   const text = part === 'source' ? item.source : (part === 'translation' ? translation : (item.note || '（メモは未入力です）'));

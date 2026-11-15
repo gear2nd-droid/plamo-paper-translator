@@ -32,6 +32,10 @@ from paper_core import (
     _drawn_figure_box,
     _figure_text_orders,
     _footer_lines,
+    _algorithm_blocks,
+    ALGORITHM_CAPTION_PATTERN,
+    _table_blocks,
+    _table_line_is_prose,
     _inline_math_spans,
     expand_inline_math,
     inline_math_html,
@@ -353,6 +357,53 @@ class CoreTests(unittest.TestCase):
         ]
         captions = _positioned_captions(fragments, 297, [8.5, 9.2, 9.2], 9.2)
         self.assertEqual([caption.text for caption in captions], ["図 2: 提案手法の全体図．"])
+
+    def test_algorithm_box_takes_numbered_lines_and_stops_at_body_text(self):
+        fragments = [
+            LayoutFragment(0, 318, 700, "ALGORITHM 1:", 8),
+            LayoutFragment(1, 360, 700, "FieldGovernedCFA", 8),
+            LayoutFragment(2, 318, 690, "Input: The voxel representation", 8),
+            LayoutFragment(3, 311, 680, "1", 5.5),
+            LayoutFragment(4, 320, 680, "Adding all voxels to the first layer", 8),
+            LayoutFragment(5, 311, 670, "2", 5.5),
+            LayoutFragment(6, 320, 670, "while f ≤ F do", 8),
+            LayoutFragment(7, 308, 660, "10", 5.5),
+            LayoutFragment(8, 330, 660, "end", 8),
+            LayoutFragment(9, 318, 640, "into 2 (or 2k) feasible configurations of the robot arm are found here.", 9),
+            LayoutFragment(10, 52, 640, "Left column body text that runs along the whole column width here.", 9),
+        ]
+        blocks = _algorithm_blocks(fragments, 612)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["number"], 1)
+        self.assertEqual(blocks[0]["orders"], [0, 1, 2, 3, 4, 5, 6])  # "10" is not line 3
+        self.assertIsNone(ALGORITHM_CAPTION_PATTERN.match("Algorithm 1 becomes unnecessary"))
+        self.assertIsNotNone(ALGORITHM_CAPTION_PATTERN.match("Algorithm 1 Translation job"))
+
+    def test_table_rows_are_not_body_text(self):
+        self.assertFalse(_table_line_is_prose("Total Time (sec.) of Curved Layer Decomposition Missed Working Surf."))
+        self.assertFalse(_table_line_is_prose("data/jobs one JSON file per translation"))
+        self.assertFalse(_table_line_is_prose("Bunny 1 97,532 7.24 171.57 203.90 null 888.72"))
+        self.assertTrue(_table_line_is_prose("This integrated approach within a single framework, of multiple"))
+        self.assertTrue(_table_line_is_prose("their plain counterparts."))
+
+    def test_table_body_is_cropped_below_its_caption(self):
+        fragments = [
+            LayoutFragment(0, 52, 720, "Body text before the table that is a long sentence.", 9),
+            LayoutFragment(1, 179, 706, "Table 1. Computational statistics of our multi-axis volume printing approach", 8),
+            LayoutFragment(2, 74, 688, "Model Figure Total Voxel # Peeling-Field", 9),
+            LayoutFragment(3, 74, 676, "Bunny 1 97,532 7.24 171.57", 9),
+            LayoutFragment(4, 74, 664, "Fertility 14 77,064 3.79 207.04", 9),
+            LayoutFragment(5, 56, 650, "†The time reported for working surface extraction includes trimming.", 7),
+            LayoutFragment(6, 52, 630, "the results show that our method is efficient on all of these models.", 9),
+            LayoutFragment(7, 330, 688, "nothing", 9),
+        ]
+        captions = [PositionedCaption(fragments[1].text, 179, 706)]
+        blocks = _table_blocks(fragments, captions, 612)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["identity"], ("table", 1))
+        self.assertEqual(blocks[0]["orders"][:3], [2, 3, 4])
+        self.assertNotIn(5, blocks[0]["orders"])  # the footnote sentence stays text
+        self.assertNotIn(6, blocks[0]["orders"])
 
     def test_inline_math_spans_join_symbols_scripts_and_their_base(self):
         fragments = [
