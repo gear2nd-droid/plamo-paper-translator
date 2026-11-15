@@ -10,16 +10,25 @@
 \usepackage[T1]{fontenc}
 \usepackage{mathptmx}
 \ifdefined\manualonecolumn
-  \usepackage[margin=1in]{geometry}
+  \usepackage[margin=1in,headheight=14pt]{geometry}
 \else
-  \usepackage[margin=0.75in,columnsep=0.28in]{geometry}
+  \usepackage[margin=0.75in,columnsep=0.28in,headheight=14pt]{geometry}
 \fi
 \usepackage{amsmath,amssymb}
 \usepackage{graphicx}
 \usepackage{booktabs,multirow}
 \usepackage{caption,subcaption}
 \usepackage{algorithm,algpseudocode}
+\usepackage{stmaryrd}
+\usepackage{fancyhdr}
 \usepackage[hidelinks]{hyperref}
+% A running head with the page number, as in most journals. The application
+% removes it from the text; this manual doubles as a test of that.
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\itshape PLaMo Paper Translator User Manual}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0pt}
 \captionsetup{font=small,labelfont=bf}
 \graphicspath{{figures/}}
 % Width of figures that fill one column; narrower in the single-column edition.
@@ -31,6 +40,7 @@
   \renewenvironment{figure*}[1][]{\manualfigure[!htbp]}{\endmanualfigure}
   \let\manualtable\table \let\endmanualtable\endtable
   \renewenvironment{table}[1][]{\manualtable[!htbp]}{\endmanualtable}
+  \renewenvironment{table*}[1][]{\manualtable[!htbp]}{\endmanualtable}
   \renewcommand{\topfraction}{0.85}
   \renewcommand{\bottomfraction}{0.6}
   \renewcommand{\textfraction}{0.1}
@@ -40,7 +50,7 @@
 \AtBeginDocument{\ifdefined\manualonecolumn\setlength{\figwidth}{0.62\textwidth}\else\setlength{\figwidth}{\columnwidth}\fi}
 
 \title{\textbf{PLaMo Paper Translator: Local, Sentence-Aligned\\Bilingual Reading of Academic PDFs}\\[4pt]
-\large User Manual, Version 1.2\ifdefined\manualonecolumn\ (Single-Column Edition)\fi}
+\large User Manual, Version 1.5\ifdefined\manualonecolumn\ (Single-Column Edition)\fi}
 \author{The PLaMo Paper Translator Project}
 \date{November 2026}
 
@@ -48,7 +58,7 @@
 \maketitle
 
 \begin{abstract}
-PLaMo Paper Translator is a desktop application that turns an academic PDF into a sentence-aligned bilingual document and keeps everything on the reader's own computer. The application extracts text, figures and numbered equations from the PDF, translates each sentence with PLaMo 3 Translate running locally through llama.cpp, and presents the result in a three-pane reader with a table of contents, cross-reference links, bookmarks, notes, pinned clips and a side panel for a Markdown summary of the paper. This manual is written in the form of a research paper so that it can double as a realistic test document: it contains numbered sections, figures, tables, display equations, an algorithm and a reference list. We describe installation (Section~\ref{sec:install}), the document pipeline (Section~\ref{sec:pipeline}), translation (Section~\ref{sec:translation}), the reading interface (Section~\ref{sec:reader}), quality checks (Section~\ref{sec:quality}) and the paper library (Section~\ref{sec:library}).
+PLaMo Paper Translator is a desktop application that turns an academic PDF into a sentence-aligned bilingual document and keeps everything on the reader's own computer. The application extracts text, figures and numbered equations from the PDF, translates each sentence with PLaMo 3 Translate running locally through llama.cpp, and presents the result in a three-pane reader with a table of contents, cross-reference links, bookmarks, notes, pinned clips and a side panel for a Markdown summary of the paper. Inline mathematics can be shown either as text with subscripts and superscripts or, in the \emph{all math as images} mode, exactly as printed. Pseudocode and tables are kept whole as images, and papers in Japanese, Chinese and Korean are read as well. This manual is written in the form of a research paper so that it can double as a realistic test document: it contains numbered sections, a running head, figures, tables with footnotes, display and inline equations, an algorithm and a reference list. We describe installation (Section~\ref{sec:install}), the document pipeline (Section~\ref{sec:pipeline}), translation (Section~\ref{sec:translation}), the reading interface (Section~\ref{sec:reader}), quality checks (Section~\ref{sec:quality}) and the paper library (Section~\ref{sec:library}).
 \end{abstract}
 
 \noindent\textbf{Keywords:} machine translation, PDF processing, local inference, reading interface, PLaMo
@@ -182,7 +192,7 @@ The cleaned text is split into blocks and each block is classified as a heading,
 Headings are assigned a level from their numbering, so ``3.2'' becomes level~2. Sentences broken by a page or column boundary are merged again, and each reference entry is merged into a single citation segment.
 
 \subsection{Figures and Equations}
-Figures are cropped from the rendered page rather than taken from the embedded images. Labels such as (a) and (b) that are drawn over a figure are therefore kept. A numbered display equation is detected from the position of its number at the right margin and rendered with PDFium at
+Figures are cropped from the rendered page rather than taken from the embedded images. Labels such as (a) and (b) that are drawn over a figure are therefore kept, and figures drawn only with lines and text, such as charts and flowcharts, are cropped from the area above their caption. The text inside a figure (panel labels, legends, axis ticks) is part of the image and is left out of the body text. A numbered display equation is detected from the position of its number at the right margin and rendered with PDFium at
 \begin{equation}
   \sigma = \frac{216\ \text{dpi}}{72\ \text{pt/in}} = 3
   \label{eq:scale}
@@ -202,6 +212,46 @@ Plain text extraction loses the difference between $E_\text{algo}$ and ``Ealgo''
   \label{eq:scripts}
 \end{equation}
 so small capitals on the same baseline stay normal text. A script is stored in the text as \verb|E_{algo}| or \verb|b^{*}| and shown as a real subscript or superscript in the reader and in exports. Pieces of one script, such as $p$, a comma and $k$ in $s_{p,k}$, are joined. In a test with 60 sentences, PLaMo 3 Translate kept all 126 marked scripts unchanged; a flattened script would be restored automatically.
+
+\subsection{Inline Mathematics as Images}
+\label{sec:inline-math}
+Scripts are not enough for much of the mathematics inside sentences. A fraction such as $\frac{m}{N}$, an accent as in $\hat{\mathbf{x}}_i$ or $\bar{F}$, a root as in $\sqrt{\lvert s \rvert}$, a sum with limits as in $\sum_{i=1}^{N} \lvert C_i \rvert$, or a set such as $\mathcal{M} \subset \mathbb{R}^3$ loses its form as plain text, and some word processors embed math fonts whose characters cannot be read at all. The translation settings therefore offer two modes:
+\begin{itemize}
+  \item \emph{Standard}: numbered display equations are images, and inline mathematics is text with subscripts and superscripts.
+  \item \emph{All math as images}: every inline expression is also cropped from the page and shown in the source and in the translation.
+\end{itemize}
+In the second mode an expression is replaced in the text by a placeholder such as $\llbracket \mathrm{M12} \rrbracket$ before translation; PLaMo 3 Translate kept all 43 placeholders of a test unchanged, and a missing one is added back. The text of the expression is kept for search, copying and quotes in the summary. Each image is sized in units of the text height so that it sits on the baseline: for a crop from $b$ to $t$ around a line with baseline $y$ and font size $z$,
+\begin{equation}
+  \text{height} = \frac{t - b}{z}\ \text{em}, \qquad \text{depth} = \frac{y - b}{z}\ \text{em}.
+  \label{eq:inline-size}
+\end{equation}
+
+\subsection{Algorithms and Tables}
+\label{sec:blocks}
+Pseudocode is not split into one segment per line. An algorithm box, recognised by its caption (``Algorithm 1'') and its numbered lines, becomes a single row that shows the whole box as an image, such as Algorithm~\ref{alg:translate}; its text is kept for search, and the row is not translated. A table set in text is cropped from its caption to its last row and attached to the caption, which is translated as usual, so its numbers do not leak into the body text. Table~\ref{tab:samples} shows a table that spans both columns and carries a footnote; a sentence such as the footnote stays in the text as well as in the image.
+
+\begin{table*}[t]
+  \centering
+  \caption{Elements kept as images in the sample papers used for testing.}
+  \label{tab:samples}
+  \begin{tabular}{@{}lrrrrrr@{}}
+    \toprule
+    & & \multicolumn{2}{c}{Equations} & \multicolumn{2}{c}{Figures} & \\
+    \cmidrule(lr){3-4} \cmidrule(lr){5-6}
+    Sample & Pages & Numbered & Imaged & Captions & Imaged & Tables$^\dagger$ \\
+    \midrule
+    A (two columns) & 18 & 30 & 25 & 13 & 13 & 3 \\
+    B (two columns) & 15 & 19 & 19 & 20 & 20 & 2 \\
+    C (one column) & 19 & 9 & 4 & 6 & 5 & 3 \\
+    D (Japanese) & 10 & 5 & 3 & 8 & 7 & 2 \\
+    This manual & 9 & 16 & 16 & 8 & 8 & 9 \\
+    \bottomrule
+    \multicolumn{7}{@{}l}{\footnotesize $^\dagger$Tables set in text; a table embedded as a picture is shown like a figure.}
+  \end{tabular}
+\end{table*}
+
+\subsection{Other Languages and Scanned Pages}
+Japanese, Chinese and Korean papers are read as well. Many of them, especially papers typeset with \LaTeX, embed fonts without a table that maps their glyphs to characters; the application then uses Adobe's public character collections, so the text is not garbled. Sentences end at full stops of the language, spaces that the layout puts between characters are removed, and captions such as ``Figure~1'' written in Japanese are recognised. A PDF whose pages are only images has no text to translate: the application reports this and asks for OCR instead of showing an empty or garbled result.
 
 \section{Translation}
 \label{sec:translation}
@@ -417,6 +467,9 @@ The library lists every saved translation (Figure~\ref{fig:library}). It searche
 \end{align}
 and every path must lie inside \texttt{data/jobs}, \texttt{data/uploads} or \texttt{data/assets}.
 
+\subsection{Re-extraction}
+\emph{Re-extract} reads a saved paper again with the current version of the extraction, for example after an update, and can switch the mathematics mode of Section~\ref{sec:inline-math}. Rows whose text is unchanged keep their translation, notes, bookmarks and clips; references to rows in the summary and the reading position follow their text; only new or changed rows are translated again. The state before re-extraction is saved in \texttt{data/reextract-backups}.
+
 \subsection{Deleting a Paper}
 \emph{Delete} removes a translation after confirmation. The original file and crops are deleted as well, unless another translation was made from the same file. A paper that is being translated cannot be deleted.
 
@@ -432,7 +485,7 @@ Table~\ref{tab:export} lists the export formats. The summary is placed at the to
     \toprule
     Format & Contents \\
     \midrule
-    HTML & single file with embedded figures, notes and the rendered summary \\
+    HTML & single file with embedded figures, math images, notes and the rendered summary \\
     Markdown & summary, then source and translation, one pair per entry \\
     JSON & all segments, tags, summary and reading status \\
     \bottomrule
@@ -443,7 +496,7 @@ When publishing translations of other people's papers, check the license of each
 
 \section{Limitations}
 \label{sec:limitations}
-The application needs a PDF that contains text; scanned pages must be processed with OCR first. Two-column layouts are read in the order stored in the PDF, which is usually but not always the reading order. Figures drawn only with vector graphics are not cropped, and their text is kept as ordinary segments. Inline mathematics is translated as text; subscripts and superscripts are kept (Section~\ref{sec:scripts}), but fractions and stacked limits inside a sentence become flat scripts. Finally, machine translation can be wrong: results used for submissions, contracts or medical decisions must be checked by an expert.
+The application needs a PDF that contains text; scanned pages must be processed with OCR first. Two-column layouts are read in the order stored in the PDF, which is usually but not always the reading order. In the standard mode, fractions and stacked limits inside a sentence become flat scripts; the all-images mode of Section~\ref{sec:inline-math} keeps them, but an expression can occasionally be split into two images. Tables and algorithms shown as images are not translated. Finally, machine translation can be wrong: results used for submissions, contracts or medical decisions must be checked by an expert.
 
 \section{Conclusion}
 \label{sec:conclusion}
@@ -521,6 +574,7 @@ Table~\ref{tab:api} lists the main endpoints of \texttt{app.py}. They are intend
     \texttt{GET /api/status} & engine and model state \\
     \texttt{POST /api/documents} & upload and extract a file \\
     \texttt{POST /api/jobs} & start a translation \\
+    \texttt{POST /api/jobs/\{id\}/reextract} & read a saved paper again \\
     \texttt{GET /api/jobs/\{id\}} & job state and segments \\
     \texttt{GET /api/jobs/\{id\}/export} & HTML, MD or JSON \\
     \texttt{GET /api/jobs/\{id\}/quality} & quality check \\
@@ -534,7 +588,8 @@ Table~\ref{tab:api} lists the main endpoints of \texttt{app.py}. They are intend
 \label{app:trouble}
 \begin{itemize}
   \item \textbf{The engine does not start.} Check \texttt{data/llama-server.log}. Loading must finish within three minutes.
-  \item \textbf{Nothing is extracted.} The PDF probably contains only images; run OCR first.
+  \item \textbf{The upload reports that hardly any text was found.} The PDF contains only page images; run OCR first.
+  \item \textbf{A paper read with an older version looks wrong.} Use \emph{Re-extract} in the library; translations and notes are kept.
   \item \textbf{The Chrome button reports an error.} Run \texttt{install-native-host.ps1} again and restart Chrome.
 \end{itemize}
 

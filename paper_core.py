@@ -2655,6 +2655,9 @@ def _table_blocks(
                 if in_caption and compact and compact in caption_text:
                     previous_y = y
                     continue  # a wrapped caption line
+                if in_caption and _table_line_is_prose(joined) and abs(previous_y - y) <= 1.8 * body:
+                    previous_y = y
+                    continue  # more of a long caption, before the first row
                 in_caption = False
                 if any((round(item.x), round(item.y)) in caption_starts for item in line):
                     break  # the next caption
@@ -2666,7 +2669,18 @@ def _table_blocks(
                 # The line's width is not used: a column can be misjudged.
                 prose = _table_line_is_prose(joined)
                 small = all(item.size < 0.9 * body for item in line)
-                if (prose and not small) or heading_level(joined.strip()) > 0:
+                # A header cell such as "Method" or "Results" is not a section
+                # heading; any other heading ("References", "4.2 Results")
+                # ends the table.
+                numbered_heading = heading_level(joined.strip()) > 0 and joined.strip().lower() not in {
+                    "method",
+                    "methods",
+                    "result",
+                    "results",
+                    "material",
+                    "materials",
+                }
+                if (prose and not small) or numbered_heading:
                     break  # body text or a heading again
                 kept.append(line)
                 previous_y = y
@@ -2707,31 +2721,42 @@ def _table_blocks(
             # The side with more table lines holds the table.
             if best is None or len(lines) > len(best[0]):
                 best = (lines, span)
+        if not best and column == full:
+            # A two-column page taken for a single column: the other column's
+            # body text joins every line. Look in the caption's own column.
+            half = (left_margin - 4, midpoint - 2) if caption.x < midpoint else (midpoint - 2, right_margin + 4)
+            for below in (True, False):
+                lines = collect(*half, below)
+                if len(lines) >= 2 and (best is None or len(lines) > len(best[0])):
+                    best = (lines, half)
         if not best:
             continue
         lines, (x_from, x_to) = best
         texts = [" ".join(item.text for item in sorted(line, key=lambda entry: entry.order)) for line in lines]
-        sentences = sum(
-            1
-            for value in texts
-            if len(re.findall(r"[A-Za-z][A-Za-z'-]+", value)) >= 5
-            and sum(word[0].islower() for word in re.findall(r"[A-Za-z][A-Za-z'-]+", value))
-            >= 0.6 * len(re.findall(r"[A-Za-z][A-Za-z'-]+", value))
-        )
-        if sentences * 3 > len(lines):
+        if sum(_table_line_is_prose(value) for value in texts) * 3 > len(lines):
             continue  # mostly sentences: body text, not a table
         members = [item for line in lines for item in line]
         low = min(item.y for item in members) - 0.4 * body
         high = max(item.y for item in members) + 1.0 * body
         # A sentence caught at the edge of the crop (body text, a footnote)
-        # stays in the body text too: better shown twice than lost. Judged
-        # per line (one fragment per word) and per fragment (one per line).
+        # stays in the body text too: better shown twice than lost. Body text
+        # and notes start at the column's left edge; table rows are indented
+        # or centred, so their cells leave the text.
         def sentence_like(value: str) -> bool:
             words = re.findall(r"[A-Za-z][A-Za-z'-]+", value)
             return len(words) >= 3 and sum(word[0].islower() for word in words) >= 0.6 * len(words)
 
-        kept_text = {item.order for line, value in zip(lines, texts) if sentence_like(value) for item in line}
-        kept_text |= {item.order for item in members if sentence_like(item.text)}
+        starts = Counter(
+            round(item.x) for item in fragments if x_from - 2 <= item.x < x_to and len(item.text.strip()) > 20
+        )
+        text_left = starts.most_common(1)[0][0] if starts else x_from
+        kept_text = {
+            item.order
+            for line, value in zip(lines, texts)
+            if sentence_like(value) and min(entry.x for entry in line) <= text_left + 6
+            for item in line
+        }
+        kept_text |= {item.order for item in members if sentence_like(item.text) and item.x <= text_left + 6}
         # pypdf can report a cell at the start of its text chunk, outside
         # the box; cells drawn in the table's run of the stream, within its
         # rows, belong to it unless they read as a sentence.
@@ -2812,6 +2837,7 @@ def _attach_tables(segments: list[Segment], page_number: int, registry: dict[tup
         asset = registry.get((page_number, identity[1]))
         if asset and asset not in segment.assets:
             segment.assets.append(asset)
+            registry.pop((page_number, identity[1]))  # the first "Table N." row is the caption
 
 
 def _render_inline_math(
