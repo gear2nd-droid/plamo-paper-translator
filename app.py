@@ -5,6 +5,7 @@ import atexit
 import base64
 import hashlib
 import json
+import queue
 import mimetypes
 import os
 import re
@@ -30,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import latex_ocr
 from paper_core import (
     LlamaTranslator,
     Segment,
@@ -81,7 +83,7 @@ MAX_BACKUP_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_BACKUP_EXPANDED_BYTES = 8 * 1024 * 1024 * 1024
 MAX_BACKUP_FILES = 100_000
 # One version for the app, the Chrome extension and the release.
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
 NATIVE_HOST_NAME = "jp.gear2.plamo_paper_translator"
 CHROME_EXTENSION_ID = "cpiiadekehcofkocnlplcaolgioefcjd"
 CHROME_EXTENSION_ORIGIN = f"chrome-extension://{CHROME_EXTENSION_ID}/"
@@ -94,6 +96,7 @@ CONTROL_FILE = DATA_DIR / "server-control.json"
 CONTROL_TOKEN_HEADER = "X-PLaMo-Control-Token"
 RUNTIME_DIR = USER_DIR / "runtime"
 MODEL_DIR = USER_DIR / "models"
+LATEX_MODEL_DIR = MODEL_DIR / "latex-ocr"
 for directory in (DATA_DIR, UPLOAD_DIR, JOB_DIR, ASSET_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -968,6 +971,7 @@ def _reextract_job(job_id: str, math_mode: str | None = None) -> dict[str, Any]:
             _remove_unreferenced_document(old_document_id)
         if needs_translation:
             threading.Thread(target=_translate_job, args=(job_id, True), daemon=True).start()
+        _queue_latex(job_id)
         return {"id": job_id, "old_rows": old_count, "new_rows": len(merged), "translating": needs_translation, **counts}
     finally:
         with state_lock:
@@ -1147,6 +1151,172 @@ def _translate_job(job_id: str, only_missing: bool = False) -> None:
         _save_job(job)
 
 
+# Equation images to LaTeX ----------------------------------------------------
+latex_download = {"running": False, "progress": 0.0, "file": "", "error": ""}
+latex_queue: "queue.Queue[str]" = queue.Queue()
+latex_pending: set[str] = set()  # jobs queued or being recognised
+latex_tried: set[tuple[str, int, str]] = set()  # (job, row, image) attempted in this run
+latex_worker_lock = threading.Lock()
+latex_worker: threading.Thread | None = None
+
+
+def _latex_status() -> dict[str, Any]:
+    runtime = latex_ocr.runtime_available()
+    models = latex_ocr.models_present(LATEX_MODEL_DIR)
+    with state_lock:
+        download = dict(latex_download)
+    return {
+        "available": runtime and models,
+        "runtime": runtime,
+        "models": models,
+        "downloading": download["running"],
+        "progress": download["progress"],
+        "file": download["file"],
+        "error": download["error"],
+        "size_mb": round(sum(latex_ocr.MODEL_SIZES.values()) / 1_000_000),
+    }
+
+
+def _latex_targets(job: dict[str, Any]) -> list[int]:
+    return [
+        index
+        for index, segment in enumerate(job.get("segments", []))
+        if isinstance(segment, Segment)
+        and segment.kind == "equation"
+        and segment.assets
+        and not segment.tex.strip()
+        and (job["id"], index, segment.assets[0]) not in latex_tried
+    ]
+
+
+def _queue_latex(job_id: str) -> bool:
+    """Recognise the job's equation images in the background. True while pending."""
+    if not (latex_ocr.runtime_available() and latex_ocr.models_present(LATEX_MODEL_DIR)):
+        return False
+    global latex_worker
+    with state_lock:
+        if job_id in latex_pending:
+            return True
+        job = jobs.get(job_id)
+        if not job or not _latex_targets(job):
+            return False
+        latex_pending.add(job_id)
+    with latex_worker_lock:
+        if latex_worker is None or not latex_worker.is_alive():
+            latex_worker = threading.Thread(target=_latex_worker_loop, daemon=True)
+            latex_worker.start()
+    latex_queue.put(job_id)
+    return True
+
+
+def _latex_worker_loop() -> None:
+    while True:
+        job_id = latex_queue.get()
+        try:
+            _recognize_job_equations(job_id)
+        except Exception:
+            pass
+        finally:
+            with state_lock:
+                latex_pending.discard(job_id)
+
+
+def _recognize_job_equations(job_id: str) -> None:
+    job = _load_saved_job(job_id)
+    if not job:
+        return
+    # Half of the cores: translation and the browser keep running meanwhile.
+    engine = latex_ocr.engine(LATEX_MODEL_DIR, threads=max(1, (os.cpu_count() or 2) // 2))
+    with state_lock:
+        targets = _latex_targets(job)
+    changed = 0
+    for index in targets:
+        with state_lock:
+            segments = job["segments"]
+            if index >= len(segments):
+                break
+            segment = segments[index]
+            asset = segment.assets[0] if segment.assets else ""
+            latex_tried.add((job_id, index, asset))
+        image = _asset_path(asset)
+        if not image:
+            continue
+        try:
+            numbered = bool(re.search(r"\(\d{1,3}[a-z]?\)\s*\.?\s*$", segment.source))
+            tex = latex_ocr.strip_equation_number(engine(image, numbered=numbered))
+        except Exception:
+            continue
+        with state_lock:
+            # Re-extraction may have replaced the rows meanwhile.
+            if job["segments"] is segments and segment.assets[:1] == [asset] and not segment.tex.strip() and tex:
+                segment.tex = tex
+                segment.tex_origin = "ocr"
+                changed += 1
+                if changed % 5 == 0:
+                    _save_job(job)
+    if changed:
+        with state_lock:
+            _save_job(job)
+
+
+def _download_latex_models() -> None:
+    total = sum(latex_ocr.MODEL_SIZES.values())
+    finished: dict[str, int] = {}
+
+    def progress(name: str, done: int, _size: int) -> None:
+        finished[name] = done
+        with state_lock:
+            latex_download["file"] = name
+            latex_download["progress"] = round(min(99.9, sum(finished.values()) / total * 100), 1)
+
+    try:
+        latex_ocr.download_models(LATEX_MODEL_DIR, progress)
+        latex_ocr.LatexOCR(LATEX_MODEL_DIR)  # check that the models load
+        with state_lock:
+            latex_download.update(progress=100.0, file="", error="")
+    except Exception as exc:
+        with state_lock:
+            latex_download["error"] = f"数式OCRモデルを取得できませんでした: {exc}"
+    finally:
+        with state_lock:
+            latex_download["running"] = False
+
+
+def _start_latex_download() -> None:
+    if not latex_ocr.runtime_available():
+        raise ValueError("この環境には数式OCRの実行環境（onnxruntime）がありません。")
+    with state_lock:
+        if latex_download["running"]:
+            return
+        latex_download.update(running=True, progress=0.0, file="", error="")
+    threading.Thread(target=_download_latex_models, daemon=True).start()
+
+
+def _job_tex(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    pending = _queue_latex(job_id)
+    with state_lock:
+        items = {
+            str(index): {"tex": segment.tex, "tex_origin": segment.tex_origin}
+            for index, segment in enumerate(job.get("segments", []))
+            if isinstance(segment, Segment) and segment.kind == "equation" and segment.tex.strip()
+        }
+    return {"pending": pending, "available": _latex_status()["available"], "items": items}
+
+
+def _set_segment_tex(job: dict[str, Any], index: int, tex: Any) -> Segment:
+    segments = job.get("segments", [])
+    if index < 0 or index >= len(segments) or not isinstance(segments[index], Segment):
+        raise IndexError("対訳位置が不正です。")
+    segment = segments[index]
+    if segment.kind != "equation" or not segment.assets:
+        raise ValueError("画像の数式ではありません。")
+    if not isinstance(tex, str) or len(tex) > 20_000:
+        raise ValueError("TeXの形式が不正です。")
+    segment.tex = tex.strip()
+    segment.tex_origin = "manual" if segment.tex else ""
+    return segment
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"PLaMoPaperTranslator/{APP_VERSION}"
 
@@ -1186,8 +1356,20 @@ class Handler(BaseHTTPRequestHandler):
                     "engine_error": llama_process.error,
                     "model": model.name if model else None,
                     "gpu_recommended": "PLaMo 3 Translate 8B Q4_K_M / RTX 2000 Ada 16GB",
+                    "latex_ocr": _latex_status(),
                 }
             )
+            return
+        if path == "/api/latex-ocr":
+            self._json(_latex_status())
+            return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/tex", path)
+        if match:
+            job = _load_saved_job(match.group(1))
+            if not job:
+                self._error("ジョブが見つかりません。", 404)
+                return
+            self._json(_job_tex(match.group(1), job))
             return
         if path == "/api/library":
             parameters = urllib.parse.parse_qs(parsed.query)
@@ -1416,6 +1598,37 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(str(exc) or "論文情報を保存できません。")
                 return
             self._json({"ok": True, **metadata})
+            return
+        if parsed.path == "/api/latex-ocr/download":
+            try:
+                _start_latex_download()
+            except ValueError as exc:
+                self._error(str(exc))
+                return
+            self._json(_latex_status())
+            return
+        match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/tex", parsed.path)
+        if match:
+            job = _load_saved_job(match.group(1))
+            if not job:
+                self._error("ジョブが見つかりません。", 404)
+                return
+            try:
+                data = self._read_json()
+                index = int(data.get("index", -1))
+                with state_lock:
+                    if data.get("recognize") is True:
+                        # Read the image again: forget the attempt and the text.
+                        segment = _set_segment_tex(job, index, "")
+                        latex_tried.discard((match.group(1), index, segment.assets[0]))
+                    else:
+                        segment = _set_segment_tex(job, index, data.get("tex"))
+                    _save_job(job)
+            except (IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._error(str(exc) or "TeXを保存できません。")
+                return
+            pending = _queue_latex(match.group(1)) if data.get("recognize") is True else False
+            self._json({"ok": True, "index": index, "tex": segment.tex, "tex_origin": segment.tex_origin, "pending": pending})
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/notes", parsed.path)
         if match:
@@ -1741,6 +1954,7 @@ class Handler(BaseHTTPRequestHandler):
             jobs[job_id] = job
             _save_job(job)
         threading.Thread(target=_translate_job, args=(job_id,), daemon=True).start()
+        _queue_latex(job_id)
         self._json(_job_snapshot(job), HTTPStatus.CREATED)
 
 

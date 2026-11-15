@@ -17,7 +17,7 @@ if (Test-Path -LiteralPath $ResolvedPackageRoot) {
 & $Python -m pip install --disable-pip-version-check "pyinstaller>=6.16,<7"
 Push-Location $AppRoot
 try {
-    & $Python -m PyInstaller --noconfirm --clean --onefile --name PLaMoPaperTranslator --icon "assets\app.ico" --hidden-import pypdf --add-data "static;static" --add-data "cmaps;cmaps" app.py
+    & $Python -m PyInstaller --noconfirm --clean --onefile --name PLaMoPaperTranslator --icon "assets\app.ico" --hidden-import pypdf --hidden-import onnxruntime --hidden-import numpy --exclude-module onnxruntime.tools --exclude-module onnxruntime.transformers --exclude-module onnxruntime.quantization --add-data "static;static" --add-data "cmaps;cmaps" app.py
     New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
     Copy-Item -Force "dist\PLaMoPaperTranslator.exe" $PackageRoot
     Copy-Item -Force "Start-PLaMoPaperTranslator.cmd","start.ps1","setup.ps1","requirements.txt","README.md","CHANGELOG.md","DISTRIBUTION.md","THIRD_PARTY_NOTICES.md","LICENSE" $PackageRoot
@@ -61,6 +61,13 @@ try {
     Copy-PackageLicense -Distribution "pypdf" -DestinationName "pypdf-LICENSE.txt"
     Copy-PackageLicense -Distribution "Pillow" -DestinationName "Pillow-LICENSE.txt"
     Copy-PackageLicense -Distribution "pyinstaller" -DestinationName "PyInstaller-COPYING.txt"
+    Copy-PackageLicense -Distribution "onnxruntime" -DestinationName "onnxruntime-LICENSE.txt"
+    $OrtNotices = (& $Python -c "import sys; from importlib.metadata import distribution; d=distribution('onnxruntime'); print(next(d.locate_file(f) for f in d.files if str(f).endswith('ThirdPartyNotices.txt')))").Trim()
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $OrtNotices)) { throw "onnxruntime の ThirdPartyNotices が見つかりません。" }
+    Copy-Item -Force -LiteralPath $OrtNotices -Destination (Join-Path $LicenseRoot "onnxruntime-ThirdPartyNotices.txt")
+    $NumpyLicense = (& $Python -c "import sys; from importlib.metadata import distribution; d=distribution('numpy'); print(next(d.locate_file(f) for f in d.files if str(f).endswith('licenses/LICENSE.txt') or str(f).endswith('LICENSE.txt')))").Trim()
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $NumpyLicense)) { throw "numpy のライセンス本文が見つかりません。" }
+    Copy-Item -Force -LiteralPath $NumpyLicense -Destination (Join-Path $LicenseRoot "numpy-LICENSE.txt")
     $PdfiumFinder = "import sys; from pathlib import Path; from importlib.metadata import distribution; d=distribution(sys.argv[1]); p=next(Path(d.locate_file(f)) for f in (d.files or []) if 'build_licenses' in str(f).lower()); print(next(x for x in (p, *p.parents) if x.name.lower() == 'licenses'))"
     $PdfiumLicenseSource = (& $Python -c $PdfiumFinder "pypdfium2").Trim()
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $PdfiumLicenseSource)) {

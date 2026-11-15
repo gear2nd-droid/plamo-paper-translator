@@ -424,6 +424,22 @@ class CoreTests(unittest.TestCase):
         spans = _inline_math_spans(fragments, fonts, roles, set())
         self.assertEqual(spans, [[1, 2], [4, 5, 6]])
 
+    def test_inline_math_spans_keep_brackets_whole(self):
+        def spans_of(parts):
+            fragments = [LayoutFragment(order, 50 + 10 * order, 700, text, 9) for order, (text, _font) in enumerate(parts)]
+            return _inline_math_spans(fragments, [font for _text, font in parts], {}, set())
+
+        # G(x) with a bold x in a text font: the whole call is one image.
+        self.assertEqual(spans_of([("the field ", "Times"), ("𝐺", "txsys"), ("(", "Times"), ("x", "Times-Bold"), (")", "Times"), (" inside", "Times")]), [[1, 2, 3, 4]])
+        # |x| and a matrix [a b]: closed by the matching delimiter.
+        self.assertEqual(spans_of([("so ", "Times"), ("|", "CMSY10"), ("x", "Times-Bold"), ("|", "CMSY10"), (" is", "Times")]), [[1, 2, 3]])
+        self.assertEqual(spans_of([("so ", "Times"), ("𝑀", "CMMI10"), ("=", "CMR10"), ("[", "CMR10"), ("a", "Times"), ("b", "Times"), ("]", "CMR10"), (" is", "Times")]), [[1, 2, 3, 4, 5, 6]])
+        # An opener just before the run joins it; an unclosed one stays text.
+        self.assertEqual(spans_of([("at ", "Times"), ("(", "Times"), ("𝑥", "CMMI10"), (")", "Times"), (" we", "Times")]), [[1, 2, 3]])
+        self.assertEqual(spans_of([("let ", "Times"), ("𝑓", "CMMI10"), ("(", "Times"), ("the input) be", "Times")]), [[1]])
+        # The closer sits in the following text: two images, brackets as text.
+        self.assertEqual(spans_of([("for ", "Times"), ("𝑣", "CMMI10"), (" (", "Times"), ("∀𝑒", "CMMI10"), ("), we", "Times")]), [[1], [3]])
+
     def test_inline_math_tokens_render_and_survive_translation(self):
         math = {"M3": {"src": "/api/assets/a/page-001-math-3.png", "text": "w_{SF}", "height": 1.25, "depth": 0.35}}
         self.assertEqual(restore_inline_math("the weight ⟦M3⟧ is", "重み は"), "重み は ⟦M3⟧")

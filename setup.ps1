@@ -155,4 +155,20 @@ if (-not $RuntimeOnly) {
 }
 
 Write-Host ""
+Write-Host "任意: 数式OCRモデル（LaTeX-OCR / RapidLaTeXOCR、MIT License、約180MB）"
+Write-Host "番号付き数式の画像からTeXを推定し、対訳欄にコピー用として表示します。後からアプリの翻訳設定画面でも取得できます。"
+$LatexConsent = Read-Host "数式OCRモデルを取得しますか？ [yes/no]"
+if ($LatexConsent -in @("yes", "YES", "Yes", "y", "Y")) {
+    $LatexRoot = Join-Path $ModelRoot "latex-ocr"
+    New-Item -ItemType Directory -Force -Path $LatexRoot | Out-Null
+    $LatexBase = "https://github.com/RapidAI/RapidLaTeXOCR/releases/download/v0.0.0"
+    foreach ($LatexFile in @("image_resizer.onnx", "encoder.onnx", "decoder.onnx", "tokenizer.json")) {
+        Get-RemoteFile -Url "$LatexBase/$LatexFile" -Destination (Join-Path $LatexRoot $LatexFile)
+    }
+    Write-Host "  数式OCRモデルを保存しました: $LatexRoot"
+} else {
+    Write-Host "  数式OCRモデルの取得を省略しました。"
+}
+
+Write-Host ""
 Write-Host "セットアップが完了しました。Start-PLaMoPaperTranslator.cmd をダブルクリックしてください。" -ForegroundColor Green

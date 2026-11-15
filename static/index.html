@@ -78,6 +78,10 @@
               <label><input type="radio" name="mathMode" value="standard" checked><span><b>標準</b><small>番号付き数式は画像、本文中の数式は文字（上付き・下付きを再現）</small></span></label>
               <label><input type="radio" name="mathMode" value="images"><span><b>すべて画像</b><small>本文中の数式も原文どおりの画像で表示します</small></span></label>
             </fieldset>
+            <div class="latex-ocr-box full">
+              <div><b>数式のTeX化</b><p id="latexOcrState" class="latex-ocr-state">数式OCRの状態を確認しています…</p></div>
+              <button id="latexOcrDownload" type="button" class="secondary" hidden>数式OCRモデルを取得</button>
+            </div>
             <label class="field"><span>原文の言語</span><select id="sourceLang"><option value="auto">自動判定</option><option value="en">英語</option><option value="ja">日本語</option><option value="zh">中国語</option><option value="ko">韓国語</option><option value="de">ドイツ語</option><option value="fr">フランス語</option></select></label>
             <label class="field"><span>翻訳先</span><select id="targetLang"><option value="ja">日本語</option><option value="en">英語</option><option value="zh">中国語</option><option value="ko">韓国語</option><option value="de">ドイツ語</option><option value="fr">フランス語</option></select></label>
             <label class="field"><span>日本語の文体</span><select id="form"><option value="plain">常体（である調）</option><option value="polite">敬体（です・ます調）</option></select></label>

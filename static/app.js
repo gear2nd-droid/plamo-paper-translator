@@ -7,7 +7,7 @@ const CLIP_PARTS = {
 };
 const REFERENCE_PATTERN = /\b(?:fig(?:ure)?s?\.?\s*\d+(?:\s*[-–]\s*\d+)?|eq(?:uation)?s?\.?\s*\(?\d+\)?|tables?\s+\d+)|(?:図|式|表)\s*\(?\d+\)?/gi;
 const ACADEMIC_LINK_PATTERN = /https?:\/\/[^\s<>"']+|(?:doi:\s*)?10\.\d{4,9}\/[-._;()/:a-z0-9]+|arxiv:\s*\d{4}\.\d{4,5}(?:v\d+)?/gi;
-const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], segmentationMode: 'sentence', tocObserver: null, referenceTargets: new Map(), referenceHistory: [], resultsReady: false, paperTags: [], paperSummary: '', paperSourceUrl: '', paperReadingStatus: 'unread', readingIndex: 0, readingSaveTimer: null, lastSavedReadingIndex: null, summaryOpen: false, summaryMode: 'edit', summarySaveTimer: null, summarySaving: null, summaryDirty: false, librarySearchTimer: null, revisionSegmentIndex: null };
+const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], segmentationMode: 'sentence', tocObserver: null, referenceTargets: new Map(), referenceHistory: [], resultsReady: false, paperTags: [], paperSummary: '', paperSourceUrl: '', paperReadingStatus: 'unread', readingIndex: 0, readingSaveTimer: null, lastSavedReadingIndex: null, summaryOpen: false, summaryMode: 'edit', summarySaveTimer: null, summarySaving: null, summaryDirty: false, librarySearchTimer: null, revisionSegmentIndex: null, texTimer: null, texTimers: new Map(), latexAvailable: false };
 const noteTimers = new Map();
 const $ = (id) => document.getElementById(id);
 
@@ -31,7 +31,139 @@ async function updateEngine() {
     const badge = $('engineBadge');
     if (data.engine === 'ready') { badge.className = 'engine-badge ready'; badge.querySelector('span').textContent = data.model || 'エンジン準備完了'; }
     else { badge.className = 'engine-badge waiting'; badge.querySelector('span').textContent = data.model ? 'モデル読込中' : 'セットアップが必要'; }
+    if (data.latex_ocr) updateLatexOcr(data.latex_ocr);
   } catch (_) { $('engineBadge').className = 'engine-badge error'; }
+}
+
+function updateLatexOcr(info) {
+  const box = $('latexOcrState'); const button = $('latexOcrDownload');
+  const wasAvailable = state.latexAvailable;
+  state.latexAvailable = Boolean(info.available);
+  if (box && button) {
+    let message;
+    if (info.available) message = '準備完了：番号付き数式の画像からTeXを推定し、対訳欄に表示します。';
+    else if (!info.runtime) message = 'この環境では数式OCRを利用できません（onnxruntime が必要です）。';
+    else if (info.downloading) message = `数式OCRモデルを取得中… ${Number(info.progress || 0).toFixed(1)}%`;
+    else message = `未取得：数式OCRモデル（約${info.size_mb || 180}MB、MIT License）を取得すると、数式のTeXを対訳欄に表示します。${info.error ? ` ${info.error}` : ''}`;
+    box.textContent = message;
+    box.className = `latex-ocr-state${info.available ? ' ready' : ''}${info.error && !info.available ? ' error' : ''}`;
+    button.hidden = Boolean(info.available) || !info.runtime;
+    button.disabled = Boolean(info.downloading);
+    button.textContent = info.downloading ? '取得中…' : '数式OCRモデルを取得';
+  }
+  if (!wasAvailable && state.latexAvailable && state.resultsReady) refreshTex();
+}
+
+async function downloadLatexOcr() {
+  try {
+    const response = await fetch('/api/latex-ocr/download', {method:'POST'});
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || '取得を開始できませんでした');
+    updateLatexOcr(data); toast('数式OCRモデルの取得を開始しました');
+  } catch (error) { toast(error.message); }
+}
+
+function texRenderHtml(tex) {
+  if (!window.katex || !tex) return '';
+  try { return window.katex.renderToString(tex, {displayMode:true, throwOnError:false, strict:'ignore'}); }
+  catch (_) { return ''; }
+}
+
+function fitTexRenders(root = document) {
+  // Shrink a wide formula to the column instead of scrolling it.
+  root.querySelectorAll('.tex-render').forEach((node) => {
+    node.style.fontSize = '';
+    let size = 1;
+    while (node.scrollWidth > node.clientWidth + 1 && size > 0.5) { size -= 0.05; node.style.fontSize = `${size.toFixed(2)}em`; }
+  });
+}
+
+function texPaneHtml(item) {
+  const tex = String(item.tex || '');
+  if (!tex) {
+    const message = state.latexAvailable ? 'TeXを認識しています…' : '数式OCRモデルを取得すると、ここにTeXが表示されます。';
+    return `<p class="tex-pending" data-tex-pending="${item.index}">${escapeHtml(message)}</p>`;
+  }
+  const origin = item.tex_origin === 'manual' ? '編集済み' : '自動認識';
+  return `<div class="tex-panel" data-tex-index="${item.index}">
+    <div class="tex-render" aria-label="TeXの描画">${texRenderHtml(tex)}</div>
+    <textarea class="tex-code" data-tex-index="${item.index}" rows="${Math.min(8, Math.ceil(tex.length / 44) + 1)}" spellcheck="false" aria-label="${item.index + 1}番の数式のTeX">${escapeHtml(tex)}</textarea>
+    <div class="tex-actions"><button type="button" class="tex-copy" data-tex-action="copy" data-tex-index="${item.index}">TeXをコピー</button><button type="button" data-tex-action="copy-display" data-tex-index="${item.index}">$$…$$でコピー</button><button type="button" data-tex-action="recognize" data-tex-index="${item.index}">再認識</button><span class="tex-origin">${escapeHtml(origin)} · 原文の画像と見比べて確認してください</span></div>
+  </div>`;
+}
+
+async function copyText(value) {
+  try { await navigator.clipboard.writeText(value); return true; }
+  catch (_) {
+    const area = document.createElement('textarea'); area.value = value; area.style.position = 'fixed'; area.style.opacity = '0';
+    document.body.appendChild(area); area.select();
+    const ok = document.execCommand('copy'); area.remove(); return ok;
+  }
+}
+
+async function texAction(button) {
+  const index = Number(button.dataset.texIndex);
+  const item = state.segments.find((segment) => Number(segment.index) === index);
+  if (!item) return;
+  const action = button.dataset.texAction;
+  if (action === 'copy' || action === 'copy-display') {
+    const editor = document.querySelector(`textarea.tex-code[data-tex-index="${index}"]`);
+    const tex = (editor ? editor.value : item.tex || '').trim();
+    const value = action === 'copy' ? tex : `$$\n${tex}\n$$`;
+    toast(await copyText(value) ? 'TeXをコピーしました' : 'コピーできませんでした');
+    return;
+  }
+  if (action === 'recognize') {
+    button.disabled = true;
+    try {
+      const response = await fetch(`/api/jobs/${state.jobId}/tex`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index, recognize:true})});
+      const data = await response.json(); if (!response.ok) throw new Error(data.error || '再認識できませんでした');
+      item.tex = ''; item.tex_origin = '';
+      rerenderSegment(index); scheduleTexRefresh(1500);
+    } catch (error) { toast(error.message); button.disabled = false; }
+  }
+}
+
+function saveTex(index, value) {
+  clearTimeout(state.texTimers.get(index));
+  state.texTimers.set(index, setTimeout(async () => {
+    try {
+      const response = await fetch(`/api/jobs/${state.jobId}/tex`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index, tex:value})});
+      const data = await response.json(); if (!response.ok) throw new Error(data.error || 'TeXを保存できませんでした');
+      const item = state.segments.find((segment) => Number(segment.index) === index);
+      if (item) { item.tex = data.tex; item.tex_origin = data.tex_origin; }
+      const origin = document.querySelector(`.tex-panel[data-tex-index="${index}"] .tex-origin`);
+      if (origin) origin.textContent = '編集済み · 原文の画像と見比べて確認してください';
+    } catch (error) { toast(error.message); }
+  }, 700));
+}
+
+function scheduleTexRefresh(delay = 3000) {
+  clearTimeout(state.texTimer);
+  state.texTimer = setTimeout(refreshTex, delay);
+}
+
+async function refreshTex() {
+  const jobId = state.jobId;
+  if (!jobId || !state.resultsReady) return;
+  const waiting = state.segments.some((item) => item.kind === 'equation' && (item.assets || []).length && !item.tex);
+  if (!waiting) return;
+  try {
+    const response = await fetch(`/api/jobs/${jobId}/tex`); const data = await response.json();
+    if (!response.ok || jobId !== state.jobId) return;
+    state.latexAvailable = Boolean(data.available);
+    Object.entries(data.items || {}).forEach(([key, value]) => {
+      const index = Number(key);
+      const item = state.segments.find((segment) => Number(segment.index) === index);
+      if (!item || item.tex === value.tex) return;
+      const editing = document.activeElement && document.activeElement.matches(`textarea.tex-code[data-tex-index="${index}"]`);
+      item.tex = value.tex; item.tex_origin = value.tex_origin;
+      if (!editing) rerenderSegment(index);
+    });
+    if (data.pending) scheduleTexRefresh(3000);
+    else document.querySelectorAll('[data-tex-pending]').forEach((node) => {
+      node.textContent = data.available ? 'TeXを認識できませんでした。「再認識」は認識後の行で使えます。' : '数式OCRモデルを取得すると、ここにTeXが表示されます。';
+    });
+  } catch (_) { scheduleTexRefresh(6000); }
 }
 
 async function upload(file) {
@@ -122,12 +254,14 @@ function showResults(data) {
   else if (viewerSetting('summaryOpen') === 'true' && window.innerWidth >= 1100) openPaperSummaryPanel({focus:false});
   ['Html','Md','Json'].forEach((format) => $(`export${format}`).href = `/api/jobs/${state.jobId}/export?format=${format.toLowerCase()}`);
   $('results').innerHTML = state.segments.map((item, position, list) => renderSegment(item, position, list, mode)).join('');
+  requestAnimationFrame(() => fitTexRenders($('results')));
   document.querySelectorAll('.note-editor').forEach(resizeNote);
   renderPaperNavigation();
   renderClipShelf();
   markPaperOpened();
   refreshQualityCheck(false);
   if (state.readingIndex > 0) requestAnimationFrame(() => requestAnimationFrame(() => restoreReadingPosition(state.readingIndex)));
+  scheduleTexRefresh(500);
   toast('翻訳が完了しました');
 }
 
@@ -144,7 +278,10 @@ function renderSegment(item, position, list, mode) {
   const revisions = Array.isArray(item.translation_revisions) ? item.translation_revisions : [];
   const originLabel = item.translation_origin === 'manual' ? '編集済み' : (item.translation_origin === 'model' ? 'モデル訳' : '');
   const translationActions = equationImage ? '' : `<div class="translation-actions"><span>${escapeHtml(originLabel)}</span><button type="button" data-translation-action="edit" data-translation-index="${item.index}">編集</button><button type="button" data-translation-action="retranslate" data-translation-index="${item.index}">再翻訳</button>${revisions.length ? `<button type="button" data-translation-action="history" data-translation-index="${item.index}">履歴 ${revisions.length}</button>` : ''}</div>`;
-  const translationContent = equationImage ? `${images}<details class="equation-text"><summary>抽出テキスト</summary><p>${translationText}</p></details>` : `${translationActions}<div class="translation-body"><p>${translationText}</p></div>`;
+  const extractedText = `<details class="equation-text"><summary>抽出テキスト</summary><p>${translationText}</p></details>`;
+  const translationContent = equationImage
+    ? (kind === 'equation' ? `${texPaneHtml(item)}${extractedText}` : `${images}${extractedText}`)
+    : `${translationActions}<div class="translation-body"><p>${translationText}</p></div>`;
   const hasPosition = Number(item.paragraph) > 0;
   const isParagraphStart = hasPosition && (position === 0 || item.paragraph !== list[position - 1].paragraph);
   const unitPosition = hasPosition ? (Number(item.sentence) > 0 ? `P${item.paragraph} / S${item.sentence}` : `P${item.paragraph}`) : '旧形式';
@@ -818,6 +955,7 @@ function rerenderSegment(index) {
   const row = $(`segment-${index}`);
   if (!item || position < 0 || !row) return;
   row.outerHTML = renderSegment(item, position, state.segments, state.segmentationMode);
+  const updated = $(`segment-${index}`); if (updated) fitTexRenders(updated);
   const editor = document.querySelector(`.note-editor[data-note-index="${index}"]`);
   if (editor) resizeNote(editor);
   renderClipShelf();
@@ -1266,6 +1404,7 @@ document.querySelectorAll('.back').forEach((node) => node.addEventListener('clic
 document.querySelectorAll('.step').forEach((node) => node.addEventListener('click', () => { const n=Number(node.dataset.step); if(n===1 || (n===2 && state.documentId) || (n===3 && state.jobId)) showStep(n); }));
 $('targetLang').addEventListener('change', () => $('form').closest('label').style.display = $('targetLang').value === 'ja' ? '' : 'none');
 $('startTranslation').addEventListener('click', startJob);
+$('latexOcrDownload').addEventListener('click', downloadLatexOcr);
 $('cancelJob').addEventListener('click', async () => { if(state.jobId) await fetch(`/api/jobs/${state.jobId}/cancel`, {method:'POST'}); });
 $('newPaper').addEventListener('click', () => { localStorage.removeItem(JOB_STORAGE_KEY); location.href = '/'; });
 $('referenceBack').addEventListener('click', returnFromReference);
@@ -1346,6 +1485,14 @@ $('revisionItems').addEventListener('click', (event) => {
   if (button) restoreTranslationRevision(Number(button.dataset.revisionRestore), button);
 });
 $('results').addEventListener('input', (event) => {
+  const texEditor = event.target.closest('textarea.tex-code');
+  if (texEditor) {
+    const index = Number(texEditor.dataset.texIndex);
+    const render = texEditor.closest('.tex-panel')?.querySelector('.tex-render');
+    if (render) { render.innerHTML = texRenderHtml(texEditor.value.trim()); fitTexRenders(render.parentElement); }
+    saveTex(index, texEditor.value);
+    return;
+  }
   const translationEditor = event.target.closest('.translation-editor');
   if (translationEditor) {
     translationEditor.style.height = 'auto';
@@ -1367,6 +1514,8 @@ $('results').addEventListener('click', (event) => {
   if (button) toggleBookmark(button);
 });
 $('readerLayout').addEventListener('click', (event) => {
+  const texButton = event.target.closest('[data-tex-action]');
+  if (texButton) { texAction(texButton); return; }
   const translationButton = event.target.closest('[data-translation-action]');
   if (translationButton) {
     const index = Number(translationButton.dataset.translationIndex);
