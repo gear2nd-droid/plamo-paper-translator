@@ -234,7 +234,10 @@ def _join_lines(lines: list[str]) -> str:
     """Join wrapped lines: with a space in English, directly in Japanese and Chinese."""
     text = ""
     for line in lines:
-        if text and not (re.search(rf"[{CJK_CHARACTER}]$", text) and re.match(rf"[{CJK_CHARACTER}]", line)):
+        # A URL broken after "https:" continues without a space.
+        if text and not (re.search(rf"[{CJK_CHARACTER}]$", text) and re.match(rf"[{CJK_CHARACTER}]", line)) and not (
+            re.search(r"https?:/{0,2}$", text) and line.startswith("/")
+        ):
             text += " "
         text += line
     return text
@@ -276,6 +279,15 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
             # position-verified captions receive figure/table treatment in PDF.
             line = BODY_MARKER + line
         special_kind = _block_kind(line)
+        if (
+            special_kind == "table"
+            and current
+            and re.search(r"Reference Format:|^Citation:", " ".join(current))
+            and re.search(r"\bArticle\s+\d+|\b\d+\s+pages\b|\bpp\.\s*\d|\bVol\.\s*\d|doi\.org/|https?:", line, re.I)
+        ):
+            # "ACM Reference Format: ... ACM Trans. Graph. 37, 4, Article 1
+            # (August 2018), 14 pages." is full of numbers but not a table.
+            special_kind = "sentence"
         if special_kind == "list_item":
             flush()
             current.append(line)
@@ -316,7 +328,7 @@ def _normalize_block(text: str, *, captions_marked: bool = False) -> str:
             paragraphs.append(line)
         else:
             current.append(line)
-            if re.search(r"[.!?。！？．:]$", line) and len(" ".join(current)) >= 220:
+            if re.search(r"[.!?。！？．:]$", line) and not re.search(r"https?:$", line) and len(" ".join(current)) >= 220:
                 flush()
     flush()
     return "\n\n".join(paragraphs)
@@ -1549,9 +1561,15 @@ def _figure_text_orders(
             left, right = max(x0, image[0] - 3), min(x1, image[2] + 3)
             regions.append(((left, max(y0, image[1] - 1), right, min(y1, image[3] + 3)), False))
             regions.append(((left, max(y0, image[1] - 16), right, image[1] - 1), True))
-    if not regions:
-        return set()
     orders: set[int] = set()
+    # Labels drawn inside a figure's form can come as one fragment with all
+    # of a plot's labels, one per line, at no real position.
+    for item in fragments:
+        rows = [row for row in item.text.split("\n") if row.strip()]
+        if len(rows) >= 4 and sum(len(row.split()) <= 3 for row in rows) >= 0.8 * len(rows):
+            orders.add(item.order)
+    if not regions:
+        return orders
     for (x0, y0, x1, y1), labels_only in regions:
         lines: list[list[LayoutFragment]] = []
         for fragment in sorted(
@@ -1570,6 +1588,23 @@ def _figure_text_orders(
             extent = max(item.x + 0.5 * item.size * len(item.text.strip()) for item in line) - min(item.x for item in line)
             if _layout_line_is_prose(line) and extent >= 0.5 * (x1 - x0):
                 continue
+            # The area can cut a line of body text in two (one fragment per
+            # word): judge the whole line, not only its part in the area.
+            same_y = sorted((item for item in fragments if abs(item.y - line[0].y) <= 1.5), key=lambda item: item.x)
+            # Only the run that continues without a column gap.
+            runs: list[list[LayoutFragment]] = []
+            for item in same_y:
+                if runs:
+                    last = runs[-1][-1]
+                    if item.x - (last.x + 0.5 * last.size * len(last.text.strip())) <= 3 * item.size:
+                        runs[-1].append(item)
+                        continue
+                runs.append([item])
+            whole = next((run for run in runs if any(item.order == line[0].order for item in run)), line)
+            if len(whole) > len(line) and len(re.findall(r"[A-Za-z]{2,}", " ".join(item.text for item in line))) >= 2:
+                reach = max(item.x + 0.5 * item.size * len(item.text.strip()) for item in whole) - min(item.x for item in whole)
+                if _layout_line_is_prose(whole) and reach >= 0.5 * (x1 - x0):
+                    continue
             if any(_equation_number_of(item.text) is not None for item in line):
                 continue
             orders.update(item.order for item in line)
@@ -1687,6 +1722,208 @@ def _assign_page_images(
         else:
             unassigned.append(image)
     return unassigned
+
+
+def _merge_figure_tiles(
+    pdfium_document: Any,
+    page_number: int,
+    page_segments: list[Segment],
+    captions: list[PositionedCaption],
+    images: list[ExtractedPageImage],
+    fragments: list[LayoutFragment],
+    page_width: float,
+    page_height: float,
+    asset_dir: Path | None,
+    url_prefix: str,
+) -> None:
+    """Show a figure made of several embedded images as one picture.
+
+    Many figures are assembled from tiles (one image per panel or even per
+    piece of a panel) with labels and arrows drawn between them. Cropping
+    each tile alone shows a dozen fragments; one crop of the whole figure
+    area, the tiles together with what is drawn around them, shows the
+    figure as printed.
+    """
+    if pdfium_document is None or asset_dir is None:
+        return
+    boxes = {image.asset: image for image in images if image.x0 is not None}
+    leaders: dict[tuple[str, int], Segment] = {}
+    for segment in page_segments:
+        identity = _caption_identity(segment.source)
+        if identity and identity[0] == "figure" and identity not in leaders:
+            leaders[identity] = segment
+    page: Any = None
+    try:
+        for caption in captions:
+            identity = _caption_identity(caption.text)
+            leader = leaders.get(identity) if identity else None
+            if leader is None:
+                continue
+            tiles = [boxes[asset] for asset in leader.assets if asset in boxes]
+            if len(tiles) < 2:
+                continue
+            # The tiles' own positions can be in a form's coordinates, not
+            # the page's: crop the figure area between the caption and the
+            # body text above it instead, within the text's side margins (a
+            # stamp such as arXiv's in the margin is not part of the figure).
+            area = _drawn_figure_box(caption, fragments, page_width, page_height)
+            if not area or area[3] - area[1] < 40:
+                continue
+            x0, y0, x1, y1 = area
+            # A caption whose first line runs across the middle belongs to a
+            # figure across the page, whatever is beside the figure.
+            caption_end = caption.x
+            for item in sorted((item for item in fragments if abs(item.y - caption.y) <= 2 and item.x >= caption.x - 2), key=lambda entry: entry.x):
+                if item.x - caption_end > 2.5 * item.size:
+                    break
+                caption_end = max(caption_end, item.x + 0.45 * item.size * len(item.text.strip()))
+            beside = [
+                item
+                for item in fragments
+                if item.x >= page_width / 2 + 4
+                and y0 < item.y < y1
+                and (
+                    # Body text (a figure's own labels are short or capitalised)
+                    (
+                        len(words := re.findall(r"[A-Za-z][A-Za-z'-]+", item.text)) >= 5
+                        and sum(word[0].islower() for word in words) >= 0.6 * len(words)
+                    )
+                    # or another figure's caption beside this one
+                    or any(abs(item.y - other.y) <= 2 and abs(item.x - other.x) <= 2 for other in captions if other is not caption)
+                )
+            ]
+            neighbour = any(
+                other is not caption and other.x >= page_width / 2 and abs(other.y - caption.y) <= 40 for other in captions
+            )
+            if caption.x < page_width / 2 and caption_end > page_width / 2 + 20 and not beside and not neighbour:
+                x0, x1 = 0.0, page_width
+            elif not _is_single_column_page(fragments, page_width) and any(
+                other is not caption
+                and (_caption_identity(other.text) or ("", 0))[0] == "figure"
+                and (other.x >= page_width / 2) != (caption.x >= page_width / 2)
+                and other.y < y1
+                for other in captions
+            ):
+                # The other column has a figure of its own in this height:
+                # this figure stays in its column.
+                if caption.x < page_width / 2:
+                    x1 = min(x1, page_width / 2)
+                else:
+                    x0 = max(x0, page_width / 2)
+            # Not the running head above the figure.
+            heads = [item.y for item in fragments if item.y > page_height - 70 and item.y > y0 and item.text.strip()]
+            if heads:
+                y1 = min(y1, min(heads) - 3)
+            if x1 - x0 > 0.6 * page_width:
+                margin = max(0.0, min(caption.x, min((item.x for item in fragments if len(item.text.strip()) > 30), default=caption.x)) - 8)
+                x0, x1 = max(x0, margin), min(x1, page_width - margin)
+            if y1 - y0 > 0.55 * page_height:
+                # The area reaches far up the page (no body text above the
+                # figure): only trust it around tiles that lie inside it.
+                inside = [
+                    tile
+                    for tile in tiles
+                    if x0 - 6 <= tile.x0 and tile.x1 <= x1 + 6 and y0 - 6 <= tile.y0 and tile.y1 <= y1 + 6
+                    and (tile.x1 - tile.x0) * (tile.y1 - tile.y0) < 0.35 * page_width * page_height
+                ]
+                if len(inside) < len(tiles) or not inside:
+                    continue  # tile positions in a form's coordinates: keep the tiles
+                x0 = min(tile.x0 for tile in inside) - 24
+                x1 = max(tile.x1 for tile in inside) + 24
+                y0 = max(y0, min(tile.y0 for tile in inside) - 24)
+                y1 = min(y1, max(tile.y1 for tile in inside) + 24)
+            # Tiles can bleed past the page edge.
+            x0, y0 = max(0.0, x0), max(0.0, y0)
+            x1, y1 = min(page_width, x1), min(page_height, y1)
+            if x1 - x0 < 20 or y1 - y0 < 20:
+                continue
+            if page is None:
+                page = pdfium_document[page_number - 1]
+                rendered_page = page.render(scale=3).to_pil().convert("L")
+            from PIL import Image, ImageChops
+
+            # Grow any side that cuts through the drawing until it reaches a
+            # blank line: the area can stop short of a figure's edge (a
+            # figure wider than the text, labels above the panels).
+            scale = 3
+            left, right = int(x0 * scale), int(x1 * scale)
+            top, bottom = int((page_height - y1) * scale), int((page_height - y0) * scale)
+            width, height = rendered_page.size
+
+            # Lines of text (body, captions) stop the growth: the figure ends
+            # where the writing begins.
+            text_boxes = [
+                (
+                    item.x * scale,
+                    (page_height - item.y - 0.8 * item.size) * scale,
+                    (item.x + 0.5 * item.size * len(item.text.strip())) * scale,
+                    (page_height - item.y + 0.25 * item.size) * scale,
+                )
+                for item in fragments
+                if _caption_identity(item.text)
+                or (
+                    len(words := re.findall(r"[A-Za-z][A-Za-z'-]+", item.text)) >= 5
+                    and sum(word[0].islower() for word in words) >= 0.6 * len(words)
+                )
+            ]
+
+            def inked(box: tuple[int, int, int, int]) -> bool:
+                if any(
+                    text[0] < box[2] and box[0] < text[2] and text[1] < box[3] and box[1] < text[3]
+                    for text in text_boxes
+                ):
+                    return False
+                strip = rendered_page.crop(box).point(lambda value: 255 if value < 200 else 0)
+                histogram = strip.histogram()
+                return histogram[255] > 0.01 * max(1, (box[2] - box[0]) * (box[3] - box[1]))
+
+            limit_x, limit_y = int(0.35 * width), int(0.35 * height)
+            start = (left, top, right, bottom)
+            for _ in range(400):
+                grown = False
+                if top > 0 and top > start[1] - limit_y and inked((left, top, right, top + 1)):
+                    top -= 3
+                    grown = True
+                if bottom < height and bottom < start[3] + limit_y and inked((left, bottom - 1, right, bottom)):
+                    bottom += 3
+                    grown = True
+                if left > 0 and left > start[0] - limit_x and inked((left, top, left + 1, bottom)):
+                    left -= 3
+                    grown = True
+                if right < width and right < start[2] + limit_x and inked((right - 1, top, right, bottom)):
+                    right += 3
+                    grown = True
+                if not grown:
+                    break
+            left, top = max(0, left), max(0, top)
+            right, bottom = min(width, right), min(height, bottom)
+            # Never into the caption below the figure.
+            caption_size = max((item.size for item in fragments if abs(item.y - caption.y) <= 2), default=9.0)
+            caption_top = int((page_height - caption.y - 0.8 * caption_size) * scale)
+            if caption_top >= start[3] - 5:
+                bottom = min(bottom, caption_top)
+            if right - left < 60 or bottom - top < 60:
+                continue
+            image = page.render(scale=scale, crop=(left / scale, page_height - bottom / scale, page_width - right / scale, top / scale)).to_pil().convert("RGB")
+            content = ImageChops.difference(image, Image.new("RGB", image.size, "white")).getbbox()
+            if not content:
+                continue
+            image = image.crop(
+                (max(0, content[0] - 9), max(0, content[1] - 9), min(image.width, content[2] + 9), min(image.height, content[3] + 9))
+            )
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"page-{page_number:03d}-figure-{identity[1]:02d}-whole.png"
+            image.save(asset_dir / filename, format="PNG", optimize=True)
+            merged = {tile.asset for tile in tiles}
+            first = next(position for position, asset in enumerate(leader.assets) if asset in merged)
+            kept = [asset for asset in leader.assets if asset not in merged]
+            kept.insert(min(first, len(kept)), f"{url_prefix.rstrip('/')}/{filename}")
+            leader.assets = kept
+            for asset in merged:
+                (asset_dir / asset.rsplit("/", 1)[-1]).unlink(missing_ok=True)
+    finally:
+        if page is not None:
+            page.close()
 
 
 def _word_tokens(value: str) -> set[str]:
@@ -2251,6 +2488,14 @@ def _is_math_fragment(text: str, font_name: str) -> bool:
     value = text.strip()
     if not value or len(re.findall(r"[A-Za-z]{3,}", value)) >= 2:
         return False  # a run of prose words is never one expression
+    if len(re.findall(r"[A-Za-z]{2,}", value)) >= 3 and not MATH_FONT_PATTERN.search(font_name):
+        return False  # ", an accent as in ˆ": text that ends in an accent
+    if (
+        re.search(r"[A-Za-z]{2,}", value)
+        and not MATH_FONT_PATTERN.search(font_name)
+        and not MATH_CHARACTER_PATTERN.search(re.sub(r"[ˆ˜¯˙¨´`ˇ˘]", "", value))
+    ):
+        return False  # " or ¯": a word followed by the accent of the next letter
     if re.search(rf"[{CJK_CHARACTER}]", value):
         return False
     if ITALIC_FONT_PATTERN.search(font_name) and re.fullmatch(r"[A-Za-z]{1,2}\d?", value):
@@ -2274,11 +2519,29 @@ def _inline_math_spans(
     """
     spans: list[list[int]] = []
     current: list[int] = []
+    # The font of the body text: brackets in another font (CMR10 in a Times
+    # paper) are math brackets.
+    weights: Counter[str] = Counter()
+    for order, fragment in enumerate(fragments):
+        if order < len(fonts):
+            weights[fonts[order].split("+")[-1]] += len(fragment.text.strip())
+    body_font = weights.most_common(1)[0][0] if weights else ""
+
+    def big_symbol(order: int) -> bool:
+        # A radical or a big delimiter from the extension font is drawn
+        # from above the line down to it.
+        return order < len(fonts) and bool(re.search(r"CMEX|txex|ntxex|NewTXEX|esint", fonts[order], re.I))
 
     def same_line(order: int) -> bool:
-        base = fragments[current[0]]
         last = fragments[current[-1]]
         fragment = fragments[order]
+        # The line is set by the run's first ordinary character, not by a
+        # radical that starts above it.
+        line_start = next((position for position in current if not big_symbol(position)), None)
+        if line_start is None or big_symbol(order):
+            first = fragments[current[0]]
+            return abs(fragment.y - last.y) <= 1.6 * max(last.size, fragment.size) and fragment.x >= first.x - 1
+        base = fragments[line_start]
         # pypdf can report the start of the line as a fragment's x, so only
         # the line (y) and the reading direction are trusted here.
         # A subscript under a superscript starts where the superscript did,
@@ -2292,7 +2555,11 @@ def _inline_math_spans(
         depth = 0
         for opener, closer in ("()", "[]", "{}", "⟨⟩"):
             depth += content.count(opener) - content.count(closer)
-        depth += content.count("|") % 2 + content.count("‖") % 2 + content.count("∥") % 2
+        # The bar of a set {x | G(x) = d} separates; it opens nothing.
+        bars = content
+        while re.search(r"\{[^{}]*\}", bars):
+            bars = re.sub(r"\{[^{}]*\}", " ", bars)
+        depth += bars.count("|") % 2 + bars.count("‖") % 2 + bars.count("∥") % 2
         return depth
 
     def close() -> None:
@@ -2351,7 +2618,23 @@ def _inline_math_spans(
             # "(0, 0, 1)" after d_p = belongs to the expression.
             current.append(order)
             continue
-        if current and open_brackets(current) > 0 and re.fullmatch(r"\s*[^\W_]{1,3}(?:\s*[,;]\s*[^\W_]{1,3})*\s*[)\]}|‖∥⟩]*[.,;:]?\s*", fragment.text):
+        if (
+            not current
+            and re.fullmatch(r"\s*[(\[]\s*", fragment.text)
+            and order < len(fonts)
+            and body_font
+            and fonts[order].split("+")[-1] != body_font
+        ):
+            # "[ a b ]": a bracket in a math font opens an expression; it is
+            # dropped again when nothing closes it.
+            current.append(order)
+            continue
+        if (
+            current
+            and open_brackets(current) > 0
+            and len(fragment.text.strip()) <= 12
+            and re.fullmatch(r"\s*[^\W_]{1,3}(?:\s*[,;]?\s*[^\W_]{1,3})*\s*[)\]}|‖∥⟩]*[.,;:]?\s*", fragment.text)
+        ):
             # Inside "G(" or "|": a bold or upright variable ("x" in G(x))
             # set in a text font is still part of the expression.
             current.append(order)
@@ -2644,8 +2927,109 @@ def _table_line_is_prose(joined: str) -> bool:
     return bool(re.search(r"[.:;]\s*$", joined.strip())) and numbers < 3
 
 
+def _page_rules(page: Any) -> list[tuple[float, float, float]]:
+    """Horizontal rules drawn on a page, as (left, y, right).
+
+    Tables set with booktabs or \\hline draw thin full-width lines above
+    and below their rows; they mark a table's extent better than its text.
+    """
+    try:
+        import pypdfium2.raw as pdfium_c
+
+        pieces = []
+        for item in page.get_objects(filter=(pdfium_c.FPDF_PAGEOBJ_PATH,), max_depth=8):
+            left, bottom, right, top = item.get_bounds()
+            if top - bottom <= 2.5 and right - left >= 3:
+                pieces.append((float(left), float(bottom + top) / 2, float(right)))
+    except Exception:
+        return []
+    # Word processors draw a rule as one piece per cell: join the pieces
+    # that continue each other on the same height.
+    rules: list[tuple[float, float, float]] = []
+    for left, y, right in sorted(pieces, key=lambda piece: (round(piece[1] * 2), piece[0])):
+        if rules and abs(rules[-1][1] - y) <= 0.6 and left <= rules[-1][2] + 3:
+            rules[-1] = (rules[-1][0], rules[-1][1], max(rules[-1][2], right))
+        else:
+            rules.append((left, y, right))
+    return [rule for rule in rules if rule[2] - rule[0] >= 40]
+
+
+def _ruled_table(
+    caption: PositionedCaption,
+    rules: list[tuple[float, float, float]],
+    captions: list[PositionedCaption],
+    body: float,
+) -> tuple[float, float, float, float] | None:
+    """The rows of a table drawn between rules next to its caption.
+
+    The first rule is the one nearest the caption on either side; further
+    rules of the same width (or shorter ones inside it, such as cmidrule)
+    follow it away from the caption until another caption. The table runs
+    from the first to the last full-width rule. Returns (left, low, right,
+    high) or None when the table has no such rules.
+    """
+    best: tuple[float, tuple[float, float, float, float]] | None = None
+    for below in (True, False):
+        side = sorted(
+            (rule for rule in rules if (caption.y - rule[1] if below else rule[1] - caption.y) > 1),
+            key=lambda rule: abs(rule[1] - caption.y),
+        )
+        near = [
+            rule
+            for rule in side
+            if abs(rule[1] - caption.y) <= (6.0 if below else 3.0) * body
+            and rule[0] - max(30.0, 0.2 * (rule[2] - rule[0])) <= caption.x <= rule[2]
+        ]
+        if not near:
+            continue
+        first = near[0]
+        width = first[2] - first[0]
+        chain = [first]
+        for rule in side[side.index(first) + 1 :]:
+            if rule[0] < first[0] - 6 or rule[2] > first[2] + 6:
+                continue  # a rule of something wider
+            between = [
+                other
+                for other in captions
+                if other is not caption
+                and min(chain[-1][1], rule[1]) < other.y < max(chain[-1][1], rule[1])
+                and first[0] - max(30.0, 0.2 * width) <= other.x <= first[2]
+            ]
+            if between or abs(rule[1] - chain[-1][1]) > 40 * body:
+                break
+            chain.append(rule)
+        full = [rule for rule in chain if (rule[2] - rule[0]) >= 0.9 * width]
+        if len(full) < 2:
+            continue
+        ys = [rule[1] for rule in full]
+        found = (first[0], min(ys), first[2], max(ys))
+
+        def gap(other: PositionedCaption) -> float:
+            # How far a caption is from the ruled area, above or below it.
+            return found[1] - other.y if other.y < found[1] else (other.y - found[3] if other.y > found[3] else -1.0)
+
+        own = gap(caption)
+        if any(
+            other is not caption
+            and found[0] - max(30.0, 0.2 * width) <= other.x <= found[2]
+            and 0 <= gap(other) < own
+            for other in captions
+        ):
+            continue  # the rules belong to the table of a nearer caption
+        # The table is on the side of the nearer rule: a caption under its
+        # table has the next table's rules below it, further away. A
+        # caption over its table can wrap, so distances below count less.
+        distance = abs(first[1] - caption.y) * (0.6 if below else 1.0)
+        if best is None or distance < best[0]:
+            best = (distance, found)
+    return best[1] if best else None
+
+
 def _table_blocks(
-    fragments: list[LayoutFragment], captions: list[PositionedCaption], page_width: float
+    fragments: list[LayoutFragment],
+    captions: list[PositionedCaption],
+    page_width: float,
+    rules: list[tuple[float, float, float]] | None = None,
 ) -> list[dict[str, Any]]:
     """The body of each text table next to its "Table N." caption.
 
@@ -2663,6 +3047,29 @@ def _table_blocks(
     body = sizes[len(sizes) // 2]
     caption_starts = {(round(caption.x), round(caption.y)) for caption in captions}
     blocks: list[dict[str, Any]] = []
+    # Cells can also report one shared, meaningless position (0, 0).
+    shared = Counter((round(item.x), round(item.y)) for item in fragments)
+
+    def stream_cells(orders: set[int], low: float, high: float, x_from: float, x_to: float) -> set[int]:
+        """pypdf can report a cell at the start of its text chunk, outside
+        the box; cells drawn in the table's run of the stream, within its
+        rows or at a shared bogus position, belong to it unless they read as
+        a sentence."""
+        orders = set(orders)
+        first, last = min(orders), max(orders)
+        while last + 1 < len(fragments) and shared[(round(fragments[last + 1].x), round(fragments[last + 1].y))] >= 3:
+            last += 1
+        for item in fragments[first : last + 1]:
+            bogus = shared[(round(item.x), round(item.y))] >= 3
+            inside = low - 2 <= item.y <= high + 2 and x_from - 2 <= item.x < x_to
+            if item.order in orders or not (bogus or inside):
+                continue
+            words = re.findall(r"[A-Za-z][A-Za-z'-]+", item.text)
+            if len(words) >= 4 and sum(word[0].islower() for word in words) >= 0.6 * len(words):
+                continue
+            orders.add(item.order)
+        return orders
+
     for caption in captions:
         identity = _caption_identity(caption.text)
         if not identity or identity[0] != "table":
@@ -2729,6 +3136,65 @@ def _table_blocks(
                 previous_y = y
             return kept
 
+        ruled = _ruled_table(caption, rules or [], captions, body)
+        if ruled:
+            # Everything between the table's rules is the table, even rows
+            # that read like sentences; small notes right under the last
+            # rule ("†Tables set in text ...") belong to it as well.
+            x_from, rule_low, x_to, rule_high = ruled
+            x_from, x_to = x_from - 4, x_to + 4
+            inside = [item for item in fragments if item.text.strip() and x_from - 2 <= item.x < x_to and rule_low - 1 < item.y < rule_high + 1]
+            notes: list[LayoutFragment] = []
+            floor = rule_low
+            for item in sorted(
+                (item for item in fragments if item.text.strip() and x_from - 2 <= item.x < x_to and item.y <= rule_low - 1),
+                key=lambda entry: -entry.y,
+            ):
+                if floor - item.y > 1.8 * body or item.size >= 0.9 * body:
+                    break
+                notes.append(item)
+                floor = item.y
+            if not inside:
+                continue
+            members = inside + notes
+            orders = stream_cells(
+                {item.order for item in inside},
+                rule_low,
+                rule_high,
+                x_from,
+                x_to,
+            ) | {item.order for item in notes}
+            # The caption is translated: never take its words.
+            orders -= {item.order for item in fragments if abs(item.y - caption.y) <= 1.5 and item.x >= caption.x - 2}
+            # A note under the table that reads as a sentence stays in the text too.
+            note_lines: dict[int, list[LayoutFragment]] = {}
+            for item in notes:
+                note_lines.setdefault(round(item.y / 2), []).append(item)
+            kept_text = {
+                item.order
+                for line in note_lines.values()
+                if len(re.findall(r"[A-Za-z][A-Za-z'-]+", " ".join(entry.text for entry in line))) >= 3
+                for item in line
+            }
+            # The note's mark ("†") is raised: keep it with its sentence.
+            staying = [
+                other
+                for other in fragments
+                if (other.order not in orders or other.order in kept_text)
+                and len(re.findall(r"[A-Za-z][A-Za-z'-]+", other.text)) >= 3
+            ]
+            kept_text |= {
+                item.order
+                for item in fragments
+                if item.order in orders
+                and len(item.text.strip()) <= 2
+                and not item.text.strip().isalnum()
+                and any(abs(item.y - other.y) <= 0.6 * body and 0 <= other.x - item.x <= 30 for other in staying)
+            }
+            low = min([rule_low, *(item.y for item in notes)]) - 0.4 * body
+            high = rule_high + 0.6 * body
+            blocks.append({"identity": identity, "orders": sorted(orders - kept_text), "box": (x_from, low, x_to, high)})
+            continue
         full = (left_margin - 4, right_margin + 4)
         column = full if single else ((left_margin - 4, midpoint - 2) if caption.x < midpoint else (midpoint - 2, right_margin + 4))
         # A caption that runs past the middle of the page belongs to a
@@ -2800,24 +3266,7 @@ def _table_blocks(
             for item in line
         }
         kept_text |= {item.order for item in members if sentence_like(item.text) and item.x <= text_left + 6}
-        # pypdf can report a cell at the start of its text chunk, outside
-        # the box; cells drawn in the table's run of the stream, within its
-        # rows, belong to it unless they read as a sentence.
-        orders = {item.order for item in members}
-        first, last = min(orders), max(orders)
-        # Cells can also report one shared, meaningless position (0, 0).
-        shared = Counter((round(item.x), round(item.y)) for item in fragments)
-        while last + 1 < len(fragments) and shared[(round(fragments[last + 1].x), round(fragments[last + 1].y))] >= 3:
-            last += 1
-        for item in fragments[first : last + 1]:
-            bogus = shared[(round(item.x), round(item.y))] >= 3
-            inside = low - 2 <= item.y <= high + 2 and x_from - 2 <= item.x < x_to
-            if item.order in orders or not (bogus or inside):
-                continue
-            words = re.findall(r"[A-Za-z][A-Za-z'-]+", item.text)
-            if len(words) >= 4 and sum(word[0].islower() for word in words) >= 0.6 * len(words):
-                continue
-            orders.add(item.order)
+        orders = stream_cells({item.order for item in members}, low, high, x_from, x_to)
         blocks.append(
             {
                 "identity": identity,
@@ -2842,13 +3291,14 @@ def _render_tables(
     """Crop each text table's body; its text leaves the body text."""
     if pdfium_document is None or asset_dir is None:
         return {}
-    blocks = _table_blocks(fragments, captions, page_width)
+    page = pdfium_document[page_index]
+    blocks = _table_blocks(fragments, captions, page_width, _page_rules(page))
     if not blocks:
+        page.close()
         return {}
     from PIL import Image, ImageChops
 
     substitutions: dict[int, str] = {}
-    page = pdfium_document[page_index]
     try:
         for block in blocks:
             left, bottom, right, top = block["box"]
@@ -2924,6 +3374,26 @@ def _render_inline_math(
             kept = [box for order in span for box in char_boxes.get(order, [])]
             if not kept or any(order not in char_boxes for order in span if fragments[order].text.strip()):
                 continue  # not every part was found on the page: keep the text
+            accent = ""
+            before = span[0] - 1
+            match = re.search(r"([ˆ˜¯˙¨´`ˇ˘^~])\s*$", fragments[before].text) if before >= 0 else None
+            if match and before not in dropped and before not in substitutions and char_boxes.get(span[0]):
+                head = char_boxes[span[0]][0]
+                # The accent's own box: right over the first letter, above
+                # its middle (the text before may not have been matched).
+                over = [
+                    box
+                    for box in page_boxes
+                    if box not in kept
+                    and box[2] > head[0] - 0.5
+                    and box[0] < head[2] + 0.5
+                    and box[1] >= (head[1] + head[3]) / 2
+                    and box[1] <= head[3] + 0.6 * base_size
+                    and box[2] - box[0] <= base_size
+                ]
+                if over:
+                    accent = match.group(1)
+                    kept.append(min(over, key=lambda box: box[1]))
             # The baseline of the line: the lowest box bottom of a base-size
             # character, or the first fragment's position.
             base_boxes = [box for order in span if order not in roles for box in char_boxes.get(order, [])]
@@ -2989,6 +3459,11 @@ def _render_inline_math(
                 substitutions[order] = ""
             substitutions[span[0]] = f"{lead}⟦{key}⟧"
             substitutions[span[-1]] = substitutions[span[-1]] + trail
+            if accent:
+                previous_text = fragments[span[0] - 1].text
+                cut = previous_text.rstrip()
+                substitutions[span[0] - 1] = cut[:-1] + previous_text[len(cut):]
+                registry[key]["text"] = f"{accent}{registry[key]['text']}"
     finally:
         page.close()
     return substitutions
@@ -3330,6 +3805,18 @@ def extract_document(
                     positioned_captions,
                     images,
                     float(page.mediabox.width),
+                )
+                _merge_figure_tiles(
+                    pdfium_document,
+                    page_number,
+                    segments[page_start:],
+                    positioned_captions,
+                    images,
+                    layout_fragments,
+                    float(page.mediabox.width),
+                    float(page.mediabox.height),
+                    asset_dir,
+                    asset_url_prefix,
                 )
                 unassigned_assets = _assign_inline_images(
                     segments[page_start:],
