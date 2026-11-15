@@ -1,13 +1,13 @@
 # PLaMo Paper Translator
 
-PLaMo 3 Translate をこのPC上で動かし、PDF論文を一文単位の対訳にするローカルアプリです。論文の内容を外部へ送らずに翻訳できます。
+PLaMo 3 Translate をお使いのPC上で動かし、PDF論文を一文単位の対訳にするローカルアプリです。論文の内容を外部へ送らずに翻訳できます。
 
 - 原文・訳文・箇所別メモを一文ずつ並べて表示。番号付き数式は画像のまま、本文中の下付き・上付き文字も保持します。「数式の表示：すべて画像」を選ぶと、本文中の数式も原文どおりの画像で表示します。数式OCRモデル（任意）を取得すると、番号付き数式の画像からTeXを推定して訳文欄に表示し、コピーして論文やノートに貼り付けられます。
 - 小節構造から生成した目次、「Figure 2」などの参照リンク、ブックマーク、固定クリップで論文の中を行き来できます。
 - 読みながら書けるまとめパネル（Markdown・数式・図の埋め込み）と、翻訳の機械チェック、横断検索できる論文ライブラリ。
 - 結果はHTML / Markdown / JSON へ保存。Chrome拡張のボタン（`Alt + Shift + P`）からも起動できます。
 
-> Built with PLaMo. モデル本体はリポジトリに同梱せず、初回セットアップ時にPFNの公式配布元から取得します。
+> Built with PLaMo. モデル本体はリポジトリに同梱せず、初回セットアップ時にPFNの公式配布元から取得します。数式をTeXにする数式OCRモデル（任意）も同梱せず、使う場合だけ公式配布元から取得します。
 
 ![閲覧画面：左に目次、中央に原文と訳文、右にメモとブックマーク](docs/manual/figures/fig-reader.png)
 
@@ -19,30 +19,46 @@ PLaMo 3 Translate をこのPC上で動かし、PDF論文を一文単位の対訳
 
 ## English
 
-PLaMo Paper Translator turns an academic PDF into a sentence-aligned bilingual document on your own PC. Translation runs locally with PLaMo 3 Translate and llama.cpp, so the paper never leaves your machine. Figures and numbered equations are kept as images, subscripts and superscripts are preserved, and the reader offers an outline, cross-reference links, bookmarks, pinned clips, a Markdown summary panel with math, a quality check and a searchable library. Results can be exported to HTML, Markdown or JSON.
+PLaMo Paper Translator turns an academic PDF into a sentence-aligned bilingual document on your own PC. Translation runs locally with PLaMo 3 Translate and llama.cpp, so the paper never leaves your machine. Figures and numbered equations are kept as images, and an optional local recognition model (LaTeX-OCR) turns numbered equations into TeX you can copy; subscripts and superscripts are preserved, and the reader offers an outline, cross-reference links, bookmarks, pinned clips, a Markdown summary panel with math, a quality check and a searchable library. Results can be exported to HTML, Markdown or JSON.
 
 - **Demo video (about 70 s):** [Read Academic PDFs Side by Side, Fully Offline](https://www.youtube.com/watch?v=3HeDeQIU8pc)
-- **Requirements:** Windows. An NVIDIA GPU is recommended (developed on an RTX 2000 Ada laptop GPU with 16 GB); without one, the Vulkan build of llama.cpp is used. The default 8B model file is about 5.3 GB; a 2B model (1.8 GB) is available for smaller GPUs.
-- **Quick start:** run `Start-PLaMoPaperTranslator.cmd`, read and accept the PLaMo Community License summary, and the setup script downloads llama.cpp and the model from the official sources. The reader opens at `http://127.0.0.1:7865`.
+- **Requirements:** Windows (64-bit). An NVIDIA GPU is recommended and uses the CUDA build of llama.cpp; other GPUs use the Vulkan build. The GPU memory must hold the model file (8B: 5.3 GB, the default; 2B: 1.8 GB) plus working memory for a 16,384-token context, so choose the 2B model on GPUs with little memory. About 10 GB of free disk space is needed for the 8B setup. An internet connection is needed only for setup; translation runs offline. The optional equation model runs on the CPU.
+- **Tested on:** Windows 11 with an NVIDIA RTX 2000 Ada Generation Laptop GPU (16 GB).
+- **Quick start:** run `Start-PLaMoPaperTranslator.cmd`, read and accept the PLaMo Community License summary, and the setup script downloads llama.cpp and the model from the official sources. The reader opens at `http://127.0.0.1:7865`. The equation model for TeX (about 180 MB, MIT License) is optional: the setup script offers it, or use the download button in the translation settings.
 - **Try it:** load [`docs/manual/manual.pdf`](docs/manual/manual.pdf), the app's own user manual written as a paper (CC0).
 - **Languages:** the user interface is in Japanese. Source and target languages include English, Japanese, Chinese, Korean, German and French.
-- **License:** the app's code is MIT. The model is under the [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-ja); translations you publish must show "Built with PLaMo". Commercial use, including use inside an organisation, has its own conditions.
+- **License:** the app's code is MIT. The equation model (LaTeX-OCR / RapidLaTeXOCR) is MIT. The translation model is under the [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-ja); translations you publish must show "Built with PLaMo". Commercial use, including use inside an organisation, has its own conditions.
 
-## このPC向けの構成
+## 動作環境
 
-- GPU: NVIDIA RTX 2000 Ada Generation Laptop GPU、VRAM 16GB
-- 推奨モデル: `pfnet/plamo-3-translate-8b-GGUF` の `Q4_K_M`（5.28GB）
-- 推論: llama.cpp Windows CUDA版
+| 項目 | 条件 |
+|---|---|
+| OS | Windows（64ビット） |
+| GPU | NVIDIA GPUを推奨（llama.cppのCUDA版を使用）。NVIDIA以外のGPUではVulkan版を使用 |
+| GPUメモリー（VRAM） | 翻訳モデルのファイル（8B: 5.28GB、2B: 1.81GB）に加え、文脈長16,384トークン分の作業領域が必要。少ない場合は2Bモデルを選ぶ |
+| ディスク | 8B構成で10GB以上の空き（配布物を作る場合は15GB以上） |
+| ネットワーク | 初回セットアップ（とモデルの取得）のときだけ必要。翻訳はオフラインで動作 |
+| 数式OCR（任意） | CPUで動作し、GPUは使わない。モデルは約180MB |
+
+### 既定の構成
+
+- 翻訳モデル: `pfnet/plamo-3-translate-8b-GGUF` の `Q4_K_M`（5.28GB）
+- 推論: llama.cpp（NVIDIA GPUではCUDA版、それ以外はVulkan版）
 - 文脈長: 16,384トークン
 - UI: `127.0.0.1` のみに公開するローカルWeb UI
+- 数式OCR（任意）: LaTeX-OCR のONNX版をONNX RuntimeでCPU実行
 
-31B Q4_K_M は約19.53GBでVRAM容量を超えるため既定にはしていません。8Bで重い場合は `setup.ps1 -ModelSize 2b` を使うと、1.81GBの2Bモデルに切り替えられます。
+8Bで重い場合やVRAMが足りない場合は、`setup.ps1 -ModelSize 2b` で1.81GBの2Bモデルに切り替えられます。31Bモデル（Q4_K_Mで約19.53GB）は一般的なGPUのVRAMに収まらないため、セットアップスクリプトでは取得しません。
+
+### 動作確認環境
+
+Windows 11、NVIDIA RTX 2000 Ada Generation Laptop GPU（VRAM 16GB）、8Bモデルで開発・確認しています。
 
 ## 最初の起動
 
 1. `Start-PLaMoPaperTranslator.cmd` をダブルクリックします。
 2. 初回はライセンスの要点と公式URLが表示されます。内容を確認して `yes` と入力します。
-3. llama.cpp、PLaMo 3 Translate 8B、PDF処理ライブラリが取得されます（合計約6GB）。
+3. llama.cpp、PLaMo 3 Translate 8B、PDF処理ライブラリと数式OCR用のONNX Runtimeが取得されます（合計約6GB）。最後に数式OCRモデル（任意、約180MB）を取得するか聞かれます。`no` でも、あとから翻訳設定画面で取得できます。
 4. セットアップ後、もう一度 `Start-PLaMoPaperTranslator.cmd` を開きます。
 5. ブラウザで `http://127.0.0.1:7865` が開きます。
 
@@ -80,10 +96,11 @@ Set-ExecutionPolicy -Scope Process Bypass
 スクリプトは次の処理を行います。
 
 1. PLaMo Community Licenseと公式モデルURLを表示し、同意を確認します。
-2. `.venv/` を作り、`pypdf`、図処理用の `Pillow`、数式画像化用の `pypdfium2 / PDFium` をインストールします。
+2. `.venv/` を作り、`pypdf`、図処理用の `Pillow`、数式画像化用の `pypdfium2 / PDFium`、数式OCR用の `onnxruntime` と `numpy` をインストールします。
 3. NVIDIA GPUがあればllama.cppのWindows CUDA 12.4版、なければVulkan版を公式GitHub Releasesから取得します。
 4. PFN公式Hugging Faceからモデルとチャットテンプレートを取得します。
 5. GGUFヘッダー、ファイルサイズ、SHA-256をHugging Face公式APIの現在値と照合します。
+6. 数式OCRモデル（任意）を取得するか確認し、`yes` なら `models/latex-ocr/` に保存します。
 
 既定の8Bモデル:
 
@@ -140,10 +157,36 @@ Get-ChildItem .\runtime -Filter llama-server.exe -Recurse
 nvidia-smi
 ```
 
+### 数式OCRモデル（任意）
+
+番号付き数式の画像からTeXを推定し、訳文欄にコピー用として表示するためのモデルです。翻訳には不要で、使わない場合は取得しなくてかまいません。次のどれかの方法で取得します。
+
+- アプリの翻訳設定画面（STEP 02）の「数式OCRモデルを取得」を押す
+- `setup.ps1` の最後の確認で `yes` と入力する
+- 下の手順で手動で取得する
+
+| 項目 | 値 |
+|---|---|
+| モデル | LaTeX-OCR（pix2tex）のONNX版。RapidLaTeXOCR の公開リリース `v0.0.0` |
+| ライセンス | MIT License（LaTeX-OCR、RapidLaTeXOCR とも） |
+| ファイル | `image_resizer.onnx`（約39MB）、`encoder.onnx`（約89MB）、`decoder.onnx`（約51MB）、`tokenizer.json` |
+| 保存先 | `models/latex-ocr/` |
+| 実行 | ONNX RuntimeでCPU実行。GPUとVRAMは使いません。1式あたり約0.2〜3秒 |
+
+```powershell
+New-Item -ItemType Directory -Force .\models\latex-ocr | Out-Null
+$Base = "https://github.com/RapidAI/RapidLaTeXOCR/releases/download/v0.0.0"
+foreach ($File in "image_resizer.onnx", "encoder.onnx", "decoder.onnx", "tokenizer.json") {
+  curl.exe -L --fail --retry 4 -o ".\models\latex-ocr\$File" "$Base/$File"
+}
+```
+
+取得後、翻訳設定画面の「数式のTeX化」が「準備完了」になれば使えます。読み込み済みの論文は、開いたときに数式を認識します。
+
 ### モデル取得時の注意
 
 - 空き容量は8B構成で最低10GB、ビルド成果物も作る場合は15GB以上を推奨します。
-- モデルはGit管理対象外です。`.gitignore` により `.gguf`、ランタイム、論文、翻訳結果はpushされません。
+- モデルはGit管理対象外です。`.gitignore` により `models/` 以下（`.gguf` と数式OCRモデル）、ランタイム、論文、翻訳結果はpushされません。
 - プロキシ環境では `HTTPS_PROXY` を設定してから `setup.ps1` を再実行してください。
 - 組織内利用はPLaMo Community License上の商業目的に含まれます。該当する場合はPFNの条件に従って事前登録または契約を行ってください。
 - 取得元を変更した非公式GGUFは、テンプレートや量子化方式が異なる可能性があるためサポート対象外です。
@@ -185,7 +228,7 @@ nvidia-smi
 
 ## データを消す
 
-論文ごとに消す場合は、ライブラリの各カードの「削除」を使います。すべて消す場合は、アプリを終了してから `data/uploads/`、`data/jobs/`、`data/assets/`、`data/reextract-backups/` の中身を削除してください。モデルも削除する場合は `models/` の `.gguf` を削除します。再度 `setup.ps1` を実行すれば取得できます。
+論文ごとに消す場合は、ライブラリの各カードの「削除」を使います。すべて消す場合は、アプリを終了してから `data/uploads/`、`data/jobs/`、`data/assets/`、`data/reextract-backups/` の中身を削除してください。モデルも削除する場合は `models/` の `.gguf` を、数式OCRモデルも削除する場合は `models/latex-ocr/` を削除します。どちらも再度 `setup.ps1` を実行すれば取得できます（数式OCRモデルは翻訳設定画面からも取得できます）。
 
 ## 開発時のテスト
 
@@ -220,6 +263,10 @@ UIや `static/` を変更した場合、ポータブル版のexeには同梱フ�
 - Pillow: https://python-pillow.org/
 - pypdfium2 / PDFium: https://github.com/pypdfium2-team/pypdfium2
 - KaTeX: https://katex.org/
+- LaTeX-OCR（数式OCRモデル）: https://github.com/lukas-blecher/LaTeX-OCR
+- RapidLaTeXOCR（ONNX版モデル）: https://github.com/RapidAI/RapidLaTeXOCR
+- ONNX Runtime: https://onnxruntime.ai/
+- NumPy: https://numpy.org/
 - Adobe CMap resources: https://github.com/adobe-type-tools/mapping-resources-pdf
 
 生成物を第三者へ提供・公表する場合は、`Built with PLaMo`、生成元の明示、ライセンスの提供など、PLaMo Community License第4条・第5条の条件を確認してください。組織内利用を含む商業目的では、直近事業年度の収入または売上が10億円以下でも事前登録が必要で、超える場合はPFNから別途商業用ライセンスを取得する必要があります。
