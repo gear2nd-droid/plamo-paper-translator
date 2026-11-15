@@ -53,8 +53,8 @@ async function upload(file) {
 async function startJob() {
   if (!state.documentId) return toast('先に論文を読み込んでください');
   if (state.summaryOpen) closePaperSummaryPanel();
-  const payload = {document_id: state.documentId, title: $('title').value, source_url: $('sourceUrl').value, segmentation_mode: document.querySelector('input[name="segmentationMode"]:checked').value, source_lang: $('sourceLang').value, target_lang: $('targetLang').value, form: $('form').value, context: $('context').value, glossary: $('glossary').value};
-  state.resultsReady = false; state.segments = []; state.paperTags = []; state.paperSummary = ''; state.paperSourceUrl = ''; state.paperReadingStatus = 'unread'; state.readingIndex = 0;
+  const payload = {document_id: state.documentId, title: $('title').value, source_url: $('sourceUrl').value, segmentation_mode: document.querySelector('input[name="segmentationMode"]:checked').value, math_mode: document.querySelector('input[name="mathMode"]:checked').value, source_lang: $('sourceLang').value, target_lang: $('targetLang').value, form: $('form').value, context: $('context').value, glossary: $('glossary').value};
+  state.resultsReady = false; state.segments = []; state.inlineMath = null; state.paperTags = []; state.paperSummary = ''; state.paperSourceUrl = ''; state.paperReadingStatus = 'unread'; state.readingIndex = 0;
   $('step3').classList.remove('results-ready');
   showStep(3); $('progressBox').classList.remove('hidden'); $('readerLayout').classList.add('hidden'); $('results').innerHTML = '';
   try {
@@ -101,6 +101,7 @@ function showResults(data) {
   const loadedSegments = (data.segments || []).map((item) => ({...item, clips:itemClips(item)}));
   const referenceLayout = prepareReferenceLayout(loadedSegments);
   state.segments = referenceLayout.segments;
+  state.inlineMath = null;
   state.referenceTargets = referenceLayout.targets;
   state.referenceHistory = [];
   state.paperTags = Array.isArray(data.tags) ? data.tags.filter((tag) => typeof tag === 'string') : [];
@@ -313,13 +314,38 @@ function referenceIdentity(text) {
 // Subscripts and superscripts recognised from the PDF layout: E_{algo}, b^{⋆}.
 const SCRIPT_MARKUP_PATTERN = /([_^])\{([^{}\n]{1,80})\}/g;
 
-/** Turn script markup in already-escaped HTML into <sub>/<sup>. */
-function renderScripts(html) {
-  return String(html).replace(SCRIPT_MARKUP_PATTERN, (_, kind, content) => (kind === '_' ? `<sub>${content}</sub>` : `<sup>${content}</sup>`));
+// Inline math kept as images ("すべて画像"): the text carries ⟦M12⟧ and
+// each row maps the key to the image, its text and its size.
+const INLINE_MATH_PATTERN = /⟦(M\d{1,6})⟧/g;
+
+function inlineMathMap() {
+  if (!state.inlineMath) {
+    state.inlineMath = new Map();
+    (state.segments || []).forEach((item) => Object.entries(item.inline_math || {}).forEach(([key, value]) => state.inlineMath.set(key, value)));
+  }
+  return state.inlineMath;
 }
 
+/** Turn script markup in already-escaped HTML into <sub>/<sup>, and ⟦M12⟧ into the expression's image. */
+function renderScripts(html) {
+  const math = inlineMathMap();
+  return String(html)
+    .replace(SCRIPT_MARKUP_PATTERN, (_, kind, content) => (kind === '_' ? `<sub>${content}</sub>` : `<sup>${content}</sup>`))
+    .replace(INLINE_MATH_PATTERN, (token, key) => {
+      const item = math.get(key);
+      if (!item) return token;
+      const height = Number(item.height) || 1.2;
+      const depth = Number(item.depth) || 0.3;
+      return `<img class="inline-math" src="${escapeHtml(item.src)}" alt="${escapeHtml(item.text || '')}" title="${escapeHtml(item.text || '')}" style="height:${height.toFixed(3)}em;vertical-align:-${depth.toFixed(3)}em" loading="lazy">`;
+    });
+}
+
+/** Plain text: E_{algo} -> Ealgo, ⟦M12⟧ -> the expression's text. */
 function stripScripts(value) {
-  return String(value ?? '').replace(SCRIPT_MARKUP_PATTERN, '$2');
+  const math = inlineMathMap();
+  return String(value ?? '')
+    .replace(INLINE_MATH_PATTERN, (token, key) => (math.get(key)?.text ?? token))
+    .replace(SCRIPT_MARKUP_PATTERN, '$2');
 }
 
 function renderReferencedText(value, currentIndex) {
@@ -525,7 +551,7 @@ function renderLibraryItem(item) {
   const source = item.source_url ? `<a class="library-source" href="${escapeHtml(item.source_url)}" target="_blank" rel="noreferrer">原文を開く ↗</a>` : '';
   const busy = item.status === 'queued' || item.status === 'running';
   const deleteButton = `<button type="button" class="library-delete" data-library-delete="${escapeHtml(item.id)}" data-library-title="${escapeHtml(item.title || 'Untitled')}"${busy ? ' disabled title="翻訳中は削除できません"' : ''}>削除</button>`;
-  const reextractButton = `<button type="button" class="library-reextract" data-library-reextract="${escapeHtml(item.id)}" data-library-title="${escapeHtml(item.title || 'Untitled')}"${busy ? ' disabled title="翻訳中は再抽出できません"' : ' title="最新の抽出処理で読み直します。訳文・メモ・ブックマーク・まとめは引き継ぎます"'}>再抽出</button>`;
+  const reextractButton = `<button type="button" class="library-reextract" data-library-reextract="${escapeHtml(item.id)}" data-math-mode="${escapeHtml(item.math_mode || 'standard')}" data-library-title="${escapeHtml(item.title || 'Untitled')}"${busy ? ' disabled title="翻訳中は再抽出できません"' : ' title="最新の抽出処理で読み直します。訳文・メモ・ブックマーク・まとめは引き継ぎます"'}>再抽出</button>`;
   return `<article class="library-card">
     <div class="library-card-main"><h3>${escapeHtml(item.title || 'Untitled')}</h3>
       <div class="library-card-meta"><span class="library-state">${escapeHtml(READING_STATUS_LABELS[item.reading_status] || item.reading_status)}</span><span>${Number(item.total) || 0}セグメント</span><span>更新 ${escapeHtml(formatLibraryDate(item.updated_at || item.created_at))}</span></div>
@@ -594,31 +620,54 @@ function openLibraryJob(jobId) {
   location.href = `/?job=${encodeURIComponent(jobId)}`;
 }
 
-async function reextractLibraryJob(jobId, title, button) {
+function openReextractDialog(jobId, title, mathMode) {
   if (!/^[a-f0-9]{32}$/.test(jobId || '')) return;
-  const question = `「${title || 'Untitled'}」を最新の抽出処理で読み直します。\n\n` +
-    '・本文が変わらない行の訳文、メモ、ブックマーク、クリップ、まとめはそのまま引き継ぎます。\n' +
-    '・新しい行や変わった行だけを翻訳し直します（手で直した訳文は履歴に残ります）。\n' +
-    '・実行前の状態は data/reextract-backups に保存します。\n\n再抽出しますか？';
-  if (!window.confirm(question)) return;
-  button.disabled = true;
-  button.textContent = '再抽出中…';
+  state.reextractJobId = jobId;
+  $('reextractPaperTitle').textContent = title || 'Untitled';
+  const mode = mathMode === 'images' ? 'images' : 'standard';
+  document.querySelectorAll('input[name="reextractMathMode"]').forEach((input) => { input.checked = input.value === mode; });
+  $('reextractStatus').textContent = '';
+  $('reextractStatus').className = 'dialog-status';
+  $('reextractConfirm').disabled = false;
+  $('reextractCancel').disabled = false;
+  $('reextractDialog').showModal();
+  $('reextractCancel').focus();
+}
+
+function closeReextractDialog() {
+  if ($('reextractConfirm').disabled) return;
+  state.reextractJobId = null;
+  if ($('reextractDialog').open) $('reextractDialog').close();
+}
+
+async function reextractLibraryJob() {
+  const jobId = state.reextractJobId;
+  if (!jobId) return;
+  const mathMode = document.querySelector('input[name="reextractMathMode"]:checked')?.value || 'standard';
+  $('reextractConfirm').disabled = true;
+  $('reextractCancel').disabled = true;
+  $('reextractStatus').className = 'dialog-status saving';
+  $('reextractStatus').textContent = '読み直しています…（数式を画像にする場合は少し時間がかかります）';
   try {
-    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/reextract`, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/reextract`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({math_mode:mathMode})});
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || '再抽出できません');
     const moved = data.moved_notes ? `、メモ${data.moved_notes}件を近い行へ移動` : '';
     const pending = data.translating ? `。${data.needs_translation}行を翻訳しています` : '';
     toast(`再抽出しました：${data.old_rows}→${data.new_rows}行、訳文${data.kept_translations}行を引き継ぎ${moved}${pending}`);
+    $('reextractConfirm').disabled = false;
+    $('reextractCancel').disabled = false;
+    closeReextractDialog();
     if (state.jobId === jobId) {
       openLibraryJob(jobId);
       return;
     }
     await loadLibrary();
   } catch (error) {
-    toast(error.message || '再抽出できません');
-    button.disabled = false;
-    button.textContent = '再抽出';
+    $('reextractStatus').className = 'dialog-status error';
+    $('reextractStatus').textContent = error.message || '再抽出できません';
+    $('reextractConfirm').disabled = false;
+    $('reextractCancel').disabled = false;
   }
 }
 
@@ -1155,7 +1204,12 @@ function summaryQuoteFor(item) {
     return `![[${label}]]`;
   }
   if (hasVisualAsset(item)) return `![[#${Number(item.index) + 1}]]`;
-  const text = String(item.translation || item.source || '').replace(/\s+/g, ' ').trim();
+  // Inline math images become their text: the summary is plain Markdown.
+  const math = inlineMathMap();
+  const text = String(item.translation || item.source || '').replace(INLINE_MATH_PATTERN, (token, key) => {
+    const value = math.get(key)?.text;
+    return value ? `\`${value}\`` : token;
+  }).replace(/\s+/g, ' ').trim();
   return `> ${text} [[#${Number(item.index) + 1}]]`;
 }
 
@@ -1221,7 +1275,7 @@ $('libraryDialog').addEventListener('click', (event) => { if (event.target === $
 $('libraryItems').addEventListener('click', (event) => {
   const reextractButton = event.target.closest('[data-library-reextract]');
   if (reextractButton) {
-    reextractLibraryJob(reextractButton.dataset.libraryReextract, reextractButton.dataset.libraryTitle, reextractButton);
+    openReextractDialog(reextractButton.dataset.libraryReextract, reextractButton.dataset.libraryTitle, reextractButton.dataset.mathMode);
     return;
   }
   const deleteButton = event.target.closest('[data-library-delete]');
@@ -1237,6 +1291,10 @@ $('librarySearch').addEventListener('input', () => {
   state.librarySearchTimer = setTimeout(loadLibrary, 260);
 });
 $('libraryStatus').addEventListener('change', loadLibrary);
+$('reextractForm').addEventListener('submit', (event) => { event.preventDefault(); reextractLibraryJob(); });
+$('reextractCancel').addEventListener('click', closeReextractDialog);
+$('reextractDialog').addEventListener('cancel', (event) => { event.preventDefault(); closeReextractDialog(); });
+$('reextractDialog').addEventListener('click', (event) => { if (event.target === $('reextractDialog')) closeReextractDialog(); });
 $('deleteForm').addEventListener('submit', (event) => { event.preventDefault(); deleteLibraryJob(); });
 $('deleteCancel').addEventListener('click', closeDeleteDialog);
 $('deleteDialog').addEventListener('cancel', (event) => { event.preventDefault(); closeDeleteDialog(); });

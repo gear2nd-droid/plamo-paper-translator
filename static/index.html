@@ -73,6 +73,11 @@
               <label><input type="radio" name="segmentationMode" value="sentence" checked><span><b>一文単位</b><small>一文ずつ対訳し、同じ段落の前後文を参考にします</small></span></label>
               <label><input type="radio" name="segmentationMode" value="paragraph"><span><b>段落単位</b><small>段落全体をまとめて翻訳します</small></span></label>
             </fieldset>
+            <fieldset class="mode-switch full">
+              <legend>数式の表示</legend>
+              <label><input type="radio" name="mathMode" value="standard" checked><span><b>標準</b><small>番号付き数式は画像、本文中の数式は文字（上付き・下付きを再現）</small></span></label>
+              <label><input type="radio" name="mathMode" value="images"><span><b>すべて画像</b><small>本文中の数式も原文どおりの画像で表示します</small></span></label>
+            </fieldset>
             <label class="field"><span>原文の言語</span><select id="sourceLang"><option value="auto">自動判定</option><option value="en">英語</option><option value="ja">日本語</option><option value="zh">中国語</option><option value="ko">韓国語</option><option value="de">ドイツ語</option><option value="fr">フランス語</option></select></label>
             <label class="field"><span>翻訳先</span><select id="targetLang"><option value="ja">日本語</option><option value="en">英語</option><option value="zh">中国語</option><option value="ko">韓国語</option><option value="de">ドイツ語</option><option value="fr">フランス語</option></select></label>
             <label class="field"><span>日本語の文体</span><select id="form"><option value="plain">常体（である調）</option><option value="polite">敬体（です・ます調）</option></select></label>
@@ -183,6 +188,24 @@
       <p id="libraryDataDir" class="library-data-dir"></p>
       <div id="libraryItems" class="library-items" aria-live="polite"></div>
     </section>
+  </dialog>
+  <dialog id="reextractDialog" class="confirm-dialog" aria-labelledby="reextractTitle" aria-describedby="reextractMessage">
+    <form id="reextractForm" method="dialog">
+      <header><div><span>RE-EXTRACT</span><h2 id="reextractTitle">論文を読み直しますか？</h2></div></header>
+      <p id="reextractMessage" class="confirm-message">「<b id="reextractPaperTitle"></b>」を最新の抽出処理で読み直します。</p>
+      <ul class="confirm-list">
+        <li>本文が変わらない行の訳文・メモ・ブックマーク・クリップ・まとめはそのまま引き継ぎます。</li>
+        <li>新しい行や変わった行だけを翻訳し直します（手で直した訳文は履歴に残ります）。</li>
+        <li>実行前の状態は data/reextract-backups に保存します。</li>
+      </ul>
+      <fieldset class="mode-switch">
+        <legend>数式の表示</legend>
+        <label><input type="radio" name="reextractMathMode" value="standard"><span><b>標準</b><small>番号付き数式は画像、本文中の数式は文字</small></span></label>
+        <label><input type="radio" name="reextractMathMode" value="images"><span><b>すべて画像</b><small>本文中の数式も画像。切り替えると数式を含む行は訳し直します</small></span></label>
+      </fieldset>
+      <p id="reextractStatus" class="dialog-status" aria-live="polite"></p>
+      <div class="dialog-actions"><button id="reextractCancel" class="secondary small" type="button" autofocus>キャンセル</button><button id="reextractConfirm" class="primary small" type="submit">再抽出する</button></div>
+    </form>
   </dialog>
   <dialog id="deleteDialog" class="confirm-dialog" aria-labelledby="deleteTitle" aria-describedby="deleteMessage">
     <form id="deleteForm" method="dialog">

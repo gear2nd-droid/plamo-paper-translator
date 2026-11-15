@@ -148,6 +148,9 @@ class Segment:
     translation_revisions: list[dict[str, str]] = field(default_factory=list)
     translation_edited_at: str = ""
     translation_origin: str = ""
+    # Inline math kept as images: "M12" -> {"src", "text", "height", "depth"}.
+    # The source and translation carry the token ⟦M12⟧ in its place.
+    inline_math: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         allowed_clip_parts = {"source", "translation", "note"}
@@ -1127,6 +1130,7 @@ def segments_for_mode(segments: Iterable[Segment], mode: str) -> list[Segment]:
                 note="\n".join(member.note for member in members if member.note),
                 bookmarked=any(member.bookmarked for member in members),
                 clips=list(dict.fromkeys(part for member in members for part in member.clips)),
+                inline_math={key: value for member in members for key, value in member.inline_math.items()},
                 heading_level=first.heading_level,
                 paragraph=first.paragraph,
                 sentence=0,
@@ -1813,6 +1817,7 @@ def _apply_script_markup(
     fragment_parts: list[int],
     roles: dict[int, str],
     dropped: set[int] | None = None,
+    substitutions: dict[int, str] | None = None,
 ) -> str:
     """Insert script markup into the extracted text, and leave out ``dropped`` fragments.
 
@@ -1822,17 +1827,22 @@ def _apply_script_markup(
     is skipped. Apart from dropped fragments, markup is only ever inserted,
     so removing it gives back the original text.
     """
-    if not roles and not dropped:
+    if not roles and not dropped and not substitutions:
         return raw
     role_by_part = {fragment_parts[order]: role for order, role in roles.items() if order < len(fragment_parts)}
     dropped_parts = {fragment_parts[order] for order in dropped or () if order < len(fragment_parts)}
+    substituted_parts = {fragment_parts[order]: value for order, value in (substitutions or {}).items() if order < len(fragment_parts)}
     output: list[str] = []
     cursor = 0
     for number, part in enumerate(parts):
         if not part or not raw.startswith(part, cursor):
             continue
         role = role_by_part.get(number)
-        if number in dropped_parts:
+        if number in substituted_parts:
+            # Inline math kept as an image: the first part becomes ⟦M12⟧ and
+            # the rest of the expression is left out.
+            output.append(substituted_parts[number])
+        elif number in dropped_parts:
             # Keep a line break so the text on either side stays apart.
             output.append("\n" if "\n" in part else " ")
         else:
@@ -2206,13 +2216,351 @@ def _attach_cid_to_unicode(page: Any) -> None:
         return
 
 
+INLINE_MATH_TOKEN_PATTERN = re.compile(r"⟦(M\d{1,6})⟧")
+# Fonts that typeset math: TeX (CMMI, CMSY, CMEX, AMS, newtx/txfonts),
+# OpenType math fonts (Cambria Math, STIX Two Math, Latin Modern Math) and
+# the PostScript Symbol font.
+MATH_FONT_PATTERN = re.compile(
+    r"CMMI|CMSY|CMEX|CMBSY|MSAM|MSBM|EUFM|EUSM|RSFS|LMMath|Math|STIX|XITS|txmi|txsy|txex|ntxmi|ntxsy|ntxex|"
+    r"NewTX(?:MI|SY|EX)|zxmi|MTMI|MTSY|Symbol|esint|wasy|stmary",
+    re.I,
+)
+MATH_CHARACTER_PATTERN = re.compile(r"[\U0001D400-\U0001D7FFα-ωΑ-Ωϕϵϑϱϖ∑∏∫∮√∞∂∇∆≤≥≈≠≡±∓×÷·∈∉∀∃∪∩⊂⊃⊆⊇→←↔⇒⇐⇔∥∼≃∝⟨⟩ˆ˜¯⊤⊥∗⋆∘]")
+ITALIC_FONT_PATTERN = re.compile(r"Ital|Oblique|-It\b|-BoldIt", re.I)
+MATH_CONNECTOR_PATTERN = re.compile(r"[\s=+\-−*/^_(){}\[\],.:;|<>0-9′″!·]{1,16}")
+
+
+def _is_math_fragment(text: str, font_name: str) -> bool:
+    value = text.strip()
+    if not value or len(re.findall(r"[A-Za-z]{3,}", value)) >= 2:
+        return False  # a run of prose words is never one expression
+    if re.search(rf"[{CJK_CHARACTER}]", value):
+        return False
+    if ITALIC_FONT_PATTERN.search(font_name) and re.fullmatch(r"[A-Za-z]{1,2}\d?", value):
+        # Times-based papers (mathptmx) set variables in the italic text
+        # font: a lone italic letter is a variable, not emphasis.
+        return True
+    return bool(MATH_FONT_PATTERN.search(font_name) or MATH_CHARACTER_PATTERN.search(value))
+
+
+def _inline_math_spans(
+    fragments: list[LayoutFragment],
+    fonts: list[str],
+    roles: dict[int, str],
+    excluded: set[int],
+) -> list[list[int]]:
+    """Runs of fragments that make one inline expression, in stream order.
+
+    A run starts at a math fragment (math font or math character) and takes
+    the following fragments on the same line while they are math, scripts
+    of it, or short connectors ("=", "(", "2") that lead to more math.
+    """
+    spans: list[list[int]] = []
+    current: list[int] = []
+
+    def same_line(order: int) -> bool:
+        base = fragments[current[0]]
+        last = fragments[current[-1]]
+        fragment = fragments[order]
+        # pypdf can report the start of the line as a fragment's x, so only
+        # the line (y) and the reading direction are trusted here.
+        # A subscript under a superscript starts where the superscript did,
+        # a little left of the superscript's end: anything right of the
+        # expression's start on its line continues it.
+        return abs(fragment.y - base.y) <= 0.75 * max(base.size, fragment.size) and fragment.x >= base.x - 1
+
+    def close() -> None:
+        # A sentence's full stop or comma after the expression stays text.
+        while current and re.fullmatch(r"[\s.,;:]*", fragments[current[-1]].text):
+            current.pop()
+        content = "".join(fragments[order].text for order in current)
+        # "25.3%" set in math mode leaves only a math-font "."; a list
+        # bullet "•" comes from the math symbol font. Neither is an expression.
+        if current and (re.search(r"[^\W\d_]", content) or re.search(r"[∑∏∫√∞∂∇≤≥≈≠≡±∓×÷∈∉∀∃∪∩⊂⊃⊆⊇→←↔⇒⇐⇔∥∼≃∝⊤⊥]", content)):
+            spans.append(list(current))
+        current.clear()
+
+    for order, fragment in enumerate(fragments):
+        if order in excluded or not fragment.text.strip():
+            close()
+            continue
+        is_math = _is_math_fragment(fragment.text, fonts[order] if order < len(fonts) else "")
+        # "R" in a text font followed by its superscript "−1" is the base of R^{−1}.
+        is_base = (
+            order + 1 in roles
+            and order not in roles
+            and order + 1 not in excluded
+            and bool(re.fullmatch(r"\s*[A-Za-z]{1,2}\s*", fragment.text))
+        )
+        if current and not same_line(order):
+            close()
+        scripted = current and order in roles and not re.search(rf"[{CJK_CHARACTER}]", fragment.text)
+        if is_math or is_base or scripted:
+            current.append(order)
+            continue
+        if current and MATH_CONNECTOR_PATTERN.fullmatch(fragment.text):
+            # "(0, 0, 1)" after d_p = belongs to the expression.
+            current.append(order)
+            continue
+        close()
+    close()
+    return spans
+
+
+def _fragment_char_boxes(
+    fragments: list[LayoutFragment], textpage: Any
+) -> tuple[dict[int, list[tuple[float, float, float, float]]], list[tuple[float, float, float, float]]]:
+    """PDFium character boxes of each fragment.
+
+    pypdf reports one position per text chunk (often the start of the
+    line), so a fragment's own x is unreliable. PDFium lists characters in
+    the same content-stream order with exact boxes; the fragments' visible
+    characters are matched against that list in order.
+    """
+    import unicodedata
+
+    def normal(value: str) -> str:
+        # Line-end hyphens differ between the two (PDFium marks them with
+        # U+FFFE), so hyphens and spaces are left out of the comparison.
+        return "".join(
+            character
+            for character in unicodedata.normalize("NFKC", value)
+            if not character.isspace() and character not in "-­￾‐‑"
+        )
+
+    characters: list[tuple[str, tuple[float, float, float, float]]] = []
+    # PDFium counts UTF-16 units: a math letter such as 𝜏 (outside the BMP)
+    # takes two indices, and asking for one index alone returns nothing.
+    index = 0
+    for raw_character in textpage.get_text_range():
+        width = 2 if ord(raw_character) > 0xFFFF else 1
+        character = normal(raw_character)
+        if character:
+            try:
+                characters.append((character, tuple(float(value) for value in textpage.get_charbox(index))))
+            except Exception:
+                pass
+        index += width
+    stream = "".join(character for character, _box in characters)
+    page_extent = max((box[2] for _character, box in characters), default=600.0)
+    # Map each normalised character position back to its box.
+    positions: list[int] = []
+    for number, (character, _box) in enumerate(characters):
+        positions.extend([number] * len(character))
+    result: dict[int, list[tuple[float, float, float, float]]] = {}
+    cursor = 0
+    for order, fragment in enumerate(fragments):
+        wanted = normal(fragment.text)
+        if not wanted:
+            continue
+        def on_line(position: int) -> bool:
+            # pypdf's y is reliable even when its x is not: the match must
+            # sit on the fragment's line (scripts sit a little off it).
+            boxes = [characters[index][1] for index in sorted(set(positions[position : position + len(wanted)]))]
+            boxes = [box for box in boxes if box[2] > box[0] and box[3] > box[1]]
+            if not boxes:
+                return False
+            middle = sum((box[1] + box[3]) / 2 for box in boxes) / len(boxes)
+            centre = sum((box[0] + box[2]) / 2 for box in boxes) / len(boxes)
+            # pypdf's x is at worst the start of the line, so the match lies
+            # to its right and within the same column, never in the other one.
+            return (
+                abs(middle - (fragment.y + 0.3 * fragment.size)) <= 1.2 * fragment.size
+                and fragment.x - 5 <= centre <= fragment.x + 0.45 * page_extent
+            )
+
+        def search(low: int, high: int, backwards: bool = False) -> int:
+            positions_found = []
+            position = stream.find(wanted, max(0, low), max(0, high))
+            while position >= 0:
+                positions_found.append(position)
+                position = stream.find(wanted, position + 1, max(0, high))
+            if backwards:
+                positions_found.reverse()
+            return next((position for position in positions_found if on_line(position)), -1)
+
+        found = search(cursor, cursor + 400 + len(wanted))
+        if found < 0:
+            # Math pieces of one line can come in a slightly different
+            # order: take the nearest occurrence just before the cursor.
+            found = search(cursor - 80, cursor + len(wanted) - 1, backwards=True)
+        if found < 0 and len(wanted) >= 8:
+            # The two orders can differ (a running head first in one of
+            # them); a long fragment on its line re-anchors the search.
+            found = search(0, len(stream))
+        if found < 0:
+            continue
+        indices = sorted(set(positions[found : found + len(wanted)]))
+        boxes = [characters[index][1] for index in indices]
+        result[order] = [box for box in boxes if box[2] > box[0] and box[3] > box[1]] or boxes
+        cursor = found + len(wanted)
+    return result, [box for _character, box in characters]
+
+
+def _render_inline_math(
+    pdfium_document: Any,
+    page_index: int,
+    fragments: list[LayoutFragment],
+    fonts: list[str],
+    roles: dict[int, str],
+    dropped: set[int],
+    page_width: float,
+    page_height: float,
+    asset_dir: Path,
+    url_prefix: str,
+    registry: dict[str, dict[str, Any]],
+) -> dict[int, str]:
+    """Crop each inline expression on the page and return text substitutions.
+
+    The crop is the union of the PDF's own character boxes for the
+    expression, at least one text line high so that every image of a line
+    shares its baseline. Display equations are left to the equation crops.
+    """
+    excluded = set(dropped)
+    for equation in _positioned_equations(fragments, page_width):
+        for order, fragment in enumerate(fragments):
+            if equation.x0 - 2 <= fragment.x <= equation.x1 + 2 and equation.y0 - 2 <= fragment.y <= equation.y1 + 2:
+                excluded.add(order)
+    spans = _inline_math_spans(fragments, fonts, roles, excluded)
+    if not spans:
+        return {}
+    page = pdfium_document[page_index]
+    substitutions: dict[int, str] = {}
+    try:
+        textpage = page.get_textpage()
+        try:
+            char_boxes, page_boxes = _fragment_char_boxes(fragments, textpage)
+        finally:
+            textpage.close()
+        for span in spans:
+            first = fragments[span[0]]
+            base_size = max((fragments[order].size for order in span if order not in roles), default=first.size)
+            kept = [box for order in span for box in char_boxes.get(order, [])]
+            if not kept or any(order not in char_boxes for order in span if fragments[order].text.strip()):
+                continue  # not every part was found on the page: keep the text
+            # The baseline of the line: the lowest box bottom of a base-size
+            # character, or the first fragment's position.
+            base_boxes = [box for order in span if order not in roles for box in char_boxes.get(order, [])]
+            if base_boxes:
+                baseline = sorted(box[1] for box in base_boxes)[len(base_boxes) // 2]
+            else:
+                baseline = first.y
+            # Character boxes hug the glyph outline; italic letters lean past
+            # them, so pad by a fifth of the font size.
+            pad = max(0.8, 0.2 * base_size)
+            left = min(box[0] for box in kept) - pad
+            right = max(box[2] for box in kept) + pad
+            characters = sum(len(re.sub(r"\s", "", fragments[order].text)) for order in span)
+            if right - left > (characters + 3) * base_size or any(abs((box[1] + box[3]) / 2 - baseline) > 1.6 * base_size for box in kept):
+                continue  # matched characters elsewhere on the page: keep the text
+            bottom = min(min(box[1] for box in kept), baseline - 0.3 * base_size) - 0.4
+            top = max(max(box[3] for box in kept), baseline + 0.85 * base_size) + 0.4
+            if right - left < 1 or right - left > 0.9 * page_width:
+                continue
+            image = page.render(scale=3, crop=(left, bottom, page_width - right, page_height - top)).to_pil().convert("RGB")
+            # Paint out neighbouring characters that reach into the padding
+            # (their ink can lean past their boxes), then put the
+            # expression's own glyphs back.
+            own = set(kept)
+            neighbours = [
+                box
+                for box in page_boxes
+                if box not in own and box[2] > left and box[0] < right and box[3] > bottom and box[1] < top
+            ]
+            if neighbours:
+                from PIL import ImageDraw
+
+                original = image.copy()
+                draw = ImageDraw.Draw(image)
+                grow = 0.08 * base_size
+                for box in neighbours:
+                    draw.rectangle(
+                        ((box[0] - grow - left) * 3, (top - box[3] - grow) * 3, (box[2] + grow - left) * 3, (top - box[1] + grow) * 3),
+                        fill="white",
+                    )
+                for box in kept:
+                    region = (
+                        max(0, int((box[0] - left - 0.3) * 3)),
+                        max(0, int((top - box[3] - 0.3) * 3)),
+                        min(image.width, int((box[2] - left + 0.3) * 3) + 1),
+                        min(image.height, int((top - box[1] + 0.3) * 3) + 1),
+                    )
+                    if region[2] > region[0] and region[3] > region[1]:
+                        image.paste(original.crop(region), region[:2])
+            key = f"M{len(registry) + 1}"
+            filename = f"page-{page_index + 1:03d}-math-{key[1:]}.png"
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            image.save(asset_dir / filename, format="PNG", optimize=True)
+            registry[key] = {
+                "src": f"{url_prefix.rstrip('/')}/{filename}",
+                "text": re.sub(r"\s+", " ", "".join(_wrap_script(fragments[order].text, roles[order]) if order in roles else fragments[order].text for order in span)).strip(),
+                "height": round((top - bottom) / base_size, 3),
+                "depth": round((baseline - bottom) / base_size, 3),
+            }
+            lead = re.match(r"\s*", fragments[span[0]].text).group(0)
+            trail = re.search(r"\s*$", fragments[span[-1]].text).group(0)
+            for order in span:
+                substitutions[order] = ""
+            substitutions[span[0]] = f"{lead}⟦{key}⟧"
+            substitutions[span[-1]] = substitutions[span[-1]] + trail
+    finally:
+        page.close()
+    return substitutions
+
+
+def _attach_inline_math(segments: list[Segment], registry: dict[str, dict[str, Any]]) -> None:
+    for segment in segments:
+        segment.inline_math = {key: registry[key] for key in INLINE_MATH_TOKEN_PATTERN.findall(segment.source) if key in registry}
+
+
+def expand_inline_math(text: str, inline_math: dict[str, dict[str, Any]]) -> str:
+    """Replace ⟦M12⟧ with the expression's text, for search and plain export."""
+    return INLINE_MATH_TOKEN_PATTERN.sub(lambda match: str(inline_math.get(match.group(1), {}).get("text", match.group(0))), text)
+
+
+def restore_inline_math(source: str, translation: str) -> str:
+    """Make sure every ⟦M12⟧ of the source appears once in the translation."""
+    for key in INLINE_MATH_TOKEN_PATTERN.findall(source):
+        token = f"⟦{key}⟧"
+        count = translation.count(token)
+        if count == 0:
+            translation = f"{translation.rstrip()} {token}"
+        elif count > 1:
+            first = translation.index(token) + len(token)
+            translation = translation[:first] + translation[first:].replace(token, "")
+    return translation
+
+
+def inline_math_html(escaped: str, inline_math: dict[str, dict[str, Any]], resolve: Callable[[str], str] | None = None) -> str:
+    """Turn ⟦M12⟧ in escaped HTML into an <img> sitting on the text baseline."""
+
+    def image(match: re.Match[str]) -> str:
+        item = inline_math.get(match.group(1))
+        if not item:
+            return match.group(0)
+        src = resolve(item["src"]) if resolve else item["src"]
+        return (
+            f'<img class="inline-math" src="{html.escape(src)}" alt="{html.escape(str(item.get("text", "")))}" '
+            f'style="height:{float(item.get("height", 1.2)):.3f}em;vertical-align:-{float(item.get("depth", 0.3)):.3f}em">'
+        )
+
+    return INLINE_MATH_TOKEN_PATTERN.sub(image, escaped)
+
+
 def extract_document(
     path: Path,
     max_chars: int = 1000,
     *,
     asset_dir: Path | None = None,
     asset_url_prefix: str = "",
+    inline_math_images: bool = False,
 ) -> tuple[list[Segment], int]:
+    """Extract sentence rows from a PDF, text or Markdown file.
+
+    With ``inline_math_images`` every math expression inside the body text
+    is also kept as an image (the "all math as images" mode); otherwise
+    only numbered display equations are.
+    """
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         try:
@@ -2234,7 +2582,8 @@ def extract_document(
         page_margin_parts: list[
             tuple[list[tuple[str, str, float]], list[tuple[float, str, float]], list[tuple[float, str]]]
         ] = []
-        for page in reader.pages:
+        inline_math: dict[str, dict[str, Any]] = {}
+        for page_index, page in enumerate(reader.pages):
             _attach_cid_to_unicode(page)
             fragments: list[tuple[float, float, str]] = []
             layout_fragments: list[LayoutFragment] = []
@@ -2249,8 +2598,9 @@ def extract_document(
                 fragment_parts: list[int] = []
 
                 visited: list[tuple[int, str, tuple[float, float, float], tuple[float, float, float]]] = []
+                visited_fonts: list[str] = []
 
-                def collect_fragment(value: str, cm: Any, tm: list[float], _font: Any, size: float) -> None:
+                def collect_fragment(value: str, cm: Any, tm: list[float], font: Any, size: float) -> None:
                     # Some producers (MDPI) put no-break spaces between all
                     # words, which hides "Figure 7." from every pattern.
                     value = value.replace("\xa0", " ")
@@ -2263,6 +2613,10 @@ def extract_document(
                     x, y, c, d = _text_position(tm, cm)
                     placed = (x, y, float(size) * ((c**2 + d**2) ** 0.5 or 1.0))
                     visited.append((len(text_parts) - 1, value, plain, placed))
+                    try:
+                        visited_fonts.append(str(font.get("/BaseFont", "")) if font is not None else "")
+                    except AttributeError:
+                        visited_fonts.append("")
 
                 image_boxes: list[tuple[float, float, float, float]] = []
                 image_names = _image_xobject_names(page)
@@ -2293,13 +2647,15 @@ def extract_document(
                 use_placed = sum(on_page(placed) for *_rest, placed in visited) > 2 * max(
                     1, sum(on_page(plain) for _part, _value, plain, _placed in visited)
                 )
-                for part, value, plain, placed in visited:
+                fragment_fonts: list[str] = []
+                for (part, value, plain, placed), font_name in zip(visited, visited_fonts):
                     x, y, size = placed if use_placed else plain
                     if not on_page((x, y, size)):
                         # Text inside a reused drawing (a form XObject) can be
                         # reported in the drawing's own coordinates, off the
                         # page. Its position is meaningless for the layout.
                         continue
+                    fragment_fonts.append(font_name)
                     fragment_parts.append(part)
                     fragments.append((x, y, value))
                     layout_fragments.append(LayoutFragment(len(layout_fragments), x, y, value, size))
@@ -2322,10 +2678,32 @@ def extract_document(
                     page_width,
                     page_height,
                 )
-                raw = _apply_script_markup(raw, text_parts, fragment_parts, roles, figure_text)
+                substitutions: dict[int, str] = {}
+                if inline_math_images and pdfium_document is not None and asset_dir is not None:
+                    substitutions = _render_inline_math(
+                        pdfium_document,
+                        page_index,
+                        layout_fragments,
+                        fragment_fonts,
+                        roles,
+                        figure_text,
+                        page_width,
+                        page_height,
+                        asset_dir,
+                        asset_url_prefix,
+                        inline_math,
+                    )
+                raw = _apply_script_markup(raw, text_parts, fragment_parts, roles, figure_text, substitutions)
+                if substitutions:
+                    # Keep a space between a word and an expression image.
+                    raw = re.sub(r"(?<=[A-Za-z0-9,;:])⟦", " ⟦", raw)
+                    raw = re.sub(r"⟧(?=[A-Za-z0-9])", "⟧ ", raw)
                 for order, role in roles.items():
                     x, y, value = fragments[order]
                     fragments[order] = (x, y, _wrap_script(value, role))
+                for order, value in substitutions.items():
+                    x, y, _old = fragments[order]
+                    fragments[order] = (x, y, value)
             except TypeError:
                 fragments = []
                 layout_fragments = []
@@ -2477,6 +2855,7 @@ def extract_document(
         segments = _merge_page_continuations(segments)
         segments = _merge_interrupted_sentences(segments)
         segments = _merge_reference_entries(segments)
+        _attach_inline_math(segments, inline_math)
         if pdfium_document is not None:
             pdfium_document.close()
         return _reindex_segments(segments), len(reader.pages)
@@ -2590,9 +2969,9 @@ class LlamaTranslator:
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"翻訳エンジンから予期しない応答が返りました: {data}") from exc
         translation = re.sub(r"(?:<\|plamo:(?:tag|bos)\|>)+$", "", result).strip()
-        # PLaMo keeps E_{algo} markup in practice; repair it if a translation
-        # ever flattens it to "Ealgo".
-        return restore_script_markup(text, translation)
+        # PLaMo keeps E_{algo} markup and ⟦M12⟧ math tokens in practice
+        # (43/43 in a test); repair them if a translation ever drops one.
+        return restore_inline_math(text, restore_script_markup(text, translation))
 
 
 def document_to_dict(title: str, segments: Iterable[Segment], **metadata: Any) -> dict[str, Any]:
@@ -2717,6 +3096,18 @@ def bilingual_markdown(
     reading_status: str = "",
 ) -> str:
     segments = list(segments)
+
+    def rich(value: str, segment: Segment) -> str:
+        # Inline math kept as images becomes a Markdown image with its text.
+        return INLINE_MATH_TOKEN_PATTERN.sub(
+            lambda match: (
+                f"![{str(segment.inline_math[match.group(1)].get('text', '')).replace(']', '')}]({segment.inline_math[match.group(1)]['src']})"
+                if match.group(1) in segment.inline_math
+                else match.group(0)
+            ),
+            script_html(value),
+        )
+
     meta = _summary_meta_lines(tags, source_url, reading_status)
     summary_lines: list[str] = []
     if summary.strip() or meta:
@@ -2739,7 +3130,7 @@ def bilingual_markdown(
         if segment.kind == "heading":
             marker = " ★" if segment.bookmarked else ""
             level = min(6, max(2, segment.heading_level + 1))
-            lines.extend([f"{'#' * level} {script_html(segment.source)}{marker}", "", f"**訳:** {script_html(segment.translation or segment.source)}", ""])
+            lines.extend([f"{'#' * level} {rich(segment.source, segment)}{marker}", "", f"**訳:** {rich(segment.translation or segment.source, segment)}", ""])
             continue
         position = f"P{segment.paragraph} / S{segment.sentence}" if segment.sentence else f"P{segment.paragraph}"
         for asset in segment.assets:
@@ -2748,11 +3139,11 @@ def bilingual_markdown(
             [
                 f"### {segment.index + 1}. 原文（{position}）",
                 "",
-                script_html(segment.source),
+                rich(segment.source, segment),
                 "",
                 "### 訳文",
                 "",
-                script_html(segment.translation) if segment.translation else f"⚠ {segment.error or '未翻訳'}",
+                rich(segment.translation, segment) if segment.translation else f"⚠ {segment.error or '未翻訳'}",
                 "",
             ]
         )
@@ -2917,6 +3308,10 @@ def bilingual_html(
     previous_paragraph = None
     for segment in segments:
         translation = segment.translation or f"⚠ {segment.error or '未翻訳'}"
+
+        def rich(value: str, segment: Segment = segment) -> str:
+            return inline_math_html(script_html(html.escape(value)), segment.inline_math, asset_resolver).replace(chr(10), "<br>")
+
         images = "".join(
             f'<figure><img src="{html.escape(asset_resolver(asset) if asset_resolver else asset)}" alt="Figure {segment.index + 1}"></figure>'
             for asset in segment.assets
@@ -2927,15 +3322,15 @@ def bilingual_html(
         if equation_image:
             source_content = (
                 f'{images}<details class="equation-text"><summary>検索用テキスト</summary>'
-                f'<p>{script_html(html.escape(segment.source)).replace(chr(10), "<br>")}</p></details>'
+                f'<p>{rich(segment.source)}</p></details>'
             )
             translation_content = (
                 f'{images}<details class="equation-text"><summary>抽出テキスト</summary>'
-                f'<p>{script_html(html.escape(translation)).replace(chr(10), "<br>")}</p></details>'
+                f'<p>{rich(translation)}</p></details>'
             )
         else:
-            source_content = f'{images}<p>{script_html(html.escape(segment.source)).replace(chr(10), "<br>")}</p>'
-            translation_content = f'<p>{script_html(html.escape(translation)).replace(chr(10), "<br>")}</p>'
+            source_content = f'{images}<p>{rich(segment.source)}</p>'
+            translation_content = f'<p>{rich(translation)}</p>'
         paragraph_start = bool(segment.paragraph and segment.paragraph != previous_paragraph)
         if segment.paragraph:
             position = f"P{segment.paragraph}<br>S{segment.sentence}" if segment.sentence else f"P{segment.paragraph}"

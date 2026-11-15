@@ -353,6 +353,26 @@ class SavedJobTests(unittest.TestCase):
             self.assertTrue(result["translating"])
             translate.assert_called_once_with(self.job_id, True)
 
+    def test_reextract_switches_math_mode(self):
+        old_document = "d" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._library_root(directory)
+            backup_patch = patch.object(app, "REEXTRACT_BACKUP_DIR", root / "reextract-backups")
+            backup_patch.start()
+            self.addCleanup(backup_patch.stop)
+            self._write_job(root, self.job_id, old_document)
+            (root / "uploads" / f"{old_document}_paper.pdf").write_bytes(b"%PDF")
+            with (
+                patch.object(app, "extract_document", return_value=([Segment(0, 1, "Source")], 1)) as extract,
+                patch.object(app, "_translate_job", Mock()),
+            ):
+                with self.assertRaises(ValueError):
+                    app._reextract_job(self.job_id, "bitmap")
+                app._reextract_job(self.job_id, "images")
+            self.assertTrue(extract.call_args.kwargs["inline_math_images"])
+            self.assertEqual(app.jobs[self.job_id]["math_mode"], "images")
+            self.assertEqual(app._library_item(app.jobs[self.job_id])["math_mode"], "images")
+
     def test_reextract_rejects_busy_jobs_and_missing_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._library_root(directory)
