@@ -949,7 +949,17 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             segments, _pages = extract_document(manual, asset_dir=Path(directory), asset_url_prefix="/a")
         equations = {segment.label for segment in segments if segment.label.startswith("equation:") and segment.assets}
-        self.assertEqual(equations, {f"equation:{number}" for number in range(1, 16)})
+        self.assertEqual(equations, {f"equation:{number}" for number in range(1, 17)})
+        # Algorithm 1 is one row shown as an image, not one row per line.
+        algorithms = [segment for segment in segments if segment.kind == "algorithm"]
+        self.assertEqual([(segment.label, len(segment.assets)) for segment in algorithms], [("algorithm:1", 1)])
+        self.assertFalse([segment for segment in segments if segment.source.startswith(("1: start llama", "15: return"))])
+        # Tables set in text are attached to their captions as images.
+        tables = {segment.source.split(":")[0] for segment in segments if segment.kind == "table" and segment.assets}
+        self.assertGreaterEqual(len(tables), 7)
+        self.assertIn("Table 3", tables)  # the full-width table with a footnote
+        # The running head with its page number never reaches the text.
+        self.assertFalse([segment for segment in segments if "PLaMo Paper Translator User Manual" in segment.source])
         headings = [segment.source for segment in segments if segment.kind == "heading"]
         self.assertIn("A HTTP Interface", headings)
         self.assertIn("B Troubleshooting", headings)
