@@ -3870,7 +3870,8 @@ def bilingual_html(
                 )
         else:
             source_content = f'{images}<p>{rich(segment.source)}</p>'
-            translation_content = f'<p>{rich(translation)}</p>'
+            # Figures and tables appear beside the translation as well.
+            translation_content = f'{images}<p>{rich(translation)}</p>'
         paragraph_start = bool(segment.paragraph and segment.paragraph != previous_paragraph)
         if segment.paragraph:
             position = f"P{segment.paragraph}<br>S{segment.sentence}" if segment.sentence else f"P{segment.paragraph}"

@@ -81,6 +81,13 @@ class TexExportTests(unittest.TestCase):
         self.assertNotIn("tex-code", content.split("<style>")[0] + content.split("</style>")[-1])
         self.assertNotIn("katex.render", content)
 
+    def test_html_export_shows_figures_beside_the_translation_too(self):
+        figure = Segment(0, 1, "Figure 1: A part.", "図1：部品。", kind="figure", assets=["/api/assets/x/figure.png"])
+        content = bilingual_html("Paper", [figure])
+        translation = content.split('<article class="translation">')[1].split("</article>")[0]
+        self.assertIn('<img src="/api/assets/x/figure.png"', translation)
+        self.assertIn("図1：部品。", translation)
+
     def test_reextraction_keeps_tex_of_unchanged_equation(self):
         fresh = Segment(0, 1, "a = b (1)", kind="equation", assets=["/api/assets/y/eq.png"])
         merged, _map, _counts = merge_reextracted_segments([self.segment], [fresh])

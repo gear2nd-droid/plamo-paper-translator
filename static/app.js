@@ -281,7 +281,9 @@ function renderSegment(item, position, list, mode) {
   const extractedText = `<details class="equation-text"><summary>抽出テキスト</summary><p>${translationText}</p></details>`;
   const translationContent = equationImage
     ? (kind === 'equation' ? `${texPaneHtml(item)}${extractedText}` : `${images}${extractedText}`)
-    : `${translationActions}<div class="translation-body"><p>${translationText}</p></div>`;
+    // Figures and tables are shown on both sides (the text in them is not
+    // translated), so the translation alone can be read or clipped.
+    : `${translationActions}${images}<div class="translation-body"><p>${translationText}</p></div>`;
   const hasPosition = Number(item.paragraph) > 0;
   const isParagraphStart = hasPosition && (position === 0 || item.paragraph !== list[position - 1].paragraph);
   const unitPosition = hasPosition ? (Number(item.sentence) > 0 ? `P${item.paragraph} / S${item.sentence}` : `P${item.paragraph}`) : '旧形式';
