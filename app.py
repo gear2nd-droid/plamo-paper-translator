@@ -42,6 +42,7 @@ from paper_core import (
     parse_glossary,
     remap_summary_row_references,
     segments_for_mode,
+    expand_inline_math,
     strip_script_markup,
 )
 
@@ -504,6 +505,7 @@ def _library_item(job: dict[str, Any], query: str = "") -> dict[str, Any]:
         "created_at": job.get("created_at", ""),
         "updated_at": job.get("updated_at", ""),
         "last_opened_at": job.get("last_opened_at", ""),
+        "math_mode": str(job.get("math_mode", "standard")),
         "match": "",
     }
     normalized_query = query.casefold().strip()
@@ -514,10 +516,14 @@ def _library_item(job: dict[str, Any], query: str = "") -> dict[str, Any]:
             str(job.get("paper_summary", "")),
         ]
         for segment in segments:
+            # Inline math kept as images is searched by its text.
             if isinstance(segment, Segment):
-                candidates.extend([segment.source, segment.translation, segment.note])
+                candidates.extend(
+                    [expand_inline_math(segment.source, segment.inline_math), expand_inline_math(segment.translation, segment.inline_math), segment.note]
+                )
             elif isinstance(segment, dict):
-                candidates.extend([str(segment.get(key, "")) for key in ("source", "translation", "note")])
+                math = segment.get("inline_math") if isinstance(segment.get("inline_math"), dict) else {}
+                candidates.extend([expand_inline_math(str(segment.get(key, "")), math) for key in ("source", "translation", "note")])
         for candidate in candidates:
             # Search the visible text: "Ealgo" finds "E_{algo}".
             compact = re.sub(r"\s+", " ", strip_script_markup(candidate)).strip()
@@ -882,7 +888,10 @@ def _backup_job_before_reextract(job: dict[str, Any]) -> Path:
     return target
 
 
-def _reextract_job(job_id: str) -> dict[str, Any]:
+MATH_MODES = {"standard", "images"}
+
+
+def _reextract_job(job_id: str, math_mode: str | None = None) -> dict[str, Any]:
     """Extract a saved paper again with the current extractor, keeping the reader's work.
 
     The source PDF is copied under a new document id so the old images stay
@@ -907,6 +916,9 @@ def _reextract_job(job_id: str) -> dict[str, Any]:
         )
         if not sources:
             raise ValueError("元の論文ファイルが保存されていないため再抽出できません。")
+        if math_mode is not None and math_mode not in MATH_MODES:
+            raise ValueError("数式の表示方法が不正です。")
+        math_mode = math_mode or str(job.get("math_mode", "standard"))
         active_reextractions.add(job_id)
     try:
         source = sources[0]
@@ -919,6 +931,7 @@ def _reextract_job(job_id: str) -> dict[str, Any]:
                 target,
                 asset_dir=asset_root,
                 asset_url_prefix=f"/api/assets/{new_document_id}",
+                inline_math_images=math_mode == "images",
             )
             fresh = segments_for_mode(extracted, str(job.get("segmentation_mode", "sentence")))
             if not fresh:
@@ -933,6 +946,7 @@ def _reextract_job(job_id: str) -> dict[str, Any]:
             merged, index_map, counts = merge_reextracted_segments(job["segments"], fresh)
             job["segments"] = merged
             job["document_id"] = new_document_id
+            job["math_mode"] = math_mode
             job["total"] = len(merged)
             job["paper_summary"] = remap_summary_row_references(str(job.get("paper_summary", "") or ""), index_map)
             reading_index = int(job.get("reading_index", 0) or 0)
@@ -1532,7 +1546,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._error("Content-Type must be application/json", 415)
                 return
             try:
-                result = _reextract_job(match.group(1))
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self._read_json() if length else {}
+                requested = body.get("math_mode") if isinstance(body, dict) else None
+                result = _reextract_job(match.group(1), str(requested) if requested else None)
             except LookupError as exc:
                 self._error(str(exc), 404)
                 return
@@ -1661,8 +1678,26 @@ class Handler(BaseHTTPRequestHandler):
             self._error("翻訳先言語が不正です。")
             return
         segmentation_mode = str(data.get("segmentation_mode", "sentence"))
+        math_mode = str(data.get("math_mode", "standard"))
+        if math_mode not in MATH_MODES:
+            self._error("数式の表示方法が不正です。")
+            return
+        source_segments = document["segments"]
+        if math_mode == "images" and Path(document["path"]).suffix.lower() == ".pdf":
+            # The upload was read in the standard mode for a quick preview;
+            # read it again keeping every math expression as an image.
+            try:
+                source_segments, _pages = extract_document(
+                    Path(document["path"]),
+                    asset_dir=ASSET_DIR / document["id"],
+                    asset_url_prefix=f"/api/assets/{document['id']}",
+                    inline_math_images=True,
+                )
+            except Exception as exc:
+                self._error(f"数式を画像として読み込めません: {exc}")
+                return
         try:
-            selected_segments = segments_for_mode(document["segments"], segmentation_mode)
+            selected_segments = segments_for_mode(source_segments, segmentation_mode)
         except ValueError as exc:
             self._error(str(exc))
             return
@@ -1678,6 +1713,7 @@ class Handler(BaseHTTPRequestHandler):
             "completed": 0,
             "total": len(selected_segments),
             "segmentation_mode": segmentation_mode,
+            "math_mode": math_mode,
             "source_lang": source_lang,
             "target_lang": target_lang,
             "form": str(data.get("form", "plain")),

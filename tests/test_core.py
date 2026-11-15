@@ -32,6 +32,10 @@ from paper_core import (
     _drawn_figure_box,
     _figure_text_orders,
     _footer_lines,
+    _inline_math_spans,
+    expand_inline_math,
+    inline_math_html,
+    restore_inline_math,
     _margin_key,
     _margin_line_key,
     _layout_line_is_prose,
@@ -349,6 +353,40 @@ class CoreTests(unittest.TestCase):
         ]
         captions = _positioned_captions(fragments, 297, [8.5, 9.2, 9.2], 9.2)
         self.assertEqual([caption.text for caption in captions], ["図 2: 提案手法の全体図．"])
+
+    def test_inline_math_spans_join_symbols_scripts_and_their_base(self):
+        fragments = [
+            LayoutFragment(0, 50, 700, "the weight", 9),
+            LayoutFragment(1, 100, 700, " 𝑤", 9),
+            LayoutFragment(2, 106, 698, "𝑆𝐹", 6.2),
+            LayoutFragment(3, 120, 700, " is defined by ", 9),
+            LayoutFragment(4, 180, 700, "R", 9),
+            LayoutFragment(5, 186, 704, "−1", 6.2),
+            LayoutFragment(6, 192, 700, "(0, 0, 1)", 9),
+            LayoutFragment(7, 230, 700, ". The value", 9),
+            LayoutFragment(8, 50, 690, "25", 9),
+            LayoutFragment(9, 60, 690, ".", 9),
+            LayoutFragment(10, 64, 690, "3% and • items", 9),
+        ]
+        fonts = ["Times", "LibertineMathMI", "LibertineMathMI7", "Times", "Times", "CMR7", "Times", "Times", "Times", "CMMI10", "Times"]
+        roles = {2: "sub", 5: "sup"}
+        spans = _inline_math_spans(fragments, fonts, roles, set())
+        self.assertEqual(spans, [[1, 2], [4, 5, 6]])
+
+    def test_inline_math_tokens_render_and_survive_translation(self):
+        math = {"M3": {"src": "/api/assets/a/page-001-math-3.png", "text": "w_{SF}", "height": 1.25, "depth": 0.35}}
+        self.assertEqual(restore_inline_math("the weight ⟦M3⟧ is", "重み は"), "重み は ⟦M3⟧")
+        self.assertEqual(restore_inline_math("⟦M3⟧", "⟦M3⟧ ⟦M3⟧"), "⟦M3⟧ ")
+        self.assertEqual(expand_inline_math("weight ⟦M3⟧", math), "weight w_{SF}")
+        rendered = inline_math_html("weight ⟦M3⟧ and ⟦M9⟧", math)
+        self.assertIn('<img class="inline-math" src="/api/assets/a/page-001-math-3.png" alt="w_{SF}"', rendered)
+        self.assertIn("height:1.250em;vertical-align:-0.350em", rendered)
+        self.assertIn("⟦M9⟧", rendered)
+        segment = Segment(0, 1, "The weight ⟦M3⟧ is fixed.", "重み ⟦M3⟧ は固定。", inline_math=math)
+        self.assertIn("![w_{SF}](/api/assets/a/page-001-math-3.png)", bilingual_markdown("Paper", [segment]))
+        self.assertIn('class="inline-math"', bilingual_html("Paper", [segment]))
+        merged = segments_for_mode([segment, Segment(1, 1, "Next.", paragraph=0)], "paragraph")
+        self.assertEqual(merged[0].inline_math, math)
 
     def test_running_heads_are_removed_as_whole_lines(self):
         head = "2 人工知能学会論文誌 38 巻 2 号 A（2023 年）"
