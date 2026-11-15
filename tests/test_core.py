@@ -35,6 +35,8 @@ from paper_core import (
     _algorithm_blocks,
     ALGORITHM_CAPTION_PATTERN,
     _table_blocks,
+    _ruled_table,
+    _is_math_fragment,
     _table_line_is_prose,
     _inline_math_spans,
     expand_inline_math,
@@ -423,6 +425,64 @@ class CoreTests(unittest.TestCase):
         roles = {2: "sub", 5: "sup"}
         spans = _inline_math_spans(fragments, fonts, roles, set())
         self.assertEqual(spans, [[1, 2], [4, 5, 6]])
+
+    def test_ruled_table_takes_the_rules_next_to_its_own_caption(self):
+        # Table 9's caption is under its table; Table 10 follows with its own.
+        rules = [(52, 720, 544), (52, 696, 544), (52, 614, 544), (52, 584, 544), (52, 573, 544), (52, 542, 544)]
+        nine = PositionedCaption("Table 9. Detection results.", 130, 602)
+        ten = PositionedCaption("Table 10. More results.", 50, 530)
+        self.assertEqual(_ruled_table(nine, rules, [nine, ten], 10)[1:4:2], (614, 720))
+        self.assertEqual(_ruled_table(ten, rules, [nine, ten], 10)[1:4:2], (542, 584))
+        # A caption over its table, rules split per cell already joined.
+        above = PositionedCaption("Table 1: Export formats.", 140, 670)
+        self.assertEqual(_ruled_table(above, [(131, 659, 481), (131, 640, 481), (131, 566, 481)], [above], 10)[1:4:2], (566, 659))
+        self.assertIsNone(_ruled_table(above, [], [above], 10))
+
+    def test_table_with_sentence_rows_between_rules_is_one_block(self):
+        caption = PositionedCaption("Table 8: Export formats.", 140, 670)
+        fragments = [
+            LayoutFragment(0, 140, 670, "Table 8: Export formats.", 10),
+            LayoutFragment(1, 140, 650, "Format Contents", 10),
+            LayoutFragment(2, 140, 630, "HTML single file with embedded figures, math images and notes", 10),
+            LayoutFragment(3, 140, 615, "Markdown summary, then source and translation, one pair per entry", 10),
+            LayoutFragment(4, 140, 590, "When publishing translations of other people's papers, check the license.", 10),
+        ]
+        rules = [(131, 659, 481), (131, 640, 481), (131, 606, 481)]
+        blocks = _table_blocks(fragments, [caption], 612, rules)
+        self.assertEqual(blocks[0]["orders"], [1, 2, 3])  # the body sentence below stays
+
+    def test_text_that_ends_in_an_accent_is_not_math(self):
+        self.assertFalse(_is_math_fragment(", an accent as in ˆ", "NimbusRomNo9L-Regu"))
+        self.assertFalse(_is_math_fragment(" or ¯", "NimbusRomNo9L-Regu"))
+        self.assertTrue(_is_math_fragment("∑", "StandardSymL"))
+
+    def test_inline_math_spans_join_a_radical_and_a_set(self):
+        def spans_of(parts):
+            fragments = [LayoutFragment(order, 50 + 10 * order, y, text, 9) for order, (text, _font, y) in enumerate(parts)]
+            return _inline_math_spans(fragments, [font for _text, font, _y in parts], {}, set())
+
+        # The radical is drawn from above the line.
+        self.assertEqual(spans_of([("root as in", "Times", 134), ("p", "CMEX10", 143), ("|", "CMSY10", 134), ("s", "Times-Italic", 134), ("|", "CMSY10", 134), (", a sum", "Times", 134)]), [[1, 2, 3, 4]])
+        # The bar of a set opens nothing.
+        parts = ["𝑆", "=", "{", "x", "|", "𝐺", "(", "x", ")", "=", "𝑑", "}"]
+        fonts = ["CMMI10", "CMR10", "CMR10", "Times-Bold", "CMSY10", "CMMI10", "CMR10", "Times-Bold", "CMR10", "CMR10", "CMMI10", "CMR10"]
+        spans = spans_of([("with ", "Times", 100), *((text, font, 100) for text, font in zip(parts, fonts)), (" will be", "Times", 100)])
+        self.assertEqual(spans, [list(range(1, 13))])
+
+    def test_acm_reference_format_lines_are_not_a_table(self):
+        text = "\n".join(
+            [
+                "ACM Reference Format:",
+                "Chengkai Dai and Yong-jin Liu. 2018. Support-Free Volume Printing by Multi-Axis",
+                "Motion. ACM Trans. Graph. 37, 4, Article 1 (August 2018), 14 pages. https:",
+                "//doi.org/10.1145/3197517.3201342",
+            ]
+        )
+        self.assertEqual(
+            _normalize_block(text),
+            "ACM Reference Format: Chengkai Dai and Yong-jin Liu. 2018. Support-Free Volume Printing by Multi-Axis "
+            "Motion. ACM Trans. Graph. 37, 4, Article 1 (August 2018), 14 pages. https://doi.org/10.1145/3197517.3201342",
+        )
 
     def test_inline_math_spans_keep_brackets_whole(self):
         def spans_of(parts):
