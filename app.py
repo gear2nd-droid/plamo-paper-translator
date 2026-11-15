@@ -83,7 +83,7 @@ MAX_BACKUP_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_BACKUP_EXPANDED_BYTES = 8 * 1024 * 1024 * 1024
 MAX_BACKUP_FILES = 100_000
 # One version for the app, the Chrome extension and the release.
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 NATIVE_HOST_NAME = "jp.gear2.plamo_paper_translator"
 CHROME_EXTENSION_ID = "cpiiadekehcofkocnlplcaolgioefcjd"
 CHROME_EXTENSION_ORIGIN = f"chrome-extension://{CHROME_EXTENSION_ID}/"
@@ -1355,7 +1355,6 @@ class Handler(BaseHTTPRequestHandler):
                     "engine": "ready" if translator.health() else "not_ready",
                     "engine_error": llama_process.error,
                     "model": model.name if model else None,
-                    "gpu_recommended": "PLaMo 3 Translate 8B Q4_K_M / RTX 2000 Ada 16GB",
                     "latex_ocr": _latex_status(),
                 }
             )

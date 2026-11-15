@@ -20,7 +20,7 @@
 PLaMoPaperTranslator/
 ├─ PLaMoPaperTranslator.exe     # Python同梱のアプリ本体
 ├─ Start-PLaMoPaperTranslator.cmd
-├─ setup.ps1                    # 公式配布元からランタイムとモデルを取得
+├─ setup.ps1                    # 公式配布元からランタイムとモデル（任意で数式OCRモデル）を取得
 ├─ chrome-extension/            # ワンクリック起動用Chrome拡張と登録スクリプト
 ├─ docs/                        # 公開デモ候補・運用資料
 ├─ LICENSE                      # アプリ独自コードのMIT License
@@ -31,7 +31,7 @@ PLaMoPaperTranslator/
 └─ data/                        # PDFと翻訳結果（配布時は空）
 ```
 
-モデルをアプリ本体から分離することで、8Bから2Bへの切替、モデル更新、アプリ更新、利用終了時のモデル削除を独立して行えます。ZIP自体には論文、訳文、モデルを含めません。
+モデルをアプリ本体から分離することで、8Bから2Bへの切替、モデル更新、アプリ更新、利用終了時のモデル削除を独立して行えます。ZIP自体には論文、訳文、モデルを含めません。数式OCRモデル（LaTeX-OCR / RapidLaTeXOCR、MIT License、約180MB）も同梱せず、使う利用者だけがセットアップスクリプトかアプリの翻訳設定画面から公式リリースを取得します。推論に使うONNX Runtime（MIT License）はアプリ本体に同梱します。
 
 `build-portable.ps1` は一時ステージでパッケージを組み立て、`dist/PLaMoPaperTranslator-Windows-portable.zip` だけを更新します。実行中のポータブル版フォルダーを上書きしないため、アプリを止めずに次回配布用ZIPを作成できます。
 
