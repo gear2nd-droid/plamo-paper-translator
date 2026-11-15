@@ -7,7 +7,7 @@ const CLIP_PARTS = {
 };
 const REFERENCE_PATTERN = /\b(?:fig(?:ure)?s?\.?\s*\d+(?:\s*[-–]\s*\d+)?|eq(?:uation)?s?\.?\s*\(?\d+\)?|tables?\s+\d+)|(?:図|式|表)\s*\(?\d+\)?/gi;
 const ACADEMIC_LINK_PATTERN = /https?:\/\/[^\s<>"']+|(?:doi:\s*)?10\.\d{4,9}\/[-._;()/:a-z0-9]+|arxiv:\s*\d{4}\.\d{4,5}(?:v\d+)?/gi;
-const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], segmentationMode: 'sentence', tocObserver: null, referenceTargets: new Map(), referenceHistory: [], resultsReady: false, paperTags: [], paperSummary: '', paperSourceUrl: '', paperReadingStatus: 'unread', readingIndex: 0, readingSaveTimer: null, lastSavedReadingIndex: null, summaryOpen: false, summaryMode: 'edit', summarySaveTimer: null, summarySaving: null, summaryDirty: false, librarySearchTimer: null, revisionSegmentIndex: null, texTimer: null, texTimers: new Map(), latexAvailable: false };
+const state = { documentId: null, jobId: null, poller: null, polling: false, pollFailures: 0, segments: [], segmentationMode: 'sentence', tocObserver: null, referenceTargets: new Map(), referenceHistory: [], resultsReady: false, paperTags: [], paperSummary: '', paperSourceUrl: '', paperReadingStatus: 'unread', readingIndex: 0, readingSaveTimer: null, lastSavedReadingIndex: null, summaryOpen: false, summaryMode: 'edit', summarySaveTimer: null, summarySaving: null, summaryDirty: false, librarySearchTimer: null, revisionSegmentIndex: null, texTimer: null, texTimers: new Map(), latexAvailable: false, citationIndex: null, citeEntries: [], citeIds: new Map(), citeHideTimer: null };
 const noteTimers = new Map();
 const $ = (id) => document.getElementById(id);
 
@@ -236,6 +236,9 @@ function showResults(data) {
   state.inlineMath = null;
   state.referenceTargets = referenceLayout.targets;
   state.referenceHistory = [];
+  state.citationIndex = window.PaperCitations ? window.PaperCitations.buildCitationIndex(state.segments) : null;
+  state.citeEntries = [];
+  state.citeIds = new Map();
   state.paperTags = Array.isArray(data.tags) ? data.tags.filter((tag) => typeof tag === 'string') : [];
   state.paperSummary = String(data.paper_summary || '');
   state.paperSourceUrl = String(data.source_url || '');
@@ -491,19 +494,41 @@ function renderReferencedText(value, currentIndex) {
   return renderScripts(renderLinkedText(value, currentIndex));
 }
 
+function citationId(entry) {
+  if (!state.citeIds.has(entry)) {
+    state.citeIds.set(entry, state.citeEntries.length);
+    state.citeEntries.push(entry);
+  }
+  return state.citeIds.get(entry);
+}
+
+function citationMatches(text, currentIndex) {
+  if (!state.citationIndex || !window.PaperCitations) return [];
+  const item = state.segments.find((segment) => Number(segment.index) === Number(currentIndex));
+  if (item && (item.kind || '') === 'citation') return [];
+  return window.PaperCitations.findCitations(text, state.citationIndex)
+    // A citation inside the reference list itself is not linked.
+    .filter((found) => found.entries.some((entry) => entry.index !== Number(currentIndex)))
+    .map((found) => ({match:Object.assign([text.slice(found.start, found.end)], {index:found.start}), kind:'citation', entries:found.entries}));
+}
+
 function renderLinkedText(value, currentIndex) {
   const text = String(value ?? '');
   let rendered = '';
   let lastIndex = 0;
   const matches = [
+    ...citationMatches(text, currentIndex),
     ...[...text.matchAll(REFERENCE_PATTERN)].map((match) => ({match, kind:'reference'})),
     ...[...text.matchAll(ACADEMIC_LINK_PATTERN)].map((match) => ({match, kind:'academic'})),
-  ].sort((left, right) => left.match.index - right.match.index || (left.kind === 'academic' ? -1 : 1));
+  ].sort((left, right) => left.match.index - right.match.index || (left.kind === 'academic' ? -1 : left.kind === 'citation' ? -1 : 1));
   for (const entry of matches) {
     const match = entry.match;
     if (match.index < lastIndex) continue;
     rendered += escapeHtml(text.slice(lastIndex, match.index));
-    if (entry.kind === 'academic') {
+    if (entry.kind === 'citation') {
+      const ids = entry.entries.map(citationId).join(' ');
+      rendered += `<button type="button" class="cite-link" data-cite-ids="${ids}" data-reference-index="${entry.entries[0].index}" aria-label="引用文献 ${escapeHtml(match[0])}">${escapeHtml(match[0])}</button>`;
+    } else if (entry.kind === 'academic') {
       const visible = match[0].replace(/[.,;]+$/, '');
       const doi = visible.match(/10\.\d{4,9}\/[-._;()/:a-z0-9]+/i)?.[0];
       const arxiv = visible.match(/\d{4}\.\d{4,5}(?:v\d+)?/i)?.[0];
@@ -621,6 +646,28 @@ function jumpToReference(index) {
   if (state.referenceHistory.length > 20) state.referenceHistory.shift();
   updateReferenceBackButton();
   jumpToSegment(index);
+}
+
+function showCitePopover(link) {
+  const popover = $('citePopover');
+  const entries = String(link.dataset.citeIds || '').split(' ').map((id) => state.citeEntries[Number(id)]).filter(Boolean);
+  if (!entries.length) return;
+  clearTimeout(state.citeHideTimer);
+  popover.innerHTML = entries.map((entry) => `<p><b>${escapeHtml(entry.label.match(/^\d+$/) ? `[${entry.label}]` : entry.label)}</b>${escapeHtml(entry.text)}</p>`).join('')
+    + '<small>クリックで巻末の文献へ移動（上部の「戻る」で戻れます）</small>';
+  popover.classList.remove('hidden');
+  const box = link.getBoundingClientRect();
+  const width = Math.min(460, window.innerWidth - 24);
+  popover.style.width = `${width}px`;
+  const left = Math.min(Math.max(12, box.left), window.innerWidth - width - 12);
+  const below = box.bottom + 8 + popover.offsetHeight < window.innerHeight;
+  popover.style.left = `${left}px`;
+  popover.style.top = `${below ? box.bottom + 8 : Math.max(8, box.top - popover.offsetHeight - 8)}px`;
+}
+
+function hideCitePopover(delay = 160) {
+  clearTimeout(state.citeHideTimer);
+  state.citeHideTimer = setTimeout(() => $('citePopover').classList.add('hidden'), delay);
 }
 
 function returnFromReference() {
@@ -1406,6 +1453,22 @@ document.querySelectorAll('.back').forEach((node) => node.addEventListener('clic
 document.querySelectorAll('.step').forEach((node) => node.addEventListener('click', () => { const n=Number(node.dataset.step); if(n===1 || (n===2 && state.documentId) || (n===3 && state.jobId)) showStep(n); }));
 $('targetLang').addEventListener('change', () => $('form').closest('label').style.display = $('targetLang').value === 'ja' ? '' : 'none');
 $('startTranslation').addEventListener('click', startJob);
+document.addEventListener('mouseover', (event) => {
+  const link = event.target.closest?.('.cite-link');
+  if (link) showCitePopover(link);
+  else if (event.target.closest?.('#citePopover')) clearTimeout(state.citeHideTimer);
+});
+document.addEventListener('mouseout', (event) => {
+  if (event.target.closest?.('.cite-link, #citePopover')) hideCitePopover();
+});
+document.addEventListener('focusin', (event) => {
+  const link = event.target.closest?.('.cite-link');
+  if (link) showCitePopover(link);
+});
+document.addEventListener('focusout', (event) => {
+  if (event.target.closest?.('.cite-link')) hideCitePopover();
+});
+window.addEventListener('scroll', () => hideCitePopover(0), {passive:true});
 $('latexOcrDownload').addEventListener('click', downloadLatexOcr);
 $('cancelJob').addEventListener('click', async () => { if(state.jobId) await fetch(`/api/jobs/${state.jobId}/cancel`, {method:'POST'}); });
 $('newPaper').addEventListener('click', () => { localStorage.removeItem(JOB_STORAGE_KEY); location.href = '/'; });
@@ -1533,8 +1596,8 @@ $('readerLayout').addEventListener('click', (event) => {
   if (clipButton) { toggleClip(clipButton); return; }
   const quoteButton = event.target.closest('[data-summary-quote]');
   if (quoteButton) { quoteSegmentInSummary(Number(quoteButton.dataset.summaryQuote)); return; }
-  const reference = event.target.closest('.reference-link');
-  if (reference) { jumpToReference(Number(reference.dataset.referenceIndex)); return; }
+  const reference = event.target.closest('.reference-link, .cite-link');
+  if (reference) { hideCitePopover(0); jumpToReference(Number(reference.dataset.referenceIndex)); return; }
   const target = event.target.closest('[data-nav-index]');
   if (target) jumpToSegment(Number(target.dataset.navIndex));
 });
