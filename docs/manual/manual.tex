@@ -50,7 +50,7 @@
 \AtBeginDocument{\ifdefined\manualonecolumn\setlength{\figwidth}{0.62\textwidth}\else\setlength{\figwidth}{\columnwidth}\fi}
 
 \title{\textbf{PLaMo Paper Translator: Local, Sentence-Aligned\\Bilingual Reading of Academic PDFs}\\[4pt]
-\large User Manual, Version 1.5\ifdefined\manualonecolumn\ (Single-Column Edition)\fi}
+\large User Manual, Version 1.6\ifdefined\manualonecolumn\ (Single-Column Edition)\fi}
 \author{The PLaMo Paper Translator Project}
 \date{November 2026}
 
@@ -58,7 +58,7 @@
 \maketitle
 
 \begin{abstract}
-PLaMo Paper Translator is a desktop application that turns an academic PDF into a sentence-aligned bilingual document and keeps everything on the reader's own computer. The application extracts text, figures and numbered equations from the PDF, translates each sentence with PLaMo 3 Translate running locally through llama.cpp, and presents the result in a three-pane reader with a table of contents, cross-reference links, bookmarks, notes, pinned clips and a side panel for a Markdown summary of the paper. Inline mathematics can be shown either as text with subscripts and superscripts or, in the \emph{all math as images} mode, exactly as printed. Pseudocode and tables are kept whole as images, and papers in Japanese, Chinese and Korean are read as well. This manual is written in the form of a research paper so that it can double as a realistic test document: it contains numbered sections, a running head, figures, tables with footnotes, display and inline equations, an algorithm and a reference list. We describe installation (Section~\ref{sec:install}), the document pipeline (Section~\ref{sec:pipeline}), translation (Section~\ref{sec:translation}), the reading interface (Section~\ref{sec:reader}), quality checks (Section~\ref{sec:quality}) and the paper library (Section~\ref{sec:library}).
+PLaMo Paper Translator is a desktop application that turns an academic PDF into a sentence-aligned bilingual document and keeps everything on the reader's own computer. The application extracts text, figures and numbered equations from the PDF, translates each sentence with PLaMo 3 Translate running locally through llama.cpp, and presents the result in a three-pane reader with a table of contents, cross-reference links, bookmarks, notes, pinned clips and a side panel for a Markdown summary of the paper. Inline mathematics can be shown either as text with subscripts and superscripts or, in the \emph{all math as images} mode, exactly as printed. Numbered equations can also be read back as \TeX{} with a local recognition model, ready to be copied into a paper or a note. Pseudocode and tables are kept whole as images, and papers in Japanese, Chinese and Korean are read as well. This manual is written in the form of a research paper so that it can double as a realistic test document: it contains numbered sections, a running head, figures, tables with footnotes, display and inline equations, an algorithm and a reference list. We describe installation (Section~\ref{sec:install}), the document pipeline (Section~\ref{sec:pipeline}), translation (Section~\ref{sec:translation}), the reading interface (Section~\ref{sec:reader}), quality checks (Section~\ref{sec:quality}) and the paper library (Section~\ref{sec:library}).
 \end{abstract}
 
 \noindent\textbf{Keywords:} machine translation, PDF processing, local inference, reading interface, PLaMo
@@ -112,6 +112,7 @@ All user data is kept in plain files under a single folder, summarised in Table~
     \texttt{data/jobs} & one JSON file per translation \\
     \texttt{data/assets} & figure and equation crops (PNG) \\
     \texttt{models} & GGUF model and chat template \\
+    \texttt{models/latex-ocr} & optional equation model (ONNX) \\
     \texttt{runtime} & llama.cpp binaries \\
     \bottomrule
   \end{tabular}
@@ -154,6 +155,7 @@ Double-click \texttt{Start-PLaMoPaperTranslator.cmd}. On the first run it shows 
   \item verify the GGUF header, the file size and the SHA-256 digest;
   \item start the application and open \texttt{http://127.0.0.1:7865}.
 \end{enumerate}
+At the end the script also offers the optional equation model of Section~\ref{sec:tex} (about 180\,MB); it can be downloaded later from the translation settings as well.
 Interrupted downloads resume from a \texttt{.partial} file. A model file $f$ is accepted only when
 \begin{equation}
   \operatorname{size}(f) = b^\star \quad\wedge\quad \operatorname{SHA256}(f) = h^\star ,
@@ -220,11 +222,34 @@ Scripts are not enough for much of the mathematics inside sentences. A fraction 
   \item \emph{Standard}: numbered display equations are images, and inline mathematics is text with subscripts and superscripts.
   \item \emph{All math as images}: every inline expression is also cropped from the page and shown in the source and in the translation.
 \end{itemize}
+An expression ends only when its brackets are closed. In $G(\mathbf{x})$ the bold $\mathbf{x}$ is set in a text font, and in $\lvert \mathbf{v}_e \rvert$, $\lVert \nabla G(\mathbf{x}) \rVert$ or a row vector $[\, \mathbf{a}\ \mathbf{b} \,]$ the content between the delimiters may be as well; the whole expression, delimiters included, is still one image. When the closing bracket belongs to the following words, as in ``for all $e$ ($\forall e \in \mathcal{T}$), we'', the two sides become separate images and the brackets stay text.
+
 In the second mode an expression is replaced in the text by a placeholder such as $\llbracket \mathrm{M12} \rrbracket$ before translation; PLaMo 3 Translate kept all 43 placeholders of a test unchanged, and a missing one is added back. The text of the expression is kept for search, copying and quotes in the summary. Each image is sized in units of the text height so that it sits on the baseline: for a crop from $b$ to $t$ around a line with baseline $y$ and font size $z$,
 \begin{equation}
   \text{height} = \frac{t - b}{z}\ \text{em}, \qquad \text{depth} = \frac{y - b}{z}\ \text{em}.
   \label{eq:inline-size}
 \end{equation}
+
+\subsection{Equations as \TeX}
+\label{sec:tex}
+A cropped equation shows the formula exactly as printed, but it cannot be pasted into a document. With the optional equation model, the translation column of a numbered equation shows \TeX{} read from the image instead: a rendering with KaTeX~\cite{katex} to compare with the source image, the \TeX{} code, and buttons that copy the code alone or wrapped in \verb|$$|. The model is LaTeX-OCR~\cite{latexocr} in the ONNX form published by RapidLaTeXOCR~\cite{rapidlatexocr}, both under the MIT License; it runs on the CPU with ONNX Runtime~\cite{onnxruntime}, is downloaded only on request and is not part of the portable package.
+
+Before recognition the equation number is cut off at the widest blank gap at the right of the image, so that the code contains only the formula. The image is then scaled to the size the model was trained on, encoded once, and the code is decoded one token at a time,
+\begin{equation}
+  y_t = \operatorname*{arg\,max}_{v \in V} \, P\bigl(v \mid y_{<t},\, E(I)\bigr), \qquad t = 1, \dots, T,
+  \label{eq:decode}
+\end{equation}
+where $I$ is the image, $E$ the encoder, $V$ the vocabulary of 1{,}175 tokens and $T \le 512$ the step at which the end token appears. A decoder that starts repeating itself is stopped after one round. Matrices are among the hardest cases; the rotation below is included as a test of one,
+\begin{equation}
+  \mathbf{R}(\theta) =
+  \begin{bmatrix}
+    \cos\theta & -\sin\theta \\
+    \sin\theta & \cos\theta
+  \end{bmatrix},
+  \qquad \lvert \det \mathbf{R}(\theta) \rvert = 1 .
+  \label{eq:rotation}
+\end{equation}
+Recognition takes about 0.2 to 3\,s per equation and runs in the background while the paper is translated; papers read before the model was installed are recognised when they are opened. The code can be corrected in place, which is saved like a note, and \emph{Re-recognise} reads the image again. Recognition is not perfect: a symbol can be misread or dropped, and matrices such as Equation~\eqref{eq:rotation} and equations that are mostly words, such as Equation~\eqref{eq:backup-upload} below, often come out wrong. Always compare the rendering with the source image before using the code.
 
 \subsection{Algorithms and Tables}
 \label{sec:blocks}
@@ -244,7 +269,7 @@ Pseudocode is not split into one segment per line. An algorithm box, recognised 
     B (two columns) & 15 & 19 & 19 & 20 & 20 & 2 \\
     C (one column) & 19 & 9 & 4 & 6 & 5 & 3 \\
     D (Japanese) & 10 & 5 & 3 & 8 & 7 & 2 \\
-    This manual & 9 & 16 & 16 & 8 & 8 & 9 \\
+    This manual & 9 & 18 & 18 & 8 & 8 & 9 \\
     \bottomrule
     \multicolumn{7}{@{}l}{\footnotesize $^\dagger$Tables set in text; a table embedded as a picture is shown like a figure.}
   \end{tabular}
@@ -485,9 +510,9 @@ Table~\ref{tab:export} lists the export formats. The summary is placed at the to
     \toprule
     Format & Contents \\
     \midrule
-    HTML & single file with embedded figures, math images, notes and the rendered summary \\
-    Markdown & summary, then source and translation, one pair per entry \\
-    JSON & all segments, tags, summary and reading status \\
+    HTML & single file with embedded figures, math images, notes, the rendered summary and the \TeX{} of equations \\
+    Markdown & summary, then source and translation, one pair per entry; equations as \verb|$$|\,\dots\,\verb|$$| \\
+    JSON & all segments with their \TeX, tags, summary and reading status \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -496,14 +521,14 @@ When publishing translations of other people's papers, check the license of each
 
 \section{Limitations}
 \label{sec:limitations}
-The application needs a PDF that contains text; scanned pages must be processed with OCR first. Two-column layouts are read in the order stored in the PDF, which is usually but not always the reading order. In the standard mode, fractions and stacked limits inside a sentence become flat scripts; the all-images mode of Section~\ref{sec:inline-math} keeps them, but an expression can occasionally be split into two images. Tables and algorithms shown as images are not translated. Finally, machine translation can be wrong: results used for submissions, contracts or medical decisions must be checked by an expert.
+The application needs a PDF that contains text; scanned pages must be processed with OCR first. Two-column layouts are read in the order stored in the PDF, which is usually but not always the reading order. In the standard mode, fractions and stacked limits inside a sentence become flat scripts; the all-images mode of Section~\ref{sec:inline-math} keeps them, but an expression can occasionally be split into two images. Tables and algorithms shown as images are not translated, and the \TeX{} read from an equation image must be checked against the image. Finally, machine translation can be wrong: results used for submissions, contracts or medical decisions must be checked by an expert.
 
 \section{Conclusion}
 \label{sec:conclusion}
 PLaMo Paper Translator brings structure-aware, sentence-level translation of academic papers to an ordinary laptop without sending any text to the cloud. We hope this manual is useful both as a guide and as a test document. Because it is dedicated to the public domain, it can be translated, shown in videos and redistributed without restriction.
 
 \section*{Acknowledgments}
-The application is built with PLaMo. It relies on llama.cpp, pypdf, Pillow, PDFium and KaTeX, and we thank their developers.
+The application is built with PLaMo. It relies on llama.cpp, pypdf, Pillow, PDFium, KaTeX, ONNX Runtime and the LaTeX-OCR models, and we thank their developers.
 
 \begin{thebibliography}{10}
 \bibitem{plamo3}
@@ -540,6 +565,21 @@ J.~A.~Clark and contributors.
 KaTeX contributors.
 \newblock KaTeX: the fastest math typesetting library for the web.
 \newblock \url{https://katex.org/}.
+
+\bibitem{latexocr}
+L.~Blecher.
+\newblock LaTeX-OCR (pix2tex): using a ViT to convert images of equations into LaTeX code.
+\newblock \url{https://github.com/lukas-blecher/LaTeX-OCR}.
+
+\bibitem{rapidlatexocr}
+RapidAI.
+\newblock RapidLaTeXOCR: ONNX models and inference for LaTeX-OCR.
+\newblock \url{https://github.com/RapidAI/RapidLaTeXOCR}.
+
+\bibitem{onnxruntime}
+Microsoft and contributors.
+\newblock ONNX Runtime.
+\newblock \url{https://onnxruntime.ai/}.
 
 \bibitem{nativemessaging}
 Google.
@@ -578,6 +618,8 @@ Table~\ref{tab:api} lists the main endpoints of \texttt{app.py}. They are intend
     \texttt{GET /api/jobs/\{id\}} & job state and segments \\
     \texttt{GET /api/jobs/\{id\}/export} & HTML, MD or JSON \\
     \texttt{GET /api/jobs/\{id\}/quality} & quality check \\
+    \texttt{GET /api/jobs/\{id\}/tex} & \TeX{} of the equations \\
+    \texttt{POST /api/latex-ocr/download} & get the equation model \\
     \texttt{DELETE /api/jobs/\{id\}} & delete a paper \\
     \texttt{GET /api/library} & search the library \\
     \bottomrule
@@ -590,6 +632,7 @@ Table~\ref{tab:api} lists the main endpoints of \texttt{app.py}. They are intend
   \item \textbf{The engine does not start.} Check \texttt{data/llama-server.log}. Loading must finish within three minutes.
   \item \textbf{The upload reports that hardly any text was found.} The PDF contains only page images; run OCR first.
   \item \textbf{A paper read with an older version looks wrong.} Use \emph{Re-extract} in the library; translations and notes are kept.
+  \item \textbf{An equation shows no \TeX.} Download the equation model in the translation settings; the paper is recognised when it is opened again.
   \item \textbf{The Chrome button reports an error.} Run \texttt{install-native-host.ps1} again and restart Chrome.
 \end{itemize}
 
