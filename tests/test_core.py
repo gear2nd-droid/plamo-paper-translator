@@ -965,7 +965,7 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             segments, _pages = extract_document(manual, asset_dir=Path(directory), asset_url_prefix="/a")
         equations = {segment.label for segment in segments if segment.label.startswith("equation:") and segment.assets}
-        self.assertEqual(equations, {f"equation:{number}" for number in range(1, 17)})
+        self.assertEqual(equations, {f"equation:{number}" for number in range(1, 19)})
         # Algorithm 1 is one row shown as an image, not one row per line.
         algorithms = [segment for segment in segments if segment.kind == "algorithm"]
         self.assertEqual([(segment.label, len(segment.assets)) for segment in algorithms], [("algorithm:1", 1)])
@@ -982,7 +982,7 @@ class CoreTests(unittest.TestCase):
         self.assertFalse([heading for heading in headings if re.match(r"^\d\. ", heading)])
         self.assertFalse([heading for heading in headings if "=" in heading])
         citations = [segment.source for segment in segments if segment.kind == "citation"]
-        self.assertEqual([citation.split(" ")[0] for citation in citations], [f"[{number}]" for number in range(1, 11)])
+        self.assertEqual([citation.split(" ")[0] for citation in citations], [f"[{number}]" for number in range(1, 14)])
         figures = {segment.source.split(":")[0] for segment in segments if segment.kind == "figure" and segment.assets}
         self.assertEqual(figures, {f"Figure {number}" for number in range(1, 9)})
         body = " ".join(segment.source for segment in segments if segment.kind == "sentence")
