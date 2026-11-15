@@ -75,8 +75,8 @@
             </fieldset>
             <fieldset class="mode-switch full">
               <legend>数式の表示</legend>
-              <label><input type="radio" name="mathMode" value="standard" checked><span><b>標準</b><small>番号付き数式は画像、本文中の数式は文字（上付き・下付きを再現）</small></span></label>
-              <label><input type="radio" name="mathMode" value="images"><span><b>すべて画像</b><small>本文中の数式も原文どおりの画像で表示します</small></span></label>
+              <label><input type="radio" name="mathMode" value="standard"><span><b>標準</b><small>番号付き数式は画像、本文中の数式は文字（上付き・下付きを再現）</small></span></label>
+              <label><input type="radio" name="mathMode" value="images" checked><span><b>すべて画像</b><small>本文中の数式も原文どおりの画像で表示します</small></span></label>
             </fieldset>
             <div class="latex-ocr-box full">
               <div><b>数式のTeX化</b><p id="latexOcrState" class="latex-ocr-state">数式OCRの状態を確認しています…</p></div>
@@ -239,8 +239,10 @@
     </section>
   </dialog>
   <div id="toast" class="toast"></div>
+  <div id="citePopover" class="cite-popover hidden" role="tooltip"></div>
   <script src="/vendor/katex/katex.min.js"></script>
   <script src="/markdown.js"></script>
+  <script src="/citations.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
