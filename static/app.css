@@ -388,3 +388,19 @@ img.brand-mark{display:block;background:none;border-radius:0;object-fit:contain}
 /* Inline math kept as an image ("すべて画像"): sized in em so it follows the text size. */
 .inline-math,.source-pane img.inline-math,.translation-pane img.inline-math{display:inline-block;width:auto;max-width:100%;max-height:none;margin:0 .08em;border:0;background:transparent;object-fit:fill}
 .kind-algorithm img{max-height:none}
+
+/* Equation TeX ------------------------------------------------------------ */
+.latex-ocr-box{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 14px;border:1px solid #d8dde4;border-radius:8px;background:#fafbfc}
+.latex-ocr-box b{font-size:.84rem}.latex-ocr-state{margin:4px 0 0;font-size:.76rem;color:#676c72}.latex-ocr-state.ready{color:#1f7a4d}.latex-ocr-state.error{color:#b3261e}
+.latex-ocr-box button{flex:none}
+.tex-panel{display:flex;flex-direction:column;gap:6px;min-width:0}
+.tex-render{overflow-x:auto;overflow-y:hidden;padding:2px 0;min-height:1.2em}
+.tex-render .katex-display{margin:.2em 0}.tex-render .katex{font-size:1.05em}
+textarea.tex-code{width:100%;min-height:3.4em;resize:vertical;padding:7px 9px;border:1px solid #dde2e8;border-radius:5px;background:#f6f8fa;color:#1f2123;font:.76rem/1.5 Consolas,"Cascadia Mono",monospace;white-space:pre-wrap;word-break:break-all}
+textarea.tex-code:focus{outline:2px solid #1a56b8;outline-offset:0;background:#fff}
+.tex-actions{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.tex-actions button{padding:3px 9px;border:1px solid #c5ccd6;border-radius:4px;background:#fff;color:#1a56b8;font-size:.72rem;cursor:pointer}
+.tex-actions button.tex-copy{background:#1a56b8;border-color:#1a56b8;color:#fff}
+.tex-actions button:disabled{opacity:.5;cursor:default}
+.tex-origin{font-size:.68rem;color:#676c72}
+.tex-pending{font-size:.76rem;color:#676c72;margin:0}

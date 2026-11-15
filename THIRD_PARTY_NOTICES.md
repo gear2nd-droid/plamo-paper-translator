@@ -54,6 +54,26 @@ PDFiumは独立表示数式をPDFから画像として切り出すために使�
 
 `pdf2unicode/Adobe-{Japan1,GB1,CNS1,Korea1}-UCS2` を、`tools/build_cid_tables.py` で範囲リストに変換して `cmaps/` に収録しています。文字の対応表（ToUnicode）を持たない日本語・中国語・韓国語フォントの文字を、Unicodeとして読み取るために使用します。
 
+## LaTeX-OCR (pix2tex) / RapidLaTeXOCR models
+
+- Projects: https://github.com/lukas-blecher/LaTeX-OCR , https://github.com/RapidAI/RapidLaTeXOCR
+- License: MIT (both)
+- Model files: `image_resizer.onnx`, `encoder.onnx`, `decoder.onnx`, `tokenizer.json` from https://github.com/RapidAI/RapidLaTeXOCR/releases/tag/v0.0.0
+
+番号付き数式の画像からTeXを推定するために使用します。モデルはポータブルZIPには同梱せず、利用者がセットアップスクリプトまたはアプリの翻訳設定画面から取得し、`models/latex-ocr/` に保存します。推論処理（前処理・デコード）は RapidLaTeXOCR の実装を `latex_ocr.py` に移植しています。
+
+## ONNX Runtime
+
+- Project: https://onnxruntime.ai/
+- License: MIT
+- Included licenses: `licenses/onnxruntime-LICENSE.txt`, `licenses/onnxruntime-ThirdPartyNotices.txt`
+
+## NumPy
+
+- Project: https://numpy.org/
+- License: BSD-3-Clause (bundled components use their own licenses)
+- Included license: `licenses/numpy-LICENSE.txt`
+
 ## Python
 
 - Project: https://www.python.org/

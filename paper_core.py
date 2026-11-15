@@ -151,6 +151,9 @@ class Segment:
     # Inline math kept as images: "M12" -> {"src", "text", "height", "depth"}.
     # The source and translation carry the token ⟦M12⟧ in its place.
     inline_math: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # LaTeX read from a display equation's image, for copying; "ocr" or "manual".
+    tex: str = ""
+    tex_origin: str = ""
 
     def __post_init__(self) -> None:
         allowed_clip_parts = {"source", "translation", "note"}
@@ -1215,6 +1218,9 @@ def merge_reextracted_segments(
             target.translation_revisions = list(previous.translation_revisions)
             target.error = previous.error
             counts["kept_translations"] += 1
+        if previous.tex.strip() and target.kind == "equation":
+            target.tex = previous.tex
+            target.tex_origin = previous.tex_origin
     for old_index, previous in enumerate(old_segments):
         if old_index not in index_map:
             continue
@@ -2280,15 +2286,47 @@ def _inline_math_spans(
         # expression's start on its line continues it.
         return abs(fragment.y - base.y) <= 0.75 * max(base.size, fragment.size) and fragment.x >= base.x - 1
 
+    def open_brackets(orders: list[int]) -> int:
+        """Brackets the run has opened but not closed: (, [, { and |…|, ‖…‖."""
+        content = "".join(fragments[order].text for order in orders)
+        depth = 0
+        for opener, closer in ("()", "[]", "{}", "⟨⟩"):
+            depth += content.count(opener) - content.count(closer)
+        depth += content.count("|") % 2 + content.count("‖") % 2 + content.count("∥") % 2
+        return depth
+
     def close() -> None:
         # A sentence's full stop or comma after the expression stays text.
         while current and re.fullmatch(r"[\s.,;:]*", fragments[current[-1]].text):
             current.pop()
-        content = "".join(fragments[order].text for order in current)
-        # "25.3%" set in math mode leaves only a math-font "."; a list
-        # bullet "•" comes from the math symbol font. Neither is an expression.
-        if current and (re.search(r"[^\W\d_]", content) or re.search(r"[∑∏∫√∞∂∇≤≥≈≠≡±∓×÷∈∉∀∃∪∩⊂⊃⊆⊇→←↔⇒⇐⇔∥∼≃∝⊤⊥]", content)):
-            spans.append(list(current))
+        # An opening bracket that the run never closes stays text with the
+        # rest, rather than "f(" as an image followed by "x)" as text.
+        while current and open_brackets(current) > 0 and re.fullmatch(r"\s*[(\[{|‖∥⟨]\s*", fragments[current[-1]].text):
+            current.pop()
+        # A closing bracket whose opener came just before the run ("(" in a
+        # text font before "𝑥)"): take the opener in.
+        if current and open_brackets(current) < 0:
+            previous = current[0] - 1
+            if previous >= 0 and previous not in excluded and re.fullmatch(r"\s*[(\[{⟨]\s*", fragments[previous].text) and abs(fragments[previous].y - fragments[current[0]].y) <= 0.75 * fragments[current[0]].size:
+                current.insert(0, previous)
+        # A closing bracket opened in the text before the run stays text.
+        while current and open_brackets(current) < 0 and re.fullmatch(r"\s*[)\]}⟩]\s*[.,;:]?\s*", fragments[current[-1]].text):
+            current.pop()
+        runs = [list(current)]
+        if current and open_brackets(current) > 0:
+            # The closing bracket is in the text after the run ("), we"):
+            # split at the unclosed opener and keep the opener as text, so
+            # "v_i (i = 1, …, 4)" becomes two images around plain brackets.
+            for position in range(len(current) - 1, 0, -1):
+                if re.fullmatch(r"\s*[(\[{⟨]\s*", fragments[current[position]].text) and open_brackets(current[position:]) > 0:
+                    runs = [current[:position], current[position + 1 :]]
+                    break
+        for run in runs:
+            content = "".join(fragments[order].text for order in run)
+            # "25.3%" set in math mode leaves only a math-font "."; a list
+            # bullet "•" comes from the math symbol font. Neither is an expression.
+            if run and (re.search(r"[^\W\d_]", content) or re.search(r"[∑∏∫√∞∂∇≤≥≈≠≡±∓×÷∈∉∀∃∪∩⊂⊃⊆⊇→←↔⇒⇐⇔∥∼≃∝⊤⊥]", content)):
+                spans.append(run)
         current.clear()
 
     for order, fragment in enumerate(fragments):
@@ -2311,6 +2349,11 @@ def _inline_math_spans(
             continue
         if current and MATH_CONNECTOR_PATTERN.fullmatch(fragment.text):
             # "(0, 0, 1)" after d_p = belongs to the expression.
+            current.append(order)
+            continue
+        if current and open_brackets(current) > 0 and re.fullmatch(r"\s*[^\W_]{1,3}(?:\s*[,;]\s*[^\W_]{1,3})*\s*[)\]}|‖∥⟩]*[.,;:]?\s*", fragment.text):
+            # Inside "G(" or "|": a bold or upright variable ("x" in G(x))
+            # set in a text font is still part of the expression.
             current.append(order)
             continue
         close()
@@ -3607,6 +3650,13 @@ def bilingual_markdown(
         position = f"P{segment.paragraph} / S{segment.sentence}" if segment.sentence else f"P{segment.paragraph}"
         for asset in segment.assets:
             lines.extend([f"![{segment.label or 'Figure'}]({asset})", ""])
+        if segment.kind == "equation" and segment.tex.strip():
+            lines.extend([f"### {segment.index + 1}. 数式（{position}）", "", "$$", segment.tex.strip(), "$$", ""])
+            if segment.note:
+                lines.extend(["**メモ**", "", segment.note, ""])
+            if segment.bookmarked:
+                lines.extend(["> ★ ブックマーク", ""])
+            continue
         lines.extend(
             [
                 f"### {segment.index + 1}. 原文（{position}）",
@@ -3690,6 +3740,17 @@ SUMMARY_EXPORT_SCRIPT = r"""(function () {
     return '<span class="summary-embed">' + body + '<span class="summary-embed-caption">' + link(index, shown) + '</span></span>';
   }
   document.getElementById('paper-summary-body').innerHTML = markdown.renderMarkdown(data.summary, {text: text, reference: reference});
+})();"""
+
+
+TEX_EXPORT_SCRIPT = """(function () {
+  if (!window.katex) return;
+  document.querySelectorAll('.tex-render[data-tex]').forEach(function (node) {
+    try { window.katex.render(node.getAttribute('data-tex'), node, {displayMode: true, throwOnError: false}); }
+    catch (_) { node.remove(); return; }
+    var size = 1;
+    while (node.scrollWidth > node.clientWidth + 1 && size > 0.5) { size -= 0.05; node.style.fontSize = size.toFixed(2) + 'em'; }
+  });
 })();"""
 
 
@@ -3796,10 +3857,17 @@ def bilingual_html(
                 f'{images}<details class="equation-text"><summary>検索用テキスト</summary>'
                 f'<p>{rich(segment.source)}</p></details>'
             )
-            translation_content = (
-                f'{images}<details class="equation-text"><summary>抽出テキスト</summary>'
-                f'<p>{rich(translation)}</p></details>'
-            )
+            if segment.kind == "equation" and segment.tex.strip():
+                tex = html.escape(segment.tex)
+                translation_content = (
+                    f'<div class="tex-render" data-tex="{tex}"></div>'
+                    f'<pre class="tex-code">{tex}</pre>'
+                )
+            else:
+                translation_content = (
+                    f'{images}<details class="equation-text"><summary>抽出テキスト</summary>'
+                    f'<p>{rich(translation)}</p></details>'
+                )
         else:
             source_content = f'{images}<p>{rich(segment.source)}</p>'
             translation_content = f'<p>{rich(translation)}</p>'
@@ -3818,6 +3886,12 @@ def bilingual_html(
             "</section>"
         )
         previous_paragraph = segment.paragraph
+    if static_dir and any(segment.kind == "equation" and segment.tex.strip() for segment in segments):
+        katex_dir = static_dir / "vendor" / "katex"
+        if (katex_dir / "katex.min.js").is_file():
+            # The summary may already have added KaTeX.
+            tex_katex = "" if "KaTeX_" in summary_scripts else _katex_assets(static_dir)
+            summary_scripts += tex_katex + _inline_script(TEX_EXPORT_SCRIPT)
     safe_title = html.escape(title)
     return f"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -3832,7 +3906,7 @@ header{{padding:28px 32px;border-bottom:1px solid #cad0d8;background:#fff;positi
 .bookmark{{display:block;color:#916d16;font-size:.68rem;margin-bottom:7px}}.bookmarked{{box-shadow:inset -4px 0 #c79b36}}
 .paragraph-start{{border-top:3px solid #99a1ac;margin-top:8px}}
 .kind-heading{{margin-top:24px;border-top:3px solid #1a56b8}}.kind-heading p{{font-weight:700;font-size:1.08rem}}.kind-equation p,.kind-table p{{font-family:"Cambria Math",Consolas,monospace;white-space:pre-wrap}}.figure-gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px}}figure{{margin:0;background:#fff}}img{{display:block;width:100%;height:100%;max-height:460px;object-fit:contain;margin:auto;border:1px solid #ddd}}
-.kind-equation .figure-gallery,.kind-algorithm .figure-gallery{{grid-template-columns:minmax(0,1fr);width:100%;min-width:0;margin-bottom:7px;overflow:hidden}}.kind-equation figure,.kind-algorithm figure{{width:100%;max-width:100%;min-width:0}}.kind-equation img,.kind-algorithm img{{display:block;width:100%;max-width:100%;height:auto;border:0;max-height:300px;object-fit:contain}}.kind-algorithm img{{max-height:none}}img.inline-math{{display:inline-block;width:auto;max-width:100%;max-height:none;margin:0 .08em;border:0;object-fit:fill}}.equation-text{{font-size:.68rem;color:#676c72;text-align:left}}.equation-text summary{{cursor:pointer}}.equation-text p{{font-size:.68rem;line-height:1.45;margin-top:7px}}
+.kind-equation .figure-gallery,.kind-algorithm .figure-gallery{{grid-template-columns:minmax(0,1fr);width:100%;min-width:0;margin-bottom:7px;overflow:hidden}}.kind-equation figure,.kind-algorithm figure{{width:100%;max-width:100%;min-width:0}}.kind-equation img,.kind-algorithm img{{display:block;width:100%;max-width:100%;height:auto;border:0;max-height:300px;object-fit:contain}}.kind-algorithm img{{max-height:none}}img.inline-math{{display:inline-block;width:auto;max-width:100%;max-height:none;margin:0 .08em;border:0;object-fit:fill}}.equation-text{{font-size:.68rem;color:#676c72;text-align:left}}.equation-text summary{{cursor:pointer}}.equation-text p{{font-size:.68rem;line-height:1.45;margin-top:7px}}.tex-render{{overflow-x:auto;padding:4px 0}}.tex-code{{margin:6px 0 0;padding:8px 10px;background:#f4f6f9;border:1px solid #dde2e8;border-radius:4px;font:.74rem/1.5 Consolas,monospace;white-space:pre-wrap;word-break:break-all;user-select:all}}
 footer{{padding:24px 32px;text-align:center;font-size:.78rem;color:#676c72}}
 @media(max-width:900px){{.labels,.reader-row{{grid-template-columns:36px minmax(260px,1fr) minmax(260px,1fr)}}.labels .memo-label{{display:none}}.note{{grid-column:2/4;border-top:1px dashed #cad0d8}}}}
 @media(max-width:620px){{header{{padding:20px 16px}}.labels{{display:none}}.reader-row{{grid-template-columns:32px 1fr}}.reader-row>*{{grid-column:2}}.number{{grid-column:1!important;grid-row:1/4}}}}
