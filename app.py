@@ -837,7 +837,7 @@ def _retranslate_segment(job_id: str, job: dict[str, Any], index: int) -> Segmen
             raise TypeError("対訳データが不正です。")
         active_retranslations.add(key)
     try:
-        if segment.kind == "equation" and segment.assets:
+        if segment.kind in {"equation", "algorithm"} and segment.assets:
             translated = segment.source
         elif segment.label == "asset":
             translated = segment.translation or segment.source
@@ -1004,7 +1004,7 @@ def _translation_quality_issues(job: dict[str, Any]) -> list[dict[str, Any]]:
     for segment in job.get("segments", []):
         if not isinstance(segment, Segment) or segment.label == "asset":
             continue
-        if segment.kind == "equation" and segment.assets:
+        if segment.kind in {"equation", "algorithm"} and segment.assets:
             continue
         source = segment.source.strip()
         translation = segment.translation.strip()
@@ -1114,7 +1114,7 @@ def _translate_job(job_id: str, only_missing: bool = False) -> None:
             job["completed"] = index
         if only_missing and (segment.translation.strip() or segment.label == "asset"):
             pass
-        elif segment.kind == "equation" and segment.assets:
+        elif segment.kind in {"equation", "algorithm"} and segment.assets:
             # Preserve the source equation exactly. The bitmap is authoritative;
             # extracted text remains available only for search and copying.
             segment.translation = segment.source

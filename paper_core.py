@@ -1156,7 +1156,7 @@ def _shared_text_ratio(first: str, second: str) -> float:
 
 
 def _needs_translation(segment: Segment) -> bool:
-    if segment.label == "asset" or (segment.kind == "equation" and segment.assets):
+    if segment.label == "asset" or (segment.kind in {"equation", "algorithm"} and segment.assets):
         return False
     return not segment.translation.strip()
 
@@ -1241,7 +1241,7 @@ def merge_reextracted_segments(
             )
             target.translation_revisions = target.translation_revisions[-20:]
     for segment in merged:
-        if segment.kind == "equation" and segment.assets:
+        if segment.kind in {"equation", "algorithm"} and segment.assets:
             # Same rule as the translation run: the image is the equation.
             segment.translation = segment.source
             segment.translation_origin = "source"
@@ -1835,8 +1835,19 @@ def _apply_script_markup(
     output: list[str] = []
     cursor = 0
     for number, part in enumerate(parts):
-        if not part or not raw.startswith(part, cursor):
+        if not part:
             continue
+        if not raw.startswith(part, cursor):
+            # pypdf's text can carry a space or line break that is not one
+            # of the fragments; step over such whitespace to stay in step,
+            # or every later fragment would be missed.
+            stripped = part.lstrip()
+            position = raw.find(stripped, cursor, cursor + 12 + len(stripped)) if stripped else -1
+            if position < 0 or raw[cursor:position].strip():
+                continue
+            output.append(raw[cursor:position])
+            cursor = position
+            part = stripped
         role = role_by_part.get(number)
         if number in substituted_parts:
             # Inline math kept as an image: the first part becomes ⟦M12⟧ and
@@ -2000,7 +2011,7 @@ def _merge_interrupted_sentences(segments: list[Segment]) -> list[Segment]:
             index += 1
             continue
         following_index = index + 1
-        while following_index < len(result) and result[following_index].kind in {"figure", "table"}:
+        while following_index < len(result) and result[following_index].kind in {"figure", "table", "algorithm"}:
             following_index += 1
         if following_index == index + 1 or following_index >= len(result):
             index += 1
@@ -2397,6 +2408,412 @@ def _fragment_char_boxes(
     return result, [box for _character, box in characters]
 
 
+ALGORITHM_MARKER = "\uE105"
+# "Algorithm 1: Name" / "ALGORITHM 1" — not "Algorithm 1 becomes unnecessary".
+ALGORITHM_CAPTION_PATTERN = re.compile(r"^(?:ALGORITHM|Algorithm)\s*(\d{1,3})(?:\s*[:.]|\s*$|\s+(?=[A-Z]))")
+ALGORITHM_LINE_START = re.compile(
+    r"^(?:\d{1,3}:?|Input|Output|Require|Ensure|Data|Result|Procedure|Function|function|procedure|end|return)\b"
+)
+
+
+def _algorithm_blocks(fragments: list[LayoutFragment], page_width: float) -> list[dict[str, Any]]:
+    """Pseudocode boxes: "ALGORITHM 1: Name" followed by numbered lines.
+
+    The block is the caption line and the lines below it in the same column
+    that start with a line number or Input/Output/Require/Ensure, together
+    with the lines in between (indented bodies, scripts). It ends at the
+    last numbered line, before the body text resumes.
+    """
+    blocks: list[dict[str, Any]] = []
+    midpoint = page_width / 2
+    left_margin = min((fragment.x for fragment in fragments), default=36.0)
+    single = _is_single_column_page(fragments, page_width)
+    taken: set[int] = set()
+    for order, fragment in enumerate(fragments):
+        match = ALGORITHM_CAPTION_PATTERN.match(fragment.text.strip())
+        if not match or order in taken:
+            continue
+        # Line numbers can stand left of the caption ("10" under "9").
+        if single:
+            left, right = fragment.x - 16, page_width - left_margin + 4
+        elif fragment.x < midpoint:
+            left, right = fragment.x - 16, midpoint - 2
+        else:
+            left, right = fragment.x - 16, page_width - left_margin + 4
+        caption_y = fragment.y
+        column = [
+            item
+            for item in fragments
+            if left <= item.x < right and caption_y - 650 < item.y <= caption_y + 2 and item.text.strip()
+        ]
+        lines: list[list[LayoutFragment]] = []
+        for item in sorted(column, key=lambda entry: (-entry.y, entry.x)):
+            if lines and abs(lines[-1][0].y - item.y) <= 3.2:
+                lines[-1].append(item)
+            else:
+                lines.append([item])
+        if not lines:
+            continue
+        body = sorted(item.size for item in column)[len(column) // 2]
+        numbered_bottom: float | None = None
+        last_y = caption_y
+        numbers = 0
+        first_numbered_line = -1
+        last_number = 0
+        for position, line in enumerate(lines[1:] if abs(lines[0][0].y - caption_y) <= 3.2 else lines):
+            starts = [item for item in line if item.x <= left + 16] + sorted(line, key=lambda entry: entry.order)[:1]
+            numbered = False
+            for item in starts:
+                token = item.text.strip()
+                digits = re.match(r"(\d{1,3}):?(?:\s|$)", token)
+                if digits:
+                    # Line numbers count up; "into 2 (or 2k)" in the body
+                    # after the box is not line 2.
+                    if int(digits.group(1)) == last_number + 1:
+                        last_number += 1
+                        numbered = True
+                        break
+                elif ALGORITHM_LINE_START.match(token) and last_number == 0:
+                    numbered = True  # Input: / Output: / Require: before line 1
+                    break
+                elif re.match(r"(?:end|return)\b", token) and last_number:
+                    numbered = True  # unnumbered "end" lines of some styles
+                    break
+            small = all(item.size < 0.85 * body for item in line)
+            if last_y - line[0].y > 3.2 * body:
+                break  # a gap: the block is over
+            if numbered:
+                numbers += 1
+                numbered_bottom = min(item.y for item in line)
+                if first_numbered_line < 0:
+                    first_numbered_line = position
+            elif not small and numbered_bottom is not None and min(item.x for item in line) <= left + 26 and (
+                _layout_line_is_prose(line) or heading_level(" ".join(item.text.strip() for item in line)) > 0
+            ):
+                break  # body text or a section heading again
+            last_y = min(item.y for item in line)
+        # Pseudocode starts right under its caption and has several lines.
+        if numbers < 3 or numbered_bottom is None or not 0 <= first_numbered_line <= 3:
+            continue
+        bottom = numbered_bottom - 0.45 * body
+        top = caption_y + 1.05 * body
+        orders = [item.order for item in fragments if left <= item.x < right and bottom - 1 <= item.y <= top]
+        if orders:
+            # Some producers draw part of the box under another transform,
+            # so many of its fragments report one shared, meaningless
+            # position. Those inside the box's run of the stream belong to it.
+            shared = Counter((round(item.x), round(item.y)) for item in fragments)
+            low, high = min(orders), max(orders)
+            while high + 1 < len(fragments) and shared[(round(fragments[high + 1].x), round(fragments[high + 1].y))] >= 3:
+                high += 1  # the box's last line drawn the same way
+            orders += [
+                item.order
+                for item in fragments[low : high + 1]
+                if shared[(round(item.x), round(item.y))] >= 3 and not (left <= item.x < right and bottom - 1 <= item.y <= top)
+            ]
+        taken.update(orders)
+        caption_orders = [item.order for item in fragments if abs(item.y - caption_y) <= 2 and left <= item.x < right]
+        blocks.append(
+            {
+                "number": int(match.group(1)),
+                "orders": sorted(set(orders)),
+                "caption": re.sub(r"\s+", " ", "".join(fragments[o].text for o in sorted(caption_orders))).strip(),
+                "box": (left, bottom, right, top),
+            }
+        )
+    return blocks
+
+
+def _render_algorithms(
+    pdfium_document: Any,
+    page_index: int,
+    fragments: list[LayoutFragment],
+    page_width: float,
+    page_height: float,
+    asset_dir: Path | None,
+    url_prefix: str,
+    registry: dict[str, dict[str, Any]],
+) -> dict[int, str]:
+    """Crop each pseudocode box and return text substitutions for its fragments."""
+    blocks = _algorithm_blocks(fragments, page_width)
+    if not blocks or pdfium_document is None or asset_dir is None:
+        return {}
+    from PIL import Image, ImageChops
+
+    substitutions: dict[int, str] = {}
+    page = pdfium_document[page_index]
+    try:
+        for block in blocks:
+            left, bottom, right, top = block["box"]
+            image = page.render(scale=3, crop=(left, bottom, page_width - right, page_height - top)).to_pil().convert("RGB")
+            content = ImageChops.difference(image, Image.new("RGB", image.size, "white")).getbbox()
+            if content:
+                image = image.crop((max(0, content[0] - 9), max(0, content[1] - 9), min(image.width, content[2] + 9), min(image.height, content[3] + 9)))
+            key = f"A{len(registry) + 1}"
+            filename = f"page-{page_index + 1:03d}-algorithm-{block['number']:02d}.png"
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            image.save(asset_dir / filename, format="PNG", optimize=True)
+            body = re.sub(r"\s+", " ", " ".join(fragments[order].text for order in block["orders"])).strip()
+            registry[key] = {
+                "src": f"{url_prefix.rstrip('/')}/{filename}",
+                "text": body,
+                "label": f"algorithm:{block['number']}",
+            }
+            for order in block["orders"]:
+                substitutions[order] = ""
+            substitutions[block["orders"][0]] = f"\n\n{ALGORITHM_MARKER}{key}\n\n"
+    finally:
+        page.close()
+    return substitutions
+
+
+def _place_algorithms(segments: list[Segment], registry: dict[str, dict[str, Any]]) -> None:
+    """Turn the marker rows into pseudocode rows: the image, with the text for search."""
+    for segment in segments:
+        match = re.fullmatch(rf"\s*{ALGORITHM_MARKER}(A\d+)\s*", segment.source)
+        if not match or match.group(1) not in registry:
+            continue
+        item = registry[match.group(1)]
+        segment.kind = "algorithm"
+        segment.label = item["label"]
+        segment.source = item["text"]
+        segment.assets = [item["src"]]
+        segment.heading_level = 0
+
+
+def _table_line_is_prose(joined: str) -> bool:
+    """A sentence of body text, as opposed to a table row.
+
+    Body text is mostly lowercase words, and either a long line or one that
+    ends a sentence. A header row ("Total Time (sec.) of Curved Layer") is
+    capitalised; a row of cells ("data/jobs one JSON file per translation")
+    is short and has no full stop.
+    """
+    words = re.findall(r"[A-Za-z][A-Za-z'-]+", joined)
+    lowercase = sum(word[0].islower() for word in words)
+    numbers = len(re.findall(r"\d+(?:[.,]\d+)*", strip_script_markup(joined)))
+    if re.search(rf"[{CJK_CHARACTER}]{{12,}}", joined):
+        return True
+    if len(words) < 3 or lowercase < 0.6 * len(words):
+        return False
+    if len(words) >= 8:
+        return numbers < len(words) // 2
+    return bool(re.search(r"[.:;]\s*$", joined.strip())) and numbers < 3
+
+
+def _table_blocks(
+    fragments: list[LayoutFragment], captions: list[PositionedCaption], page_width: float
+) -> list[dict[str, Any]]:
+    """The body of each text table next to its "Table N." caption.
+
+    Most styles put the caption above the table, some below. The body is
+    the run of lines on that side of the caption, in its column (or across
+    the page when the caption or the table spans it), up to the body text,
+    a heading or another caption. Small footnote lines right after the
+    table ("†The time reported ...") belong to it.
+    """
+    midpoint = page_width / 2
+    left_margin = min((fragment.x for fragment in fragments), default=36.0)
+    right_margin = page_width - left_margin
+    single = _is_single_column_page(fragments, page_width)
+    sizes = sorted(fragment.size for fragment in fragments) or [10.0]
+    body = sizes[len(sizes) // 2]
+    caption_starts = {(round(caption.x), round(caption.y)) for caption in captions}
+    blocks: list[dict[str, Any]] = []
+    for caption in captions:
+        identity = _caption_identity(caption.text)
+        if not identity or identity[0] != "table":
+            continue
+        caption_text = re.sub(r"\s+", "", strip_script_markup(caption.text))
+
+        def lines_between(x_from: float, x_to: float, below: bool) -> list[list[LayoutFragment]]:
+            selected = [
+                item
+                for item in fragments
+                if x_from - 2 <= item.x < x_to and item.text.strip() and ((item.y < caption.y - 1) if below else (item.y > caption.y + 1))
+            ]
+            lines: list[list[LayoutFragment]] = []
+            for item in sorted(selected, key=lambda entry: (-entry.y if below else entry.y, entry.x)):
+                if lines and abs(lines[-1][0].y - item.y) <= 3.2:
+                    lines[-1].append(item)
+                else:
+                    lines.append([item])
+            return lines
+
+        def collect(x_from: float, x_to: float, below: bool) -> list[list[LayoutFragment]]:
+            width = x_to - x_from
+            kept: list[list[LayoutFragment]] = []
+            previous_y = caption.y
+            in_caption = below
+            for line in lines_between(x_from, x_to, below):
+                y = line[0].y
+                if abs(previous_y - y) > 3.5 * body:
+                    break
+                # Some producers write one fragment per word with no spaces.
+                joined = re.sub(r"\s+", " ", " ".join(item.text for item in sorted(line, key=lambda entry: entry.order))).strip()
+                compact = re.sub(r"\s+", "", strip_script_markup(joined))
+                if in_caption and compact and compact in caption_text:
+                    previous_y = y
+                    continue  # a wrapped caption line
+                in_caption = False
+                if any((round(item.x), round(item.y)) in caption_starts for item in line):
+                    break  # the next caption
+                if any(_equation_number_of(item.text) is not None for item in line):
+                    break  # a numbered display equation follows the table
+                # Body text is a sentence: mostly lowercase words, long or
+                # ending in a full stop. A header row ("Total Time (sec.) of
+                # Curved Layer ...") is capitalised; a data row has numbers.
+                # The line's width is not used: a column can be misjudged.
+                prose = _table_line_is_prose(joined)
+                small = all(item.size < 0.9 * body for item in line)
+                if (prose and not small) or heading_level(joined.strip()) > 0:
+                    break  # body text or a heading again
+                kept.append(line)
+                previous_y = y
+            return kept
+
+        full = (left_margin - 4, right_margin + 4)
+        column = full if single else ((left_margin - 4, midpoint - 2) if caption.x < midpoint else (midpoint - 2, right_margin + 4))
+        # A caption that runs past the middle of the page belongs to a
+        # table across the page.
+        # The caption line's end: walk its words from the start while they
+        # follow each other; the other column's text beyond a gap is not it.
+        caption_end = caption.x
+        for item in sorted((item for item in fragments if abs(item.y - caption.y) <= 2 and item.x >= caption.x - 2), key=lambda entry: entry.x):
+            if item.x - caption_end > 2.5 * item.size:
+                break
+            caption_end = max(caption_end, item.x + 0.45 * item.size * len(item.text.strip()))
+        if caption.x < midpoint and caption_end > midpoint + 20 and caption.x > left_margin + 20:
+            column = full
+        best: tuple[list[list[LayoutFragment]], tuple[float, float]] | None = None
+        for below in (True, False):
+            lines = collect(*column, below)
+            if len(lines) < 2:
+                continue
+            span = column
+            if column != full:
+                # A table across the page has cells in the other column on
+                # the same rows; a column table has body text beside it.
+                wide = collect(*full, below)
+                low = min(item.y for line in lines for item in line)
+                other = [
+                    item
+                    for line in wide
+                    for item in line
+                    if item.y >= low - 1 and ((item.x >= midpoint + 4) if caption.x < midpoint else (item.x < midpoint - 4))
+                ]
+                if len(wide) >= len(lines) and len(other) >= 2:
+                    lines, span = wide, full
+            # The side with more table lines holds the table.
+            if best is None or len(lines) > len(best[0]):
+                best = (lines, span)
+        if not best:
+            continue
+        lines, (x_from, x_to) = best
+        texts = [" ".join(item.text for item in sorted(line, key=lambda entry: entry.order)) for line in lines]
+        sentences = sum(
+            1
+            for value in texts
+            if len(re.findall(r"[A-Za-z][A-Za-z'-]+", value)) >= 5
+            and sum(word[0].islower() for word in re.findall(r"[A-Za-z][A-Za-z'-]+", value))
+            >= 0.6 * len(re.findall(r"[A-Za-z][A-Za-z'-]+", value))
+        )
+        if sentences * 3 > len(lines):
+            continue  # mostly sentences: body text, not a table
+        members = [item for line in lines for item in line]
+        low = min(item.y for item in members) - 0.4 * body
+        high = max(item.y for item in members) + 1.0 * body
+        # A sentence caught at the edge of the crop (body text, a footnote)
+        # stays in the body text too: better shown twice than lost. Judged
+        # per line (one fragment per word) and per fragment (one per line).
+        def sentence_like(value: str) -> bool:
+            words = re.findall(r"[A-Za-z][A-Za-z'-]+", value)
+            return len(words) >= 3 and sum(word[0].islower() for word in words) >= 0.6 * len(words)
+
+        kept_text = {item.order for line, value in zip(lines, texts) if sentence_like(value) for item in line}
+        kept_text |= {item.order for item in members if sentence_like(item.text)}
+        # pypdf can report a cell at the start of its text chunk, outside
+        # the box; cells drawn in the table's run of the stream, within its
+        # rows, belong to it unless they read as a sentence.
+        orders = {item.order for item in members}
+        first, last = min(orders), max(orders)
+        # Cells can also report one shared, meaningless position (0, 0).
+        shared = Counter((round(item.x), round(item.y)) for item in fragments)
+        while last + 1 < len(fragments) and shared[(round(fragments[last + 1].x), round(fragments[last + 1].y))] >= 3:
+            last += 1
+        for item in fragments[first : last + 1]:
+            bogus = shared[(round(item.x), round(item.y))] >= 3
+            inside = low - 2 <= item.y <= high + 2 and x_from - 2 <= item.x < x_to
+            if item.order in orders or not (bogus or inside):
+                continue
+            words = re.findall(r"[A-Za-z][A-Za-z'-]+", item.text)
+            if len(words) >= 4 and sum(word[0].islower() for word in words) >= 0.6 * len(words):
+                continue
+            orders.add(item.order)
+        blocks.append(
+            {
+                "identity": identity,
+                "orders": sorted(orders - kept_text),
+                "box": (x_from, low, x_to, high),
+            }
+        )
+    return blocks
+
+
+def _render_tables(
+    pdfium_document: Any,
+    page_index: int,
+    fragments: list[LayoutFragment],
+    captions: list[PositionedCaption],
+    page_width: float,
+    page_height: float,
+    asset_dir: Path | None,
+    url_prefix: str,
+    registry: dict[tuple[int, int], str],
+) -> dict[int, str]:
+    """Crop each text table's body; its text leaves the body text."""
+    if pdfium_document is None or asset_dir is None:
+        return {}
+    blocks = _table_blocks(fragments, captions, page_width)
+    if not blocks:
+        return {}
+    from PIL import Image, ImageChops
+
+    substitutions: dict[int, str] = {}
+    page = pdfium_document[page_index]
+    try:
+        for block in blocks:
+            left, bottom, right, top = block["box"]
+            image = page.render(scale=3, crop=(left, bottom, page_width - right, page_height - top)).to_pil().convert("RGB")
+            content = ImageChops.difference(image, Image.new("RGB", image.size, "white")).getbbox()
+            if not content or content[3] - content[1] < 24 or content[2] - content[0] < 60:
+                continue  # nothing drawn there: keep the text
+            image = image.crop((max(0, content[0] - 9), max(0, content[1] - 9), min(image.width, content[2] + 9), min(image.height, content[3] + 9)))
+            number = block["identity"][1]
+            filename = f"page-{page_index + 1:03d}-table-{number:02d}.png"
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            image.save(asset_dir / filename, format="PNG", optimize=True)
+            registry[(page_index + 1, number)] = f"{url_prefix.rstrip('/')}/{filename}"
+            for order in block["orders"]:
+                substitutions[order] = ""
+            if block["orders"]:
+                substitutions[block["orders"][0]] = "\n\n"
+    finally:
+        page.close()
+    return substitutions
+
+
+def _attach_tables(segments: list[Segment], page_number: int, registry: dict[tuple[int, int], str]) -> None:
+    """Give each "Table N." caption row the image of its table."""
+    for segment in segments:
+        identity = _caption_identity(segment.source)
+        if not identity or identity[0] != "table":
+            continue
+        asset = registry.get((page_number, identity[1]))
+        if asset and asset not in segment.assets:
+            segment.assets.append(asset)
+
+
 def _render_inline_math(
     pdfium_document: Any,
     page_index: int,
@@ -2583,6 +3000,8 @@ def extract_document(
             tuple[list[tuple[str, str, float]], list[tuple[float, str, float]], list[tuple[float, str]]]
         ] = []
         inline_math: dict[str, dict[str, Any]] = {}
+        algorithms: dict[str, dict[str, Any]] = {}
+        tables: dict[tuple[int, int], str] = {}
         for page_index, page in enumerate(reader.pages):
             _attach_cid_to_unicode(page)
             fragments: list[tuple[float, float, str]] = []
@@ -2678,15 +3097,40 @@ def extract_document(
                     page_width,
                     page_height,
                 )
-                substitutions: dict[int, str] = {}
+                substitutions = _render_algorithms(
+                    pdfium_document,
+                    page_index,
+                    layout_fragments,
+                    page_width,
+                    page_height,
+                    asset_dir,
+                    asset_url_prefix,
+                    algorithms,
+                )
+                table_captions = _positioned_captions(fragments, page_width / 2, [fragment.size for fragment in layout_fragments])
+                substitutions |= {
+                    order: value
+                    for order, value in _render_tables(
+                        pdfium_document,
+                        page_index,
+                        layout_fragments,
+                        table_captions,
+                        page_width,
+                        page_height,
+                        asset_dir,
+                        asset_url_prefix,
+                        tables,
+                    ).items()
+                    if order not in substitutions
+                }
                 if inline_math_images and pdfium_document is not None and asset_dir is not None:
-                    substitutions = _render_inline_math(
+                    substitutions = substitutions | _render_inline_math(
                         pdfium_document,
                         page_index,
                         layout_fragments,
                         fragment_fonts,
                         roles,
-                        figure_text,
+                        figure_text | set(substitutions),
                         page_width,
                         page_height,
                         asset_dir,
@@ -2800,6 +3244,8 @@ def extract_document(
                 asset_url_prefix,
             )
             _attach_equation_images(segments[page_start:], equation_assets)
+            _place_algorithms(segments[page_start:], algorithms)
+            _attach_tables(segments[page_start:], page_number, tables)
             images = _extract_page_images(
                 page,
                 asset_dir,
@@ -3318,7 +3764,7 @@ def bilingual_html(
         )
         if images:
             images = f'<div class="figure-gallery">{images}</div>'
-        equation_image = segment.kind == "equation" and bool(images)
+        equation_image = segment.kind in {"equation", "algorithm"} and bool(images)
         if equation_image:
             source_content = (
                 f'{images}<details class="equation-text"><summary>検索用テキスト</summary>'
@@ -3356,11 +3802,11 @@ header{{padding:28px 32px;border-bottom:1px solid #cad0d8;background:#fff;positi
 .labels,.reader-row{{display:grid;grid-template-columns:44px minmax(300px,1fr) minmax(300px,1fr) minmax(230px,.72fr);max-width:1800px;margin:auto}}
 .labels{{position:sticky;top:89px;z-index:2;background:#1a56b8;color:#fff;font-size:.72rem;letter-spacing:.1em}}.labels>*{{padding:10px 18px;border-right:1px solid #3b80da}}
 .reader-row{{background:#fff;border-bottom:1px solid #d1d7de;align-items:stretch}}.reader-row>*{{padding:10px 12px;border-right:1px solid #d5dae1;min-width:0}}
-.number{{color:#717881;text-align:center;padding:22px 5px}}.number b,.number span{{display:block}}.number b{{font:italic .72rem Georgia,serif}}.number span{{font-size:.58rem;line-height:1.45;margin-top:7px}}p{{white-space:pre-wrap;line-height:1.78;margin:0;overflow-wrap:anywhere}}.source p{{font-family:Georgia,"Times New Roman","Yu Mincho",serif}}.translation{{background:#f9fafc}}.note{{background:#edf2f8;color:#5f6267;font-size:.86rem}}.note span{{color:#9da0a4}}
+.number{{color:#717881;text-align:center;padding:22px 5px}}.number b,.number span{{display:block}}.number b{{font:italic .72rem Georgia,serif}}.number span{{font-size:.58rem;line-height:1.45;margin-top:7px}}p{{white-space:pre-wrap;line-height:1.78;margin:0;overflow-wrap:anywhere}}.source p{{font-family:Georgia,"Times New Roman","Yu Mincho",serif}}.translation{{background:#fff}}.note{{background:#edf2f8;color:#5f6267;font-size:.86rem}}.note span{{color:#9da0a4}}
 .bookmark{{display:block;color:#916d16;font-size:.68rem;margin-bottom:7px}}.bookmarked{{box-shadow:inset -4px 0 #c79b36}}
 .paragraph-start{{border-top:3px solid #99a1ac;margin-top:8px}}
 .kind-heading{{margin-top:24px;border-top:3px solid #1a56b8}}.kind-heading p{{font-weight:700;font-size:1.08rem}}.kind-equation p,.kind-table p{{font-family:"Cambria Math",Consolas,monospace;white-space:pre-wrap}}.figure-gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px}}figure{{margin:0;background:#fff}}img{{display:block;width:100%;height:100%;max-height:460px;object-fit:contain;margin:auto;border:1px solid #ddd}}
-.kind-equation .figure-gallery{{grid-template-columns:minmax(0,1fr);width:100%;min-width:0;margin-bottom:7px;overflow:hidden}}.kind-equation figure{{width:100%;max-width:100%;min-width:0}}.kind-equation img{{display:block;width:100%;max-width:100%;height:auto;border:0;max-height:300px;object-fit:contain}}.equation-text{{font-size:.68rem;color:#676c72;text-align:left}}.equation-text summary{{cursor:pointer}}.equation-text p{{font-size:.68rem;line-height:1.45;margin-top:7px}}
+.kind-equation .figure-gallery,.kind-algorithm .figure-gallery{{grid-template-columns:minmax(0,1fr);width:100%;min-width:0;margin-bottom:7px;overflow:hidden}}.kind-equation figure,.kind-algorithm figure{{width:100%;max-width:100%;min-width:0}}.kind-equation img,.kind-algorithm img{{display:block;width:100%;max-width:100%;height:auto;border:0;max-height:300px;object-fit:contain}}.kind-algorithm img{{max-height:none}}img.inline-math{{display:inline-block;width:auto;max-width:100%;max-height:none;margin:0 .08em;border:0;object-fit:fill}}.equation-text{{font-size:.68rem;color:#676c72;text-align:left}}.equation-text summary{{cursor:pointer}}.equation-text p{{font-size:.68rem;line-height:1.45;margin-top:7px}}
 footer{{padding:24px 32px;text-align:center;font-size:.78rem;color:#676c72}}
 @media(max-width:900px){{.labels,.reader-row{{grid-template-columns:36px minmax(260px,1fr) minmax(260px,1fr)}}.labels .memo-label{{display:none}}.note{{grid-column:2/4;border-top:1px dashed #cad0d8}}}}
 @media(max-width:620px){{header{{padding:20px 16px}}.labels{{display:none}}.reader-row{{grid-template-columns:32px 1fr}}.reader-row>*{{grid-column:2}}.number{{grid-column:1!important;grid-row:1/4}}}}
