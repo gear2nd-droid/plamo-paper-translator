@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from paper_core import (
+    CAPTION_MARKER,
     HEADING_MARKER,
     ExtractedPageImage,
     LayoutFragment,
@@ -359,6 +360,27 @@ class CoreTests(unittest.TestCase):
         ]
         captions = _positioned_captions(fragments, 297, [8.5, 9.2, 9.2], 9.2)
         self.assertEqual([caption.text for caption in captions], ["図 2: 提案手法の全体図．"])
+
+    def test_word_fragments_without_spaces_still_mark_the_caption(self):
+        # Elsevier draws each word as its own fragment with no space
+        # characters; the caption reads "Fig.5.Errorplots..." in the layout.
+        words = ["Fig.", "5.", "Error", "plots", "for", "GPyro", "applied", "on", "the", "deposition", "plane."]
+        fragments = [(306.0 + 20 * position, 700.0, word) for position, word in enumerate(words)]
+        sizes = [6.4] * len(words)
+        captions = _positioned_captions(fragments, 297, sizes, 8.0, small_captions=True)
+        self.assertEqual(len(captions), 1)
+        text = "Evaluation metrics include the mean average percentage error\nFig. 5. Error plots for GPyro applied on the deposition plane.\n"
+        marked = _mark_caption_boundaries(text, [caption.text for caption in captions])
+        self.assertIn(f"\n\n{CAPTION_MARKER}Fig. 5. Error plots for GPyro applied on the deposition plane.", marked)
+        self.assertTrue(marked.startswith("Evaluation metrics include the mean average percentage error"))
+
+    def test_body_size_figure_reference_is_no_caption_when_captions_are_small(self):
+        # "... shown in\nFig. 4. The data from ..." starts a body line.
+        fragments = [(306.0, 74.6, "Fig."), (322.0, 74.6, "4"), (326.0, 74.6, "."), (330.0, 74.6, "The"), (350.0, 74.6, "data")]
+        sizes = [8.0] * len(fragments)
+        self.assertEqual(_positioned_captions(fragments, 297, sizes, 8.0, small_captions=True), [])
+        # Documents that set captions in the body size keep them.
+        self.assertEqual(len(_positioned_captions(fragments, 297, sizes, 8.0)), 1)
 
     def test_algorithm_box_takes_numbered_lines_and_stops_at_body_text(self):
         fragments = [
@@ -1128,6 +1150,62 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(payload["segments"][0]["bookmarked"])
         self.assertTrue(payload["segments"][0]["clipped"])
         self.assertEqual(payload["segments"][0]["clips"], ["translation"])
+
+    def test_text_clipped_by_a_form_bbox_is_left_out(self):
+        # MDPI places a whole page of the review manuscript as a form and
+        # lets its /BBox show only the figure: the rest of that page's text
+        # is never drawn and must not become body text.
+        from pypdf import PdfWriter
+        from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, NameObject, StreamObject
+
+        def text_ops(lines):
+            return "".join(f"BT /F1 10 Tf 1 0 0 1 {x} {y} Tm ({value}) Tj ET\n" for x, y, value in lines)
+
+        writer = PdfWriter()
+        page = writer.add_blank_page(width=595, height=842)
+        font = DictionaryObject(
+            {NameObject("/Type"): NameObject("/Font"), NameObject("/Subtype"): NameObject("/Type1"), NameObject("/BaseFont"): NameObject("/Helvetica")}
+        )
+        form = StreamObject()
+        form.set_data(
+            text_ops(
+                [
+                    (120, 520, "Hidden manuscript sentence that is clipped away."),
+                    (120, 500, "Another hidden line of the review manuscript page."),
+                    (150, 300, "Label A"),
+                ]
+            ).encode()
+        )
+        form.update(
+            {
+                NameObject("/Type"): NameObject("/XObject"),
+                NameObject("/Subtype"): NameObject("/Form"),
+                NameObject("/BBox"): ArrayObject([FloatObject(100), FloatObject(250), FloatObject(400), FloatObject(400)]),
+                NameObject("/Resources"): DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})}),
+            }
+        )
+        body = [(72, 780 - 14 * row, f"Body sentence number {row} explains the visible method in plain words.") for row in range(8)]
+        content = StreamObject()
+        content.set_data(
+            (text_ops(body) + "q 0.5 0 0 0.5 100 100 cm /Fm1 Do Q\n" + text_ops([(72, 120, "Figure 1. A visible caption.")])).encode()
+        )
+        page[NameObject("/Contents")] = writer._add_object(content)
+        page[NameObject("/Resources")] = DictionaryObject(
+            {
+                NameObject("/Font"): DictionaryObject({NameObject("/F1"): font}),
+                NameObject("/XObject"): DictionaryObject({NameObject("/Fm1"): writer._add_object(form)}),
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "clipped.pdf"
+            with path.open("wb") as handle:
+                writer.write(handle)
+            segments, _pages = extract_document(path)
+        text = " ".join(segment.source for segment in segments)
+        self.assertNotIn("Hidden manuscript", text)
+        self.assertNotIn("review manuscript", text)
+        self.assertIn("Body sentence number 0", text)
+        self.assertIn("Figure 1. A visible caption.", text)
 
 
 if __name__ == "__main__":

@@ -242,6 +242,7 @@ function showResults(data) {
   state.paperTags = Array.isArray(data.tags) ? data.tags.filter((tag) => typeof tag === 'string') : [];
   state.paperSummary = String(data.paper_summary || '');
   state.paperSourceUrl = String(data.source_url || '');
+  state.paperTitle = String(data.title || '');
   state.paperReadingStatus = ['unread','reading','completed','archived'].includes(data.reading_status) ? data.reading_status : 'unread';
   state.readingIndex = Math.max(0, Number(data.reading_index) || 0);
   state.lastSavedReadingIndex = state.readingIndex;
@@ -1179,8 +1180,122 @@ function insertIntoSummary(text) {
   onSummaryInput();
 }
 
+const RESEARCH_NOTE_HEADINGS = ['研究課題', '提案・手法', 'データ／実験条件', '主要な結果', '新規性・貢献', '限界・注意点', '次に確認すること'];
+const AI_SERVICES = {
+  chatgpt: {name:'ChatGPT', url:(prompt) => `https://chatgpt.com/?q=${encodeURIComponent(prompt)}`},
+  other: {name:'AI', url:null},
+};
+
+// The paper's public address: a URL, a DOI or an arXiv identifier.
+function publicPaperUrl(value) {
+  const text = String(value || '').trim();
+  if (/^https?:\/\/\S+$/i.test(text) && !/^https?:\/\/(?:127\.0\.0\.1|localhost)\b/i.test(text)) return text;
+  const doi = text.match(/^(?:doi:\s*|https?:\/\/(?:dx\.)?doi\.org\/)?(10\.\d{4,9}\/\S+)$/i);
+  if (doi) return `https://doi.org/${doi[1]}`;
+  const arxiv = text.match(/^(?:arxiv:\s*)?(\d{4}\.\d{4,5}(?:v\d+)?)$/i);
+  if (arxiv) return `https://arxiv.org/abs/${arxiv[1]}`;
+  return '';
+}
+
+function aiNotePrompt() {
+  const url = publicPaperUrl($('paperSourceUrl').value || state.paperSourceUrl);
+  const title = state.paperTitle || $('title').value || '';
+  return [
+    '次の論文を、URL から本文を読んで、日本語の研究ノートにまとめてください。',
+    '',
+    title ? `論文: ${title}` : null,
+    `URL: ${url}`,
+    '',
+    '# 書き方',
+    `- 次の見出しをこの順に、Markdown の「## 見出し」で書く: ${RESEARCH_NOTE_HEADINGS.join(' / ')}`,
+    '- 各見出しの下は箇条書き（- ）で書き、具体的な数値・条件を含める',
+    '- 論文の図・表・数式に触れるときは「図2」「表1」「式(4)」のように論文中の番号で書く',
+    '- 数式は TeX で、文中は $...$、独立した式は $$...$$ で書く',
+    '- 論文に書かれていないことは書かない。推測には「（推測）」と付ける',
+    '- URL から本文を読めない場合は、まとめを作らず、読めなかったことだけを書く',
+    '- 回答は Markdown のまとめだけにし、前置きや締めの文は書かない',
+  ].filter((line) => line !== null).join('\n');
+}
+
+function updateAiNoteDialog() {
+  const url = publicPaperUrl($('paperSourceUrl').value || state.paperSourceUrl);
+  const service = AI_SERVICES[$('aiNoteService').value] || AI_SERVICES.other;
+  $('aiNoteUrl').innerHTML = url
+    ? `論文の URL: <a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a>`
+    : '<b>原文URL / DOI が未設定です。</b>まとめパネル上部の「タグ・原文URL・読書状態」で、論文の URL（arXiv・DOI など）を入力してください。';
+  $('aiNoteUrl').classList.toggle('missing', !url);
+  if (url && (!$('aiNotePrompt').value || $('aiNotePrompt').dataset.generated === 'true')) {
+    $('aiNotePrompt').value = aiNotePrompt();
+    $('aiNotePrompt').dataset.generated = 'true';
+  }
+  if (!url) $('aiNotePrompt').value = '';
+  $('aiNoteCopy').disabled = !url;
+  $('aiNoteOpen').disabled = !url;
+  $('aiNoteOpen').hidden = !service.url;
+  $('aiNoteOpen').textContent = `コピーして ${service.name} を開く`;
+}
+
+function openAiNoteDialog() {
+  $('aiNotePrompt').dataset.generated = 'true';
+  $('aiNotePrompt').value = '';
+  $('aiNoteStatus').textContent = '';
+  updateAiNoteDialog();
+  $('aiNoteDialog').showModal();
+}
+
+async function copyAiNotePrompt(open) {
+  const prompt = $('aiNotePrompt').value.trim();
+  if (!prompt) return;
+  const copied = await copyText(prompt);
+  const service = AI_SERVICES[$('aiNoteService').value] || AI_SERVICES.other;
+  if (open && service.url) window.open(service.url(prompt), '_blank', 'noopener');
+  $('aiNoteStatus').textContent = copied
+    ? (open ? `指示文をコピーして ${service.name} を開きました。回答ができたら、コピーして下に貼り付けてください。` : '指示文をコピーしました。AI の画面に貼り付けて送信してください。')
+    : 'クリップボードにコピーできませんでした。指示文を選択してコピーしてください。';
+}
+
+// The answer as a note: no code fence or chat around it, a line saying where it came from.
+function aiNoteFromAnswer(answer, serviceName) {
+  let text = String(answer || '').replace(/\r\n/g, '\n').trim();
+  const fenced = text.match(/^```(?:markdown|md)?\n([\s\S]*?)\n```$/i);
+  if (fenced) text = fenced[1].trim();
+  const firstHeading = text.search(/^#{1,3}\s/m);
+  if (firstHeading > 0 && firstHeading < 400) text = text.slice(firstHeading);
+  const date = new Date().toISOString().slice(0, 10);
+  return `> ${serviceName} による下書き（${date}、論文の URL から作成）。内容は原文で確認してください。\n\n${text}`;
+}
+
+async function pasteAiNoteAnswer() {
+  try {
+    $('aiNoteAnswer').value = await navigator.clipboard.readText();
+    $('aiNoteStatus').textContent = '貼り付けました。内容を確認して「まとめに取り込む」を押してください。';
+  } catch (_) {
+    $('aiNoteStatus').textContent = 'クリップボードを読めませんでした。回答の欄に Ctrl+V で貼り付けてください。';
+  }
+}
+
+function importAiNoteAnswer() {
+  const answer = $('aiNoteAnswer').value.trim();
+  if (!answer) {
+    $('aiNoteStatus').textContent = 'AI の回答を貼り付けてください。';
+    return;
+  }
+  const service = AI_SERVICES[$('aiNoteService').value] || AI_SERVICES.other;
+  const note = aiNoteFromAnswer(answer, service.name === 'AI' ? 'AI' : service.name);
+  const missing = RESEARCH_NOTE_HEADINGS.filter((heading) => !note.includes(heading));
+  const editor = $('paperSummaryText');
+  const replace = document.querySelector('input[name="aiNoteMode"]:checked')?.value === 'replace';
+  setSummaryMode('edit');
+  if (replace || !editor.value.trim()) editor.value = note.slice(0, 20000);
+  else editor.value = `${editor.value.replace(/\s+$/, '')}\n\n${note}`.slice(0, 20000);
+  editor.setSelectionRange(editor.value.length, editor.value.length);
+  onSummaryInput();
+  $('aiNoteDialog').close();
+  toast(missing.length === RESEARCH_NOTE_HEADINGS.length ? 'まとめに取り込みました（研究ノートの見出しが見つかりません。AI が論文を読めたか確認してください）' : 'まとめに取り込みました');
+}
+
 function insertPaperSummaryTemplate() {
-  const template = ['研究課題', '提案・手法', 'データ／実験条件', '主要な結果', '新規性・貢献', '限界・注意点', '次に確認すること']
+  const template = RESEARCH_NOTE_HEADINGS
     .map((heading) => `## ${heading}\n- `).join('\n\n');
   setSummaryMode('edit');
   insertIntoSummary(template);
@@ -1522,6 +1637,15 @@ $('paperReadingStatus').addEventListener('change', () => { updateSummaryMetaHint
 $('paperSummaryText').addEventListener('input', onSummaryInput);
 ['click', 'keyup'].forEach((name) => $('paperSummaryText').addEventListener(name, updateSummaryCaretPreview));
 $('paperSummaryTemplate').addEventListener('click', insertPaperSummaryTemplate);
+$('aiNoteButton').addEventListener('click', openAiNoteDialog);
+$('aiNoteClose').addEventListener('click', () => $('aiNoteDialog').close());
+$('aiNoteDialog').addEventListener('click', (event) => { if (event.target === $('aiNoteDialog')) $('aiNoteDialog').close(); });
+$('aiNoteService').addEventListener('change', updateAiNoteDialog);
+$('aiNotePrompt').addEventListener('input', () => { $('aiNotePrompt').dataset.generated = 'false'; });
+$('aiNoteCopy').addEventListener('click', () => copyAiNotePrompt(false));
+$('aiNoteOpen').addEventListener('click', () => copyAiNotePrompt(true));
+$('aiNotePaste').addEventListener('click', pasteAiNoteAnswer);
+$('aiNoteImport').addEventListener('click', importAiNoteAnswer);
 $('summaryModeEdit').addEventListener('click', () => { setSummaryMode('edit'); $('paperSummaryText').focus({preventScroll:true}); });
 $('summaryModePreview').addEventListener('click', () => setSummaryMode('preview'));
 $('summaryHelpToggle').addEventListener('click', () => {
