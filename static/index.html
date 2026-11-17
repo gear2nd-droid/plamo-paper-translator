@@ -132,7 +132,7 @@
       </div>
     </section>
 
-    <section class="privacy-note"><b>データの扱い</b><p>PDF本文と翻訳結果は <code>data/</code> に保存されます。PLaMo 3 Translate と llama.cpp はローカルで動作し、翻訳時のインターネット接続は不要です。</p></section>
+    <section class="privacy-note"><b>データの扱い</b><p>PDF本文と翻訳結果は <code>data/</code> に保存されます。PLaMo 3 Translate と llama.cpp はローカルで動作し、翻訳時のインターネット接続は不要です。まとめの「AIでまとめる」を使う場合も、このアプリからは何も送信しません。あなたが ChatGPT などに送るのは論文のタイトルと URL を含む指示文だけで、本文や訳文は渡しません。</p></section>
   </main>
   <footer><span>PLaMo Paper Translator</span><span>Built with PLaMo · <a href="https://plamo.preferredai.jp/info/plamo-community-license-ja" target="_blank" rel="noreferrer">PLaMo Community License</a> · Local inference with llama.cpp</span></footer>
   <aside id="summaryPanel" class="summary-panel" aria-labelledby="paperSummaryTitle" hidden>
@@ -155,6 +155,7 @@
       <div id="summaryEditPane" class="summary-edit-pane">
         <div class="summary-toolbar">
           <button id="paperSummaryTemplate" type="button">研究ノート雛形</button>
+          <button id="aiNoteButton" type="button" title="ChatGPT などに論文のURLから読んでもらい、研究ノートの形でまとめた結果を取り込みます">AIでまとめる</button>
           <button id="summaryHelpToggle" type="button" aria-expanded="false" aria-controls="summaryHelp">書き方</button>
           <small id="paperSummaryLength">0 / 20,000</small>
         </div>
@@ -177,6 +178,38 @@
     </div>
     <div class="summary-panel-footer"><p id="paperSummaryStatus" class="dialog-status">入力すると自動保存します。</p></div>
   </aside>
+  <dialog id="aiNoteDialog" class="ai-note-dialog" aria-labelledby="aiNoteTitle">
+    <section>
+      <header>
+        <div><span>AI NOTES</span><h2 id="aiNoteTitle">AIでまとめる</h2><p>ChatGPT などに論文を URL から読んでもらい、研究ノートの形でまとめた結果をまとめに取り込みます。</p></div>
+        <button id="aiNoteClose" class="dialog-close" type="button" aria-label="閉じる">×</button>
+      </header>
+      <p class="ai-note-privacy">このアプリからは何も送信しません。あなたが AI の画面で送信するのは、下の指示文（論文のタイトルと URL）だけです。論文の本文は AI が URL から読みます。PLaMo の訳文は渡しません。</p>
+      <ol class="ai-note-steps">
+        <li>
+          <h3>1. 指示文を AI に渡す</h3>
+          <div class="ai-note-row">
+            <label class="dialog-field"><span>AI</span><select id="aiNoteService"><option value="chatgpt">ChatGPT</option><option value="other">その他の AI（コピーのみ）</option></select></label>
+            <p id="aiNoteUrl" class="ai-note-url"></p>
+          </div>
+          <textarea id="aiNotePrompt" rows="9" aria-label="AI に渡す指示文"></textarea>
+          <div class="ai-note-actions"><button id="aiNoteCopy" class="secondary small" type="button">指示文をコピー</button><button id="aiNoteOpen" class="primary small" type="button">コピーして ChatGPT を開く</button></div>
+          <small class="ai-note-hint">開いた画面に指示文が入っていなければ、貼り付けて送信してください。公開されていない論文（購読が必要なもの、手元にしかない PDF）は AI が読めません。</small>
+        </li>
+        <li>
+          <h3>2. 回答を貼り付けて取り込む</h3>
+          <textarea id="aiNoteAnswer" rows="9" aria-label="AI の回答" placeholder="AI の回答をコピーして、ここに貼り付けます（Markdown のまま）"></textarea>
+          <div class="ai-note-actions">
+            <button id="aiNotePaste" class="secondary small" type="button">クリップボードから貼り付け</button>
+            <label class="ai-note-mode"><input type="radio" name="aiNoteMode" value="append" checked> 末尾に追加</label>
+            <label class="ai-note-mode"><input type="radio" name="aiNoteMode" value="replace"> まとめを置き換え</label>
+            <button id="aiNoteImport" class="primary small" type="button">まとめに取り込む</button>
+          </div>
+          <p id="aiNoteStatus" class="dialog-status" aria-live="polite"></p>
+        </li>
+      </ol>
+    </section>
+  </dialog>
   <dialog id="libraryDialog" class="library-dialog" aria-labelledby="libraryTitle">
     <section>
       <header>

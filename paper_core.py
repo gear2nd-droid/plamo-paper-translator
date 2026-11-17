@@ -181,6 +181,7 @@ class PositionedCaption:
     text: str
     x: float
     y: float
+    size: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -339,12 +340,17 @@ def _positioned_captions(
     page_midpoint: float,
     sizes: list[float] | None = None,
     body_size: float = 0.0,
+    *,
+    small_captions: bool = False,
 ) -> list[PositionedCaption]:
     """Captions found at the start of a layout line.
 
     ``sizes`` (the font size of each fragment) confirms Japanese captions:
     body text often starts a line with "図 3 では" too, but captions are set
-    smaller than the body.
+    smaller than the body. With ``small_captions`` (the document sets its
+    captions smaller than the body, see ``_document_sets_small_captions``)
+    the same holds for "Fig. 2." too: a body line can start with
+    "Fig. 2. The setup consists of ..." when a reference wraps.
     """
     if sizes:
         weights: Counter[float] = Counter()
@@ -364,7 +370,12 @@ def _positioned_captions(
             if not POSITIONED_CAPTION_PATTERN.match(head.strip()):
                 continue
         # Sizes are rounded to half points; 7.8 pt captions under 8 pt body text count.
-        if sizes and body_size and start_text.strip().startswith(("図", "表")) and sizes[start] >= body_size - 0.15:
+        if (
+            sizes
+            and body_size
+            and (small_captions or start_text.strip().startswith(("図", "表")))
+            and sizes[start] >= body_size - 0.15
+        ):
             continue
         left_column = start_x < page_midpoint
         previous_y = start_y
@@ -383,8 +394,25 @@ def _positioned_captions(
                 previous_y = y
         caption = _merge_adjacent_scripts(re.sub(r"\s+", " ", "".join(pieces)).strip())
         if caption:
-            captions.append(PositionedCaption(caption, start_x, start_y))
+            captions.append(PositionedCaption(caption, start_x, start_y, sizes[start] if sizes and start < len(sizes) else 0.0))
     return captions
+
+
+def _document_sets_small_captions(captions: Iterable[PositionedCaption], body_size: float) -> bool:
+    """Whether the document's captions are set smaller than its body text.
+
+    Elsevier sets "Fig. 2." in 6.4 pt under 8 pt body text. LaTeX articles
+    usually set captions at the body size, so this only holds when several
+    distinct figures or tables are found in the smaller size.
+    """
+    if body_size <= 0:
+        return False
+    small = {
+        identity
+        for caption in captions
+        if 0 < caption.size < body_size - 0.5 and (identity := _caption_identity(caption.text)) is not None
+    }
+    return len(small) >= 2
 
 
 def _positioned_caption_blocks(
@@ -444,6 +472,19 @@ def _mark_caption_boundaries(text: str, caption_source: str | list[str]) -> str:
             )
             if replacements:
                 break
+        else:
+            # Some producers draw every word as its own fragment with no
+            # space characters (Elsevier): the layout caption then reads
+            # "Fig.2.Experimentalsetup..." while the extracted text has
+            # spaces. Match it ignoring whitespace, as for Japanese.
+            compact = re.sub(r"\s+", "", caption)
+            if len(compact) > 12 * len(tokens) and not re.search(rf"[{CJK_CHARACTER}]", caption):
+                text = re.sub(
+                    r"\s*".join(re.escape(character) for character in compact),
+                    lambda match: f"\n\n{CAPTION_MARKER}{match.group(0)}\n\n",
+                    text,
+                    count=1,
+                )
     return text
 
 
@@ -1283,22 +1324,41 @@ def remap_summary_row_references(summary: str, index_map: dict[int, int]) -> str
 
 
 def _image_display_boxes(page: Any) -> dict[str, list[tuple[float, float, float, float]]]:
+    """Page boxes where each image XObject is drawn, by resource name.
+
+    Images inside form XObjects are reported in the form's coordinates;
+    they are placed on the page, and the forms themselves are not boxes.
+    """
     boxes: dict[str, list[tuple[float, float, float, float]]] = {}
+    forms = _FormTracker(page.get("/Resources"))
 
     def collect_image(operation: bytes, operands: list[Any], cm: list[float], _tm: list[float]) -> None:
-        if operation != b"Do" or not operands:
+        forms.step(0)
+        if operation != b"Do":
+            return
+        subtype = forms.subtype(operands[0]) if operands else ""
+        placed = forms.to_page(cm) if len(cm) >= 6 else None
+        if not operands or placed is None or subtype == "/Form":
+            forms.before(operation, operands, cm)
             return
         name = str(operands[0]).lstrip("/")
-        if len(cm) < 6:
-            return
-        a, b, c, d, e, f = (float(value) for value in cm[:6])
+        a, b, c, d, e, f = (float(value) for value in placed[:6])
         corners = ((e, f), (a + e, b + f), (c + e, d + f), (a + c + e, b + d + f))
         xs = [point[0] for point in corners]
         ys = [point[1] for point in corners]
-        boxes.setdefault(name, []).append((min(xs), min(ys), max(xs), max(ys)))
+        # A form's /BBox can clip most of the image away: only what shows.
+        shown = forms.visible((min(xs), min(ys), max(xs), max(ys)))
+        forms.before(operation, operands, cm)
+        # An image clipped away entirely keeps an empty list: never shown.
+        boxes.setdefault(name, [])
+        if shown is not None:
+            boxes[name].append(shown)
 
     try:
-        page.extract_text(visitor_operand_before=collect_image)
+        page.extract_text(
+            visitor_operand_before=collect_image,
+            visitor_operand_after=lambda operation, *_rest: forms.after(operation),
+        )
     except (TypeError, ValueError):
         return {}
     return boxes
@@ -1340,6 +1400,8 @@ def _extract_page_images(
                 suffix = ".png"
             filename = f"page-{page_number:03d}-figure-{image_number:02d}{suffix}"
             resource_name = Path(image_file.name).stem.lstrip("/")
+            if resource_name in display_boxes and not display_boxes[resource_name]:
+                continue  # drawn only where a form's /BBox clips it away
             box = next(iter(display_boxes.get(resource_name, [])), None)
             output_path = asset_dir / filename
             rendered = False
@@ -1392,13 +1454,15 @@ def _drawn_figure_box(
     fragments: list[LayoutFragment],
     page_width: float,
     page_height: float,
+    image_boxes: Iterable[tuple[float, float, float, float]] = (),
 ) -> tuple[float, float, float, float] | None:
     """Page box of a figure drawn with vector graphics, above its caption.
 
     The figure is the area between the caption and the nearest line of body
     text above it. Short labels inside the drawing are not body text. When
-    the other column has no body text beside that area either, the figure
-    spans the full width.
+    the other column has no body text and no image (``image_boxes``, page
+    boxes of the embedded images) beside that area either, the figure spans
+    the full width.
     """
     midpoint = page_width / 2
 
@@ -1441,7 +1505,22 @@ def _drawn_figure_box(
     column = (left_margin, midpoint) if caption_left else (midpoint, right_margin)
     width = column[1] - column[0]
     # Small text in the top margin is the running header, never the figure.
-    header = [item.y for item in fragments if item.y >= page_height - 60 and item.size <= 8.5]
+    # A superscript in a body line near the top (small, just above the
+    # line's baseline) is not a header.
+    body_size = _body_font_size(fragments)
+    header = [
+        item.y
+        for item in fragments
+        if item.y >= page_height - 60
+        and item.size <= 8.5
+        and not any(
+            other.size >= body_size - 0.3
+            and other.size > item.size + 0.5
+            and 0 <= item.y - other.y < 0.6 * other.size
+            and abs(other.x - item.x) < 40
+            for other in fragments
+        )
+    ]
     top = min([page_height - 30] + [y - 3 for y in header])
     column_lines = lines_in(*column, caption_top)
     for position, line in enumerate(column_lines):
@@ -1463,15 +1542,25 @@ def _drawn_figure_box(
         return None
     other = (midpoint, right_margin) if caption_left else (left_margin, midpoint)
     beside = [line for line in lines_in(*other, caption_top) if min(item.y for item in line) < top and body_line(line, width)]
-    if not beside:
+    # An image (a raster figure) in the other column beside this area is
+    # another figure: Elsevier sets a figure in each column side by side.
+    beside_image = any(
+        min(bx1, other[1]) - max(bx0, other[0]) > 0.5 * (bx1 - bx0)
+        and min(by1, top) - max(by0, caption_top) > 20
+        for bx0, by0, bx1, by1 in image_boxes
+    )
+    if not beside and not beside_image:
         return (left_margin, caption_top, right_margin, top)
     # Within one column, cut at the column's own text edges so the end of
-    # a line in the neighbouring column never enters the crop.
-    starts = Counter(round(item.x) for item in fragments if column[0] <= item.x < column[1] and len(item.text.split()) >= 3)
+    # a line in the neighbouring column never enters the crop. The edges
+    # come from whole body lines: some producers draw each word as its own
+    # fragment.
+    column_body = [line for line in lines_in(column[0], column[1], float("-inf")) if body_line(line, width)]
+    starts = Counter(round(min(item.x for item in line)) for line in column_body)
     x0 = (starts.most_common(1)[0][0] - 4) if starts else column[0]
     x1 = column[1] if caption_left else right_margin
     if caption_left:
-        x1 = min(column[1], max((end_of(item) for item in fragments if column[0] <= item.x < column[1] and len(item.text.split()) >= 3), default=column[1]) + 4)
+        x1 = min(column[1], max((max(end_of(item) for item in line) for line in column_body), default=column[1]) + 4)
     return (max(column[0] - 4, x0), caption_top, x1, top)
 
 
@@ -1621,8 +1710,14 @@ def _render_drawn_figures(
     page_height: float,
     asset_dir: Path | None,
     url_prefix: str,
+    images: Iterable[ExtractedPageImage] = (),
 ) -> None:
     """Crop figures that have no embedded image (line art, charts, diagrams)."""
+    image_boxes = [
+        (image.x0, image.y0, image.x1, image.y1)
+        for image in images
+        if None not in (image.x0, image.y0, image.x1, image.y1)
+    ]
     if asset_dir is None or pdfium_document is None or not fragments:
         return
     from PIL import Image, ImageChops
@@ -1641,7 +1736,7 @@ def _render_drawn_figures(
             leader = leaders.get(identity)
             if leader is None or leader.assets:
                 continue
-            box = _drawn_figure_box(caption, fragments, page_width, page_height)
+            box = _drawn_figure_box(caption, fragments, page_width, page_height, image_boxes)
             if box is None:
                 continue
             x0, y0, x1, y1 = box
@@ -1682,6 +1777,7 @@ def _assign_page_images(
     captions: list[PositionedCaption],
     images: list[ExtractedPageImage],
     page_width: float,
+    fragments: list[LayoutFragment] | None = None,
 ) -> list[ExtractedPageImage]:
     leaders: dict[tuple[str, int], Segment] = {}
     for segment in page_segments:
@@ -1689,12 +1785,37 @@ def _assign_page_images(
         if identity and identity not in leaders:
             leaders[identity] = segment
 
+    def wrapped_by_text(image: ExtractedPageImage) -> bool:
+        """A small picture with body text running beside it in its column
+        is an illustration in the text, not a captioned figure."""
+        if not fragments or None in (image.x0, image.y0, image.x1, image.y1):
+            return False
+        if image.x1 - image.x0 > page_width * 0.3:
+            return False
+        left = (image.x0 + image.x1) / 2 < page_width / 2
+        # The lines run up to the picture's edge (text flows around it).
+        beside = [
+            item
+            for item in fragments
+            if image.y0 < item.y < image.y1
+            and ((item.x < page_width / 2) == left)
+            and (
+                (item.x < image.x0 - 2 and item.x + 0.5 * item.size * len(item.text.strip()) >= image.x0 - 30)
+                or image.x1 + 2 < item.x <= image.x1 + 30
+            )
+        ]
+        rows = {round(item.y) for item in beside if re.search(r"[a-z]{3}", item.text)}
+        return len(rows) >= 3 and sum(len(re.findall(r"[A-Za-z]", item.text)) for item in beside) >= 60
+
     figure_captions = [
         caption for caption in captions if (_caption_identity(caption.text) or (None, 0))[0] == "figure"
     ]
     unassigned: list[ExtractedPageImage] = []
     for image in images:
         candidates = figure_captions
+        if wrapped_by_text(image):
+            unassigned.append(image)
+            continue
         if image.x0 is not None and image.x1 is not None and image.y0 is not None:
             image_width = image.x1 - image.x0
             if image_width < page_width * 0.65:
@@ -1760,8 +1881,32 @@ def _merge_figure_tiles(
             if leader is None:
                 continue
             tiles = [boxes[asset] for asset in leader.assets if asset in boxes]
-            if len(tiles) < 2:
+            if not tiles:
                 continue
+            if len(tiles) == 1:
+                # One image with axes, a colour bar or panel labels drawn
+                # around it as text: crop the figure area too, or the picture
+                # loses them. Tick values (numbers) hugging the image, or
+                # short labels set right under or over it, tell.
+                tile = tiles[0]
+                ticks = [
+                    item
+                    for item in fragments
+                    if re.fullmatch(r"[-−+]?\d+(?:[.,]\d+)?", item.text.strip())
+                    and not (tile.x0 - 2 <= item.x <= tile.x1 + 2 and tile.y0 - 2 <= item.y <= tile.y1 + 2)
+                    and tile.x0 - 40 <= item.x <= tile.x1 + 40
+                    and tile.y0 - 25 <= item.y <= tile.y1 + 10
+                ]
+                panel_labels = [
+                    item
+                    for item in fragments
+                    if 0 < len(item.text.strip()) <= 12
+                    and not re.search(r"[a-z]{4}\s+[a-z]{2}", item.text)
+                    and tile.x0 - 2 <= item.x <= tile.x1 + 2
+                    and (tile.y0 - 15 <= item.y < tile.y0 - 1 or tile.y1 < item.y <= tile.y1 + 15)
+                ]
+                if len(ticks) < 3 and len(panel_labels) < 3:
+                    continue
             # The tiles' own positions can be in a form's coordinates, not
             # the page's: crop the figure area between the caption and the
             # body text above it instead, within the text's side margins (a
@@ -1817,6 +1962,13 @@ def _merge_figure_tiles(
             if x1 - x0 > 0.6 * page_width:
                 margin = max(0.0, min(caption.x, min((item.x for item in fragments if len(item.text.strip()) > 30), default=caption.x)) - 8)
                 x0, x1 = max(x0, margin), min(x1, page_width - margin)
+            if all(
+                0 <= tile.x0 and tile.x1 <= page_width and y0 - 6 <= tile.y0 and tile.y1 <= y1 + 6 for tile in tiles
+            ):
+                # The margins are not always symmetric (MDPI indents the text
+                # on the left only): never cut off a tile of the figure.
+                x0 = min(x0, min(tile.x0 for tile in tiles) - 6)
+                x1 = max(x1, max(tile.x1 for tile in tiles) + 6)
             if y1 - y0 > 0.55 * page_height:
                 # The area reaches far up the page (no body text above the
                 # figure): only trust it around tiles that lie inside it.
@@ -1832,6 +1984,21 @@ def _merge_figure_tiles(
                 x1 = max(tile.x1 for tile in inside) + 24
                 y0 = max(y0, min(tile.y0 for tile in inside) - 24)
                 y1 = min(y1, max(tile.y1 for tile in inside) + 24)
+            elif tiles and all(
+                x0 - 6 <= tile.x0 and tile.x1 <= x1 + 6 and y0 - 6 <= tile.y0 and tile.y1 <= y1 + 6 for tile in tiles
+            ):
+                # The area reaches up to the body text above, past a table
+                # set between that text and the figure. Where the tiles lie
+                # inside the area (page positions), the figure ends just
+                # above them and the labels set right over them (panel
+                # titles); drawing that reaches higher joins as the crop grows.
+                tiles_top = max(tile.y1 for tile in tiles)
+                labels = [
+                    item.y + item.size
+                    for item in fragments
+                    if x0 <= item.x <= x1 and tiles_top < item.y <= tiles_top + 14 and item.text.strip()
+                ]
+                y1 = min(y1, max([tiles_top + 8] + labels))
             # Tiles can bleed past the page edge.
             x0, y0 = max(0.0, x0), max(0.0, y0)
             x1, y1 = min(page_width, x1), min(page_height, y1)
@@ -1914,7 +2081,16 @@ def _merge_figure_tiles(
             asset_dir.mkdir(parents=True, exist_ok=True)
             filename = f"page-{page_number:03d}-figure-{identity[1]:02d}-whole.png"
             image.save(asset_dir / filename, format="PNG", optimize=True)
-            merged = {tile.asset for tile in tiles}
+            # A tile outside the crop (an image placed elsewhere on the page)
+            # stays a picture of its own. When no tile centre is inside, the
+            # tile positions are not on the page: the crop replaces them all.
+            crop_x0, crop_x1 = left / scale - 2, right / scale + 2
+            crop_y0, crop_y1 = page_height - bottom / scale - 2, page_height - top / scale + 2
+            merged = {
+                tile.asset
+                for tile in tiles
+                if crop_x0 <= (tile.x0 + tile.x1) / 2 <= crop_x1 and crop_y0 <= (tile.y0 + tile.y1) / 2 <= crop_y1
+            } or {tile.asset for tile in tiles}
             first = next(position for position, asset in enumerate(leader.assets) if asset in merged)
             kept = [asset for asset in leader.assets if asset not in merged]
             kept.insert(min(first, len(kept)), f"{url_prefix.rstrip('/')}/{filename}")
@@ -1951,16 +2127,22 @@ def _assign_inline_images(
             remaining.append(image.asset)
             continue
 
-        def fragment_rank(fragment: tuple[float, float, str]) -> tuple[int, float, float]:
-            _x, y, value = fragment
+        def fragment_rank(fragment: tuple[float, float, str]) -> tuple[int, int, float, float]:
+            x, y, value = fragment
             if image.y0 <= y <= image.y1:
                 vertical_gap = 0.0
             else:
                 vertical_gap = min(abs(y - image.y0), abs(y - image.y1))
+            # Prose wrapped beside the picture is the text it illustrates.
+            wraps = (
+                vertical_gap == 0.0
+                and not (image.x0 - 2 <= x <= image.x1 + 2)
+                and len(re.findall(r"[A-Za-z]", value)) >= 20
+            )
             mentions_nearby_figure = vertical_gap <= 100 and bool(
                 re.search(r"\b(?:fig(?:ure)?|illustration|image|shown|above|right|left)\b", value, re.I)
             )
-            return (0 if mentions_nearby_figure else 1, vertical_gap, abs(y - (image.y0 + image.y1) / 2))
+            return (0 if wraps else 1, 0 if mentions_nearby_figure else 1, vertical_gap, abs(y - (image.y0 + image.y1) / 2))
 
         anchor_text = min(nearby, key=fragment_rank)[2]
         anchor_words = _word_tokens(anchor_text)
@@ -1973,7 +2155,12 @@ def _assign_inline_images(
             overlap = len(anchor_words & source_words) / len(anchor_words)
             return overlap, len(anchor_words & source_words)
 
-        leader = max(page_segments, key=segment_score, default=None)
+        # Not another figure's or table's caption: the picture has none.
+        leader = max(
+            (segment for segment in page_segments if _caption_identity(segment.source) is None),
+            key=segment_score,
+            default=None,
+        )
         if leader is None or segment_score(leader)[0] < 0.6:
             remaining.append(image.asset)
             continue
@@ -2061,6 +2248,7 @@ def _apply_script_markup(
     roles: dict[int, str],
     dropped: set[int] | None = None,
     substitutions: dict[int, str] | None = None,
+    hidden_parts: set[int] | None = None,
 ) -> str:
     """Insert script markup into the extracted text, and leave out ``dropped`` fragments.
 
@@ -2068,12 +2256,15 @@ def _apply_script_markup(
     fragments (text inside form XObjects such as figure labels) are not in
     it. Fragments are matched at the cursor; a fragment that does not match
     is skipped. Apart from dropped fragments, markup is only ever inserted,
-    so removing it gives back the original text.
+    so removing it gives back the original text. ``hidden_parts`` are
+    numbers of ``parts`` (not fragment orders) to leave out as well: text
+    that is never shown, such as text clipped away by a form's /BBox.
     """
-    if not roles and not dropped and not substitutions:
+    if not roles and not dropped and not substitutions and not hidden_parts:
         return raw
     role_by_part = {fragment_parts[order]: role for order, role in roles.items() if order < len(fragment_parts)}
     dropped_parts = {fragment_parts[order] for order in dropped or () if order < len(fragment_parts)}
+    dropped_parts |= hidden_parts or set()
     substituted_parts = {fragment_parts[order]: value for order, value in (substitutions or {}).items() if order < len(fragment_parts)}
     output: list[str] = []
     cursor = 0
@@ -2376,6 +2567,142 @@ def _text_position(tm: Any, cm: Any) -> tuple[float, float, float, float]:
         c * ca + d * cc,
         c * cb + d * cd,
     )
+
+
+def _multiply_matrices(first: Any, second: Any) -> tuple[float, float, float, float, float, float]:
+    """PDF matrix product: apply ``first``, then ``second``."""
+    a, b, c, d, e, f = (float(value) for value in first[:6])
+    A, B, C, D, E, F = (float(value) for value in second[:6])
+    return (a * A + b * C, a * B + b * D, c * A + d * C, c * B + d * D, e * A + f * C + E, e * B + f * D + F)
+
+
+class _FormTracker:
+    """Follow pypdf into form XObjects while it extracts a page's text.
+
+    pypdf reports the text and images of a form in the form's own
+    coordinates and ignores the form's /BBox, which clips what is drawn.
+    Some producers place a whole page of an earlier manuscript as a form and
+    let the /BBox show only its figure (MDPI papers with "x FOR PEER REVIEW"
+    figures), so the hidden text of that page would be read as body text.
+    """
+
+    def __init__(self, page_resources: Any) -> None:
+        self.page_resources = page_resources
+        self.forms: list[dict[str, Any]] = []
+        self.calls: list[bool] = []
+
+    @property
+    def current(self) -> dict[str, Any] | None:
+        """The form whose content is being read, if any.
+
+        A form is entered at its first operation: right after ``Do`` pypdf
+        still reports the pending text of the parent content.
+        """
+        for form in reversed(self.forms):
+            if form["active"]:
+                return form
+        return None
+
+    def step(self, position: int) -> None:
+        """Called before every operation; ``position`` counts the text parts so far."""
+        if self.forms and not self.forms[-1]["active"]:
+            self.forms[-1]["active"] = True
+            self.forms[-1]["start"] = position
+
+    def _xobject(self, name: Any) -> Any:
+        current = self.current
+        resources = current["resources"] if current else self.page_resources
+        try:
+            return resources.get_object()["/XObject"].get_object()[name].get_object()
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+
+    def subtype(self, name: Any) -> str:
+        target = self._xobject(name)
+        try:
+            return str(target.get("/Subtype", "")) if target is not None else ""
+        except AttributeError:
+            return ""
+
+    def before(self, operation: bytes, operands: list[Any], cm: Any) -> None:
+        if operation != b"Do":
+            return
+        target = self._xobject(operands[0]) if operands else None
+        is_form = False
+        try:
+            is_form = target is not None and target.get("/Subtype") == "/Form"
+        except AttributeError:
+            pass
+        self.calls.append(is_form)
+        if not is_form:
+            return
+        bbox: tuple[float, float, float, float] | None = None
+        try:
+            x0, y0, x1, y1 = (float(value) for value in target["/BBox"][:4])
+            bbox = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+        except (KeyError, TypeError, ValueError):
+            pass
+        try:
+            matrix = tuple(float(value) for value in target.get("/Matrix", (1, 0, 0, 1, 0, 0))[:6])
+            current = self.current
+            parent = current["to_page"] if current and current["to_page"] else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            to_page: Any = _multiply_matrices(_multiply_matrices(matrix, cm), parent)
+        except (TypeError, ValueError):
+            to_page = None
+        # The page area the form can show: its /BBox on the page, inside the
+        # area of the forms around it.
+        clip = current["clip"] if current else None
+        if bbox is not None and to_page is not None:
+            a, b, c, d, e, f = to_page
+            xs = [x * a + y * c + e for x, y in ((bbox[0], bbox[1]), (bbox[2], bbox[1]), (bbox[0], bbox[3]), (bbox[2], bbox[3]))]
+            ys = [x * b + y * d + f for x, y in ((bbox[0], bbox[1]), (bbox[2], bbox[1]), (bbox[0], bbox[3]), (bbox[2], bbox[3]))]
+            own = (min(xs), min(ys), max(xs), max(ys))
+            clip = own if clip is None else (max(clip[0], own[0]), max(clip[1], own[1]), min(clip[2], own[2]), min(clip[3], own[3]))
+        self.forms.append(
+            {
+                "bbox": bbox,
+                "resources": target.get("/Resources"),
+                "to_page": to_page,
+                "clip": clip,
+                "active": False,
+                "start": 0,
+            }
+        )
+
+    def after(self, operation: bytes) -> None:
+        if operation == b"Do" and self.calls and self.calls.pop():
+            self.forms.pop()
+
+    def clipped(self, x: float, y: float, size: float) -> bool:
+        """Whether text at (x, y) in the current form lies outside its /BBox."""
+        current = self.current
+        bbox = current["bbox"] if current else None
+        if bbox is None:
+            return False
+        slack = max(1.0, abs(size) * 0.5)
+        return not (bbox[0] - slack <= x <= bbox[2] and bbox[1] - slack <= y <= bbox[3])
+
+    def visible(self, box: tuple[float, float, float, float]) -> tuple[float, float, float, float] | None:
+        """The part of a page box the current forms let show, if any."""
+        current = self.current
+        clip = current["clip"] if current else None
+        if clip is None:
+            return box
+        shown = (max(box[0], clip[0]), max(box[1], clip[1]), min(box[2], clip[2]), min(box[3], clip[3]))
+        if shown[2] - shown[0] < 1 or shown[3] - shown[1] < 1:
+            return None
+        return shown
+
+    def to_page(self, cm: Any) -> Any:
+        """The current transform cm expressed in page coordinates."""
+        current = self.current
+        matrix = current["to_page"] if current else None
+        if matrix is None:
+            return cm
+        try:
+            return _multiply_matrices(cm, matrix)
+        except (TypeError, ValueError):
+            return cm
 
 
 CID_ORDERINGS = ("Japan1", "GB1", "CNS1", "Korea1")
@@ -3562,6 +3889,9 @@ def extract_document(
 
                 visited: list[tuple[int, str, tuple[float, float, float], tuple[float, float, float]]] = []
                 visited_fonts: list[str] = []
+                forms = _FormTracker(page.get("/Resources"))
+                hidden_parts: set[int] = set()
+                aggregate_parts: set[int] = set()
 
                 def collect_fragment(value: str, cm: Any, tm: list[float], font: Any, size: float) -> None:
                     # Some producers (MDPI) put no-break spaces between all
@@ -3570,6 +3900,23 @@ def extract_document(
                     text_parts.append(value)
                     if not value.strip():
                         return
+                    current_form = forms.current
+                    if current_form is not None:
+                        # pypdf reports a form's whole text once more after
+                        # its fragments, at the position of the page text
+                        # before it. It is in the extracted text only once.
+                        start = current_form["start"]
+                        inner = "".join(
+                            text_parts[number] for number in range(start, len(text_parts) - 1) if number not in aggregate_parts
+                        )
+                        if len(value) > 40 and re.sub(r"\s+", "", value) == re.sub(r"\s+", "", inner):
+                            aggregate_parts.add(len(text_parts) - 1)
+                            return
+                        x, y, c, d = _text_position(tm, cm)
+                        if forms.clipped(x, y, float(size) * ((c**2 + d**2) ** 0.5 or 1.0)):
+                            # Outside the form's /BBox: clipped, not shown.
+                            hidden_parts.add(len(text_parts) - 1)
+                            return
                     # Some producers set the font size to 1 and scale the
                     # text matrix instead; use the size as drawn.
                     plain = (float(tm[4]), float(tm[5]), float(size) * ((float(tm[2]) ** 2 + float(tm[3]) ** 2) ** 0.5 or 1.0))
@@ -3587,16 +3934,38 @@ def extract_document(
                 def collect_image(operation: bytes, operands: list[Any], cm: list[float], _tm: list[float]) -> None:
                     # Only images: a form XObject is drawn in its own
                     # coordinates, so the unit square says nothing about it.
-                    if operation != b"Do" or not operands or len(cm) < 6:
+                    forms.step(len(text_parts))
+                    if operation != b"Do":
                         return
-                    if str(operands[0]).lstrip("/") not in image_names:
+                    subtype = forms.subtype(operands[0]) if operands else ""
+                    # An image inside a form is reported in the form's
+                    # coordinates; place it on the page.
+                    placed_cm = forms.to_page(cm) if len(cm) >= 6 else None
+                    forms.before(operation, operands, cm)
+                    if forms.calls and forms.calls[-1]:
                         return
-                    a, b, c, d, e, f = (float(value) for value in cm[:6])
+                    if placed_cm is None or not operands:
+                        return
+                    if subtype != "/Image" and (subtype or str(operands[0]).lstrip("/") not in image_names):
+                        return
+                    a, b, c, d, e, f = (float(value) for value in placed_cm[:6])
                     xs = (e, a + e, c + e, a + c + e)
                     ys = (f, b + f, d + f, b + d + f)
-                    image_boxes.append((min(xs), min(ys), max(xs), max(ys)))
+                    shown = forms.visible((min(xs), min(ys), max(xs), max(ys)))
+                    if shown is not None:
+                        image_boxes.append(shown)
 
-                raw = (page.extract_text(visitor_text=collect_fragment, visitor_operand_before=collect_image) or "").replace("\xa0", " ")
+                def leave_form(operation: bytes, _operands: list[Any], _cm: list[float], _tm: list[float]) -> None:
+                    forms.after(operation)
+
+                raw = (
+                    page.extract_text(
+                        visitor_text=collect_fragment,
+                        visitor_operand_before=collect_image,
+                        visitor_operand_after=leave_form,
+                    )
+                    or ""
+                ).replace("\xa0", " ")
 
                 def on_page(position: tuple[float, float, float]) -> bool:
                     return -5 <= position[0] <= page_width + 5 and -5 <= position[1] <= page_height + 5
@@ -3681,7 +4050,7 @@ def extract_document(
                         asset_url_prefix,
                         inline_math,
                     )
-                raw = _apply_script_markup(raw, text_parts, fragment_parts, roles, figure_text, substitutions)
+                raw = _apply_script_markup(raw, text_parts, fragment_parts, roles, figure_text, substitutions, hidden_parts)
                 if substitutions:
                     # Keep a space between a word and an expression image.
                     raw = re.sub(r"(?<=[A-Za-z0-9,;:])⟦", " ⟦", raw)
@@ -3739,6 +4108,20 @@ def extract_document(
 
         repeated_margin_keys = {key for key, count in margin_counts.items() if count >= 2}
         repeated_margin_keys.add("__page_number__")
+        small_captions = _document_sets_small_captions(
+            (
+                caption
+                for record in page_records
+                if record[2]
+                for caption in _positioned_captions(
+                    record[2],
+                    float(record[0].mediabox.width) / 2,
+                    [fragment.size for fragment in record[3]],
+                    document_body_size,
+                )
+            ),
+            document_body_size,
+        )
         segments: list[Segment] = []
         paragraph_offset = 0
         for page_number, (page, raw, fragments, layout_fragments, margin_candidates) in enumerate(page_records, start=1):
@@ -3751,6 +4134,7 @@ def extract_document(
                     float(page.mediabox.width) / 2,
                     [fragment.size for fragment in layout_fragments],
                     document_body_size,
+                    small_captions=small_captions,
                 )
                 raw = _mark_caption_boundaries(raw, [caption.text for caption in positioned_captions])
             if layout_fragments:
@@ -3805,6 +4189,7 @@ def extract_document(
                     positioned_captions,
                     images,
                     float(page.mediabox.width),
+                    layout_fragments,
                 )
                 _merge_figure_tiles(
                     pdfium_document,
@@ -3849,6 +4234,7 @@ def extract_document(
                 float(page.mediabox.height),
                 asset_dir,
                 asset_url_prefix,
+                images,
             )
         if not segments:
             if pdfium_document is not None:
